@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "forensickit"
+version = "1.0.0"
+description = "Deterministic offline CTF forensic analysis engine"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["PyYAML>=6.0"]
+keywords = ["ctf", "digital-forensics", "offline", "incident-response"]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Environment :: Console",
+  "Intended Audience :: Information Technology",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Security",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+tui = ["textual>=0.58"]
+
+[project.scripts]
+forensickit = "forensickit.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+forensickit = ["data/*.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

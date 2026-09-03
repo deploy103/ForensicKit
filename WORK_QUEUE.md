@@ -1,0 +1,201 @@
+# ForensicKit Work Queue
+
+Last reviewed: 2026-09-03 18:50 KST
+
+## Post-v1.0 backlog
+
+- [ ] Add bounded ext4 depth-one extent-tree traversal for directories and regular files, retaining index/leaf block provenance and cycle protection.
+
+## Environment-dependent
+
+- None.
+
+## Completed this session
+
+- [x] Bounded active ext subdirectory traversal and recursively recoverable regular-file children with inode/directory/block lineage.
+- [x] Bounded active ext root regular-file inode mapping, child registration, recursive flag detection, and Engine E2E.
+- [x] Bounded ext2/3 direct-block and ext4 depth-zero-extent root directory inventory with exact inode/block/entry offsets.
+- [x] Independent exFAT main/backup boot-region checksum, repeated-value, signature, reserved-sector, and divergence validation.
+- [x] Bounded active exFAT FAT/NoFatChain subdirectory traversal, shared-cluster defense, and recursive deleted-child recovery.
+- [x] Active exFAT allocation-bitmap/upcase-table validation, name-hash revalidation, and non-verdict deleted-cluster reuse warnings.
+- [x] Bounded deleted exFAT FAT-chained recovery through exact EOC-terminated cluster chains with physical-segment provenance.
+- [x] Bounded noncontiguous exFAT root FAT-chain traversal with per-entry physical offsets and termination provenance.
+- [x] Bounded deleted exFAT NoFatChain contiguous child recovery with ValidDataLength zero-fill semantics.
+- [x] exFAT signature identification and bounded checksum-validated deleted root file-entry set inventory.
+- [x] Deleted regular-file recovery from validated active FAT32 subdirectories with directory lineage and recursive flags.
+- [x] Bounded active FAT32 subdirectory traversal and deleted-entry inventory without traversing deleted directory allocations.
+- [x] Complete validated multi-cluster deleted FAT32 regular-file chain recovery with EOC requirement and recursive flags.
+- [x] Bounded single-cluster deleted FAT32 regular-file child recovery with recursive flag and reuse-caveat provenance.
+- [x] Bounded FAT32 root FAT-chain traversal with noncontiguous physical provenance and abnormal-termination isolation.
+- [x] Deleted FAT32 LFN-to-short-entry correlation with bounded checksum recovery, UTF-16/order validation, and unlinked provenance.
+- [x] Bounded FAT32 root-cluster deleted 8.3 entry metadata recovery with exact offsets and unknown-first-character semantics.
+- [x] Final-sector NTFS backup boot validation and exact primary divergence provenance.
+- [x] Independent boot-declared NTFS `$MFTMirr` record-zero USA validation and primary logical-byte comparison.
+- [x] Bounded USN_RECORD_V4 range-tracking parsing and timeline extent provenance without fabricated fields.
+- [x] USN timeline enrichment with exact ancestor sampled-MFT artifact/observation/physical provenance.
+- [x] Exact V2 USN→ancestor sampled-MFT correlation with reciprocal observation and sequence-reuse rejection.
+- [x] Bounded USN_RECORD_V3 parsing with exact opaque 128-bit identifiers and timeline columns.
+- [x] Exact adjacent USN V2 rename-old/rename-new correlation with FRN/sequence/name/parent provenance.
+- [x] USN journal events in deterministic JSON/Markdown/CSV timeline with journal-specific provenance and CSV safety.
+- [x] Bounded lineage-gated NTFS `$UsnJrnl:$J` USN_RECORD_V2 parsing and Windows-profile inventory.
+- [x] Exact sampled `$ATTRIBUTE_LIST` nonresident `$DATA` extent joining and recursive child recovery.
+- [x] Bounded plausible stale/deleted NTFS `$I30` slack-entry recovery, separated from active entries.
+- [x] Bounded NTFS nonresident `$I30` INDX buffer mapping, USA validation, entry parsing, and sampled-record correlation.
+- [x] Bounded NTFS sparse-run and uninitialized-tail logical zero-fill recovery with explicit per-range provenance.
+- [x] Expanded bounded NTFS MFT sampling/recovery from 32 to 256 records (maximum 1 MiB mapped reads).
+- [x] Bounded sampled-MFT nonresident `$DATA`/ADS run recovery with compressed/encrypted/sparse exclusion.
+- [x] Bounded sampled-MFT resident `$DATA`/ADS child recovery with deleted-record provenance and recursion.
+- [x] Cross-artifact EVTX process-creation↔Registry persistence command exact-path correlation with transaction-log context.
+- [x] Cross-artifact EVTX process-creation↔LNK target/Prefetch executable correlation.
+- [x] Cross-artifact EVTX↔memory process/network correlation under exact PID plus path/IP evidence.
+- [x] Deterministic `timeline.csv` plus JSON/Markdown timeline with artifact/record/tool/raw-output provenance.
+- [x] Bounded chronological EVTX activity clusters with explainable evidence-weighted sequence scoring.
+- [x] Hayabusa CSV Windows-event normalization and exact EventRecordID-to-native-offset correlation.
+- [x] Chainsaw JSON/JSONL EVTX event normalization and exact EventRecordID-to-native-offset correlation.
+- [x] Textual 8.2.8 headless UI validation: case loading, tables, row-detail provenance, refresh, and quit binding.
+- [x] Bounded SMB2 NEGOTIATE dialect/signing/capability/transport-size provenance.
+- [x] Bounded SMB3 encryption/compression transform-header provenance.
+- [x] Bounded SMB2 QUERY_DIRECTORY FileIdBothDirectoryInformation metadata inventory.
+- [x] Bounded SMB2 QUERY_DIRECTORY FileNamesInformation listing-child recovery.
+- [x] Corrected native PCAP protocol-specific extraction summary boundaries.
+- [x] Bounded SMB2 SET_INFO rename/delete-disposition FileId provenance.
+- [x] SMB2 READ/WRITE recovered-size validation against successful CLOSE EndOfFile.
+- [x] Bounded SMB2 CLOSE FileId/status/EndOfFile/timestamp provenance.
+- [x] Bounded SMB2 TREE_CONNECT share-path correlation into CREATE/READ/WRITE provenance.
+- [x] Bounded SMB2 READ download recovery with CREATE/FileId/request provenance.
+- [x] Bounded SMB2 WRITE upload recovery with CREATE/FileId/acknowledgement provenance.
+- [x] Correlated bounded SMB2 CREATE response/FileId/status provenance.
+- [x] Bounded native SMB2 CREATE filename/identifier operation provenance.
+- [x] Bounded FTP AUTH TLS transition provenance and plaintext-recovery suppression.
+- [x] Bounded POP3 STLS transition provenance and plaintext-recovery suppression.
+- [x] Bounded IMAP STARTTLS transition provenance finding, including artifact-free Engine persistence.
+- [x] Bounded IMAP STARTTLS transition suppression for plaintext FETCH recovery.
+- [x] Bounded IMAP FETCH MIME attachment extraction with child-artifact provenance.
+- [x] Bounded native IMAP FETCH message recovery with child-artifact provenance.
+- [x] Bounded POP3 RETR MIME attachment extraction with child-artifact provenance.
+- [x] Bounded native POP3 RETR message recovery with child-artifact provenance.
+- [x] Bounded SMTP BDAT MIME attachment extraction with child-artifact provenance.
+- [x] Negative regression for incomplete SMTP BDAT streams without LAST.
+- [x] Bounded SMTP BDAT final response provenance.
+- [x] Regression coverage for bounded retransmission-safe SMTP BDAT continuation reassembly.
+- [x] Bounded native SMTP BDAT chunked-message recovery with child-artifact provenance.
+- [x] Bounded SMTP STARTTLS transition provenance and plaintext-recovery suppression.
+- [x] Bounded native SMTP final 251/252 forwarding-acceptance provenance.
+- [x] Bounded native SMTP final 4xx/5xx rejection-response provenance.
+- [x] Bounded native SMTP final `250` acceptance-response provenance.
+- [x] Bounded native SMTP MIME multipart/alternative text-part FlagHunter provenance.
+- [x] Bounded native SMTP MIME inline Content-ID attachment extraction with provenance.
+- [x] Bounded native SMTP MIME attachment filename RFC 2231/5987 recovery.
+- [x] Bounded native SMTP MIME nested-message attachment extraction with child-artifact provenance.
+- [x] Bounded native SMTP MIME attachment extraction with child-artifact provenance.
+- [x] Bounded retransmission-safe TCP reassembly for native SMTP DATA bodies.
+- [x] Bounded TCP-continuation reassembly for native SMTP DATA/354 control exchanges.
+- [x] Bounded native SMTP DATA message recovery with child-artifact provenance.
+- [x] Bounded native FTP transfer completion/error control-response provenance.
+- [x] Bounded active-mode FTP MLSD/NLST listing recovery with control/data provenance.
+- [x] Bounded native FTP PASV/EPSV MLSD/NLST listing recovery with control/data provenance.
+- [x] Bounded native FTP active-mode EPRT control/data correlation and extracted-object provenance.
+- [x] Bounded native FTP active-mode PORT control/data correlation and extracted-object provenance.
+- [x] Bounded TCP-continuation reassembly for native FTP control commands and PASV/EPSV responses.
+- [x] Bounded native FTP EPSV control/data correlation and extracted-object provenance.
+- [x] Bounded native FTP PASV `STOR` control/data correlation and extracted-object provenance.
+- [x] Bounded native FTP PASV `RETR` control/data correlation and extracted-object provenance.
+- [x] Bounded RFC 2231 continued HTTP `Content-Disposition` filename recovery.
+- [x] Bounded RFC 5987 HTTP `Content-Disposition` `filename*` recovery.
+- [x] Bounded native HTTP multipart quoted-printable Content-Transfer-Encoding decoding with child-artifact provenance.
+- [x] Bounded native HTTP multipart Base64 Content-Transfer-Encoding decoding with child-artifact provenance.
+- [x] Bounded native HTTP request/response inverse-flow pairing with request packet provenance.
+- [x] Bounded native HTTP object/part response-flow and contributing-packet provenance with retransmission exclusion.
+- [x] Bounded native HTTP multipart response-part extraction with per-part content disposition and child-artifact provenance.
+- [x] Bounded native PCAP HTTP gzip/deflate response decoding with generated-object provenance.
+- [x] Bounded in-order TLS Certificate TCP-continuation reassembly with retransmission-safe provenance.
+- [x] Bounded native TLS 1.2/1.3 certificate-record inventory with packet/flow provenance.
+- [x] Regression coverage for retransmission-safe TLS ServerHello continuation reassembly.
+- [x] Bounded Minidump HandleData and UnloadedModule stream parsing with profile findings.
+- [x] Bounded directory evidence bundles, including iOS Manifest.db/payload correlation.
+- [x] Exact-name Registry hive `.LOG1`/`.LOG2` companion provenance.
+- [x] Volatility PsScan/Handles/FileScan planning and normalized findings.
+- [x] Same-distro offline source/wheel/deb bundle build and no-network installer scripts.
+- [x] Windows LNK LinkInfo target-path provenance.
+- [x] Offline bundle structure and checksum validation through `forensickit doctor --bundle`.
+- [x] Offline bundle target compatibility warning and Volatility DLLList/Malfind support.
+- [x] Direct synthetic regression sweep: 112 passed (pytest runner unavailable).
+- [x] FileScan-derived bounded Volatility dumpfiles follow-up planning.
+- [x] FileScan → parameterized DumpFiles → generated child → recursive flag Engine E2E.
+- [x] PID-keyed Volatility process correlation persistence and report E2E.
+- [x] Bounded iOS Manifest.db reference inventory and exact payload provenance beyond summary samples.
+- [x] PDF Poppler generated-output provenance, normalization, and recursive Engine fixtures.
+- [x] iOS Manifest.db domain/path semantic findings without opaque BLOB decoding.
+- [x] PID-scoped Volatility DLLList/File-or-Section-handle exact path correlation.
+- [x] Reusable fixture-aware direct regression runner for environments without pytest.
+- [x] Staged offline bundle installer validation with checksum and structure preflight.
+- [x] Bounded DNS TXT Base64 fragment reconstruction with endpoint and packet provenance.
+- [x] DNS TXT reconstructed-content FlagHunter provenance.
+- [x] Bounded DNS query-label Base64 reconstruction with packet provenance and flag lineage.
+- [x] Bounded DNS query-label hexadecimal reconstruction with packet provenance and flag lineage.
+- [x] Exact DNS request/response ID, endpoint, and port correlation for TXT provenance.
+- [x] Bounded, single-use DNS transaction correlation lifetime and transaction-scoped TXT grouping.
+- [x] Same-endpoint DNS TXT transaction-isolation regression.
+- [x] DNS transaction ID reuse expiry regression.
+- [x] Bounded PCAP DNS transaction inventory and profile finding.
+- [x] PCAP DNS transaction inventory Engine/report regression.
+- [x] DNS TXT transaction-aware reconstruction request provenance.
+- [x] Full fixture-aware direct regression after DNS provenance changes (126 passed).
+- [x] Bounded native EVTX record-header inventory and profile finding.
+- [x] EVTX record-header Engine/report persistence and malformed-record isolation regressions.
+- [x] Bounded EVTX record-ID continuity anomaly detection.
+- [x] Prefetch bounded declared-size/hash/run-count metadata recovery.
+- [x] Prefetch declared-size mismatch Engine/profile/report regression.
+- [x] Exact supplied Recycle Bin `$I`/`$R` root provenance correlation and report E2E.
+- [x] Invalid `$I` / matching-name `$R` non-correlation regression.
+- [x] Full direct synthetic regression after EVTX/Prefetch/Recycle Bin changes (133 passed).
+- [x] Deterministic DNS TXT/query-label retransmission deduplication with provenance.
+- [x] Full direct regression after DNS retransmission-safe reconstruction (135 passed).
+- [x] DNS TXT reassembly request-packet provenance observation/profile count.
+- [x] Bounded printable non-DNS UDP payload inventory and profile lead.
+- [x] Bounded printable ICMP/ICMPv6 payload inventory and profile lead.
+- [x] Full direct regression after UDP/ICMP payload inventory additions (137 passed).
+- [x] Bounded printable non-HTTP TCP payload inventory and profile lead.
+- [x] Full direct regression after TCP payload inventory addition (138 passed).
+- [x] Normalized cross-protocol printable PCAP payload summary and report persistence.
+- [x] PCAP printable packet payload FlagHunter provenance.
+- [x] Full direct regression after packet-payload FlagHunter integration (138 passed).
+- [x] Deterministic duplicate-observation PCAP payload FlagCandidate suppression.
+- [x] Report-visible PCAP payload FlagCandidate provenance regression.
+- [x] HTTP continuation exclusion from non-HTTP TCP printable payload inventory.
+- [x] Out-of-order HTTP segment exclusion from non-HTTP TCP printable payload inventory.
+- [x] Full direct regression after HTTP flow payload-boundary handling (141 passed).
+- [x] Bounded native PCAP HTTP flow-state tracking and report truncation.
+- [x] NTFS MFT0 in-memory USA fixup, bounded attribute/data-run inventory, and named-DATA profile/report provenance.
+- [x] NTFS MFT0 STANDARD_INFORMATION/FILE_NAME FILETIME inventory and cautious mismatch lead.
+- [x] Data-run-addressed, bounded NTFS MFT record sampling with deleted-record filename provenance.
+- [x] Bounded resident NTFS `$I30` INDEX_ROOT directory-entry inventory from sampled records.
+- [x] NTFS MFT non-contiguous data-run segment provenance.
+- [x] Bounded NTFS FILE_NAME parent-reference correlation with unresolved provenance.
+- [x] Bounded NTFS `$I30` sampled-record correlation with unresolved provenance.
+- [x] Bounded NTFS nonresident `$I30` INDEX_ALLOCATION metadata inventory without buffer reads.
+- [x] NTFS MFT sample mapping/USA structural finding provenance.
+- [x] Filterable per-record NTFS MFT sample FILE/bounds/USA anomaly inventory.
+- [x] Bounded NTFS STANDARD_INFORMATION fixed attribute/security metadata inventory.
+- [x] Bounded resident NTFS `$ATTRIBUTE_LIST` extent-reference inventory.
+- [x] Bounded NTFS `$ATTRIBUTE_LIST` sampled-record correlation with unresolved provenance.
+- [x] JPEG APP metadata inventory and XMP FlagHunter provenance.
+- [x] Bounded JPEG ICC_PROFILE APP2 chunk sequence validation.
+- [x] Bounded JPEG EXIF APP1 TIFF scalar metadata recovery.
+- [x] JPEG EXIF APP1 scalar/profile report finding integration.
+- [x] JPEG EXIF APP1 profile and Engine/report regression coverage.
+- [x] PCAP TLS ClientHello SNI/ALPN/version packet-provenance inventory.
+- [x] Bounded TLS ClientHello structure-error packet provenance.
+- [x] Bounded in-order TLS ClientHello TCP-continuation SNI/ALPN reassembly.
+- [x] TLS ClientHello incomplete-flow end-of-capture provenance.
+- [x] TLS ClientHello flow-state saturation profile/report finding.
+- [x] TLS ClientHello continuation gap/out-of-order abandonment provenance.
+- [x] TLS ClientHello exact retransmission-safe continuation reassembly.
+- [x] TLS ClientHello continuation record-length error-detail inventory.
+- [x] TLS ServerHello selected-ALPN/cipher-suite packet-provenance inventory.
+- [x] TLS ServerHello structural-error packet provenance.
+- [x] TLS ServerHello incomplete-record declared-length provenance.
+- [x] TLS ClientHello/ServerHello inverse-flow ALPN negotiation correlation.
+- [x] TLS ALPN offer/selection mismatch profile finding with exact flow provenance.
+- [x] Bounded in-order TLS ServerHello continuation reassembly with incomplete/gap provenance.
+- [x] Full direct regression after PCAP HTTP flow-state bound (142 passed).

@@ -1,0 +1,63 @@
+version: 1
+
+rules:
+  - id: png_appended_payload
+    profiles: [image, steganography]
+    when:
+      all:
+        - observation: artifact.format
+          equals: png
+        - observation: png.bytes_after_iend
+          greater_than: 0
+    emit:
+      findings:
+        - title: Data exists after PNG IEND
+          category: structural_anomaly
+          confidence: 0.90
+      recommend:
+        auto: [binwalk3, sevenzip]
+        deep: [zsteg]
+
+  - id: png_appended_zip
+    profiles: [image, steganography, archive]
+    when:
+      all:
+        - observation: artifact.format
+          equals: png
+        - observation: embedded.pk_signature
+          equals: true
+    emit:
+      findings:
+        - title: Possible ZIP payload embedded/appended to PNG
+          category: embedded_archive
+          confidence: 0.97
+      recommend:
+        auto: [binwalk3, sevenzip]
+
+  - id: pcap_dns_long_labels
+    profiles: [pcap]
+    when:
+      all:
+        - observation: pcap.dns.long_labels
+          equals: true
+        - observation: pcap.dns.query_count
+          greater_than: 20
+    emit:
+      findings:
+        - title: Suspicious DNS label pattern
+          category: possible_dns_encoding
+          confidence: 0.75
+      recommend:
+        auto: [tshark]
+
+  - id: office_macro_candidate
+    profiles: [office]
+    when:
+      any:
+        - observation: office.has_vba
+          equals: true
+        - observation: office.ole_streams
+          greater_than: 0
+    emit:
+      recommend:
+        auto: [olevba, oledump]

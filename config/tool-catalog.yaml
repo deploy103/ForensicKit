@@ -1,0 +1,324 @@
+version: 1
+
+tools:
+  file:
+    priority: P0
+    executables: [file]
+    profiles: [generic]
+    cost: low
+    timeout: 15
+    parser: file
+
+  exiftool:
+    priority: P0
+    executables: [exiftool]
+    profiles: [generic, image, pdf, office, audio, video]
+    cost: low
+    timeout: 30
+    parser: exiftool
+
+  binwalk3:
+    priority: P0
+    executables: [binwalk3, binwalk]
+    profiles: [generic, image, firmware, unknown]
+    cost: medium
+    timeout: 120
+    parser: binwalk
+
+  sevenzip:
+    priority: P0
+    executables: [7z, 7zz]
+    profiles: [archive, generic]
+    cost: low
+    timeout: 120
+    parser: sevenzip
+
+  pngcheck:
+    priority: P0
+    executables: [pngcheck]
+    profiles: [image, steganography]
+    accepts: [png]
+    cost: low
+    timeout: 30
+    parser: pngcheck
+
+  zsteg:
+    priority: P0
+    executables: [zsteg]
+    profiles: [image, steganography]
+    accepts: [png, bmp]
+    cost: medium
+    timeout: 120
+    parser: zsteg
+
+  steghide:
+    priority: P0
+    executables: [steghide]
+    profiles: [steganography]
+    cost: medium
+    timeout: 120
+    parser: generic
+
+  stegseek:
+    priority: P0
+    executables: [stegseek]
+    profiles: [steganography]
+    cost: high
+    timeout: 300
+    parser: generic
+
+  outguess:
+    priority: P1
+    executables: [outguess]
+    profiles: [steganography]
+    accepts: [jpeg]
+    cost: medium
+    timeout: 120
+    parser: generic
+
+  tshark:
+    priority: P0
+    executables: [tshark]
+    profiles: [pcap]
+    cost: medium
+    timeout: 180
+    parser: tshark
+    commands:
+      default: ["{executable}", "-n", "-r", "{evidence}", "--export-objects", "http,{output_dir}", "-q", "-z", "io,phs"]
+      deep: ["{executable}", "-n", "-r", "{evidence}", "--export-objects", "http,{output_dir}", "-q", "-z", "io,phs"]
+
+  capinfos:
+    priority: P0
+    executables: [capinfos]
+    profiles: [pcap]
+    cost: low
+    timeout: 30
+    parser: capinfos
+
+  sleuthkit_mmls:
+    priority: P0
+    executables: [mmls]
+    profiles: [disk, filesystem]
+    cost: low
+    timeout: 60
+    parser: sleuthkit_mmls
+
+  sleuthkit_fls:
+    priority: P0
+    executables: [fls]
+    profiles: [disk, filesystem]
+    cost: medium
+    timeout: 180
+    parser: sleuthkit_fls
+
+  sleuthkit_fsstat:
+    priority: P0
+    executables: [fsstat]
+    profiles: [disk, filesystem]
+    cost: low
+    timeout: 90
+    parser: sleuthkit_fsstat
+
+  ewfinfo:
+    priority: P0
+    executables: [ewfinfo]
+    profiles: [disk]
+    cost: low
+    timeout: 60
+    parser: ewfinfo
+
+  volatility3:
+    priority: P0
+    executables: [vol, vol.py, vol-offline]
+    profiles: [memory]
+    cost: high
+    timeout: 600
+    parser: volatility3
+
+  volatility3_windows_psscan:
+    priority: P0
+    executables: [vol, vol.py, vol-offline]
+    profiles: [memory]
+    cost: high
+    timeout: 600
+    parser: volatility3
+
+  volatility3_windows_handles:
+    priority: P0
+    executables: [vol, vol.py, vol-offline]
+    profiles: [memory]
+    cost: high
+    timeout: 600
+    parser: volatility3
+
+  volatility3_windows_filescan:
+    priority: P0
+    executables: [vol, vol.py, vol-offline]
+    profiles: [memory]
+    cost: high
+    timeout: 600
+    parser: volatility3
+
+  volatility3_windows_dlllist:
+    priority: P0
+    executables: [vol, vol.py, vol-offline]
+    profiles: [memory]
+    cost: high
+    timeout: 600
+    parser: volatility3
+
+  volatility3_windows_malfind:
+    priority: P0
+    executables: [vol, vol.py, vol-offline]
+    profiles: [memory]
+    cost: high
+    timeout: 600
+    parser: volatility3
+
+  volatility3_windows_dumpfiles:
+    priority: P0
+    executables: [vol, vol.py, vol-offline]
+    profiles: [memory]
+    cost: high
+    timeout: 600
+    parser: generic
+    generates_files: true
+
+  pdfid:
+    priority: P0
+    executables: [pdfid.py, pdfid]
+    profiles: [pdf]
+    cost: low
+    timeout: 30
+    parser: pdfid
+
+  pdfinfo:
+    priority: P0
+    executables: [pdfinfo]
+    profiles: [pdf]
+    cost: low
+    timeout: 30
+    parser: pdfinfo
+
+  pdftotext:
+    priority: P0
+    executables: [pdftotext]
+    profiles: [pdf]
+    cost: low
+    timeout: 60
+    parser: pdftotext
+
+  qpdf:
+    priority: P0
+    executables: [qpdf]
+    profiles: [pdf]
+    cost: low
+    timeout: 60
+    parser: qpdf
+
+  pdfdetach:
+    priority: P0
+    executables: [pdfdetach]
+    profiles: [pdf]
+    cost: medium
+    timeout: 120
+    parser: generic
+
+  pdfimages:
+    priority: P0
+    executables: [pdfimages]
+    profiles: [pdf, image, steganography]
+    cost: medium
+    timeout: 180
+    parser: generic
+
+  pdf_parser:
+    priority: P0
+    executables: [pdf-parser.py]
+    profiles: [pdf]
+    cost: medium
+    timeout: 120
+    parser: pdf_parser
+
+  olevba:
+    priority: P0
+    executables: [olevba]
+    profiles: [office]
+    cost: medium
+    timeout: 120
+    parser: olevba
+
+  oledump:
+    priority: P0
+    executables: [oledump.py]
+    profiles: [office]
+    cost: medium
+    timeout: 120
+    parser: oledump
+
+  regripper:
+    priority: P0
+    executables: [regripper, rip.pl]
+    profiles: [registry, windows]
+    cost: medium
+    timeout: 180
+    parser: regripper
+
+  hayabusa:
+    priority: P0
+    executables: [hayabusa]
+    profiles: [evtx, windows]
+    cost: high
+    timeout: 600
+    parser: generic
+
+  chainsaw:
+    priority: P0
+    executables: [chainsaw]
+    profiles: [evtx, windows]
+    cost: high
+    timeout: 600
+    parser: event_json
+
+  aleapp:
+    priority: P0
+    executables: [aleapp]
+    profiles: [android, mobile]
+    cost: high
+    timeout: 900
+    parser: leapp
+
+  ileapp:
+    priority: P0
+    executables: [ileapp]
+    profiles: [ios, mobile]
+    cost: high
+    timeout: 900
+    parser: leapp
+
+  apktool:
+    priority: P0
+    executables: [apktool]
+    profiles: [android, mobile]
+    accepts: [apk]
+    cost: medium
+    timeout: 300
+    parser: generic
+
+  jadx:
+    priority: P0
+    executables: [jadx]
+    profiles: [android, mobile]
+    accepts: [apk]
+    cost: high
+    timeout: 600
+    parser: generic
+
+  readelf:
+    priority: P1
+    executables: [readelf]
+    profiles: [executable]
+    accepts: [elf]
+    cost: low
+    timeout: 60
+    parser: readelf
