@@ -5158,8 +5158,9 @@ class GenericTriageEngine:
                             continue
                         base = entry[1:8].decode("cp437", errors="replace").rstrip(" ")
                         extension = entry[8:11].decode("cp437", errors="replace").rstrip(" ")
-                        first_cluster = int.from_bytes(entry[20:22], "little") << 16 | int.from_bytes(entry[26:28], "little")
-                        deleted.append({
+                        raw_cluster = int.from_bytes(entry[20:22], "little") << 16 | int.from_bytes(entry[26:28], "little")
+                        first_cluster = raw_cluster & 0x0FFFFFFF
+                        recovered: dict[str, object] = {
                             "directory_start_cluster": start,
                             "directory_cluster_lineage": lineage,
                             "directory_source_entry_offset": directory.get("source_entry_offset"),
@@ -5169,9 +5170,29 @@ class GenericTriageEngine:
                             "first_character_unknown": True,
                             "attributes": f"0x{attributes:02X}",
                             "first_cluster": first_cluster,
+                            "cluster_field_raw": f"0x{raw_cluster:08X}",
+                            "fat32_cluster_high_reserved": raw_cluster >> 28,
                             "size": int.from_bytes(entry[28:32], "little"),
                             "raw_hex": entry.hex(),
-                        })
+                        }
+                        if pending_lfn:
+                            lfn, lfn_error = GenericTriageEngine._fat_deleted_lfn_candidate(
+                                pending_lfn, entry, offsets,
+                            )
+                            if lfn is not None:
+                                recovered.update(lfn)
+                            elif len(unlinked_lfn_slots) < 256:
+                                unlinked_lfn_slots.append({
+                                    "directory_start_cluster": start,
+                                    "directory_cluster_lineage": lineage,
+                                    "directory_source_entry_offset": directory.get("source_entry_offset"),
+                                    "short_entry_index": index,
+                                    "short_entry_offset": offsets[index],
+                                    "slot_offsets": [offsets[slot_index] for slot_index, _ in pending_lfn],
+                                    "reason": lfn_error,
+                                    "raw_hex": [slot.hex() for _, slot in pending_lfn],
+                                })
+                        deleted.append(recovered)
                         pending_lfn = []
                         if len(deleted) >= 512:
                             return (

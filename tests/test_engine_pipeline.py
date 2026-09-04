@@ -2084,7 +2084,10 @@ def test_fat32_noncontiguous_subdirectory_lfn_file_keeps_selected_fat_lineage(tm
     for offset in (fat0_offset, fat1_offset):
         image[offset:offset + 8] = b"\xf8\xff\xff\x0f\xff\xff\xff\x0f"
     image[fat0_offset + 2 * 4:fat0_offset + 2 * 4 + 4] = (0x0FFFFFFF).to_bytes(4, "little")
-    for cluster, next_cluster in ((2, 0x0FFFFFFF), (5, 9), (9, 0x0FFFFFFF), (7, 0x0FFFFFFF)):
+    for cluster, next_cluster in (
+        (2, 0x0FFFFFFF), (5, 9), (9, 0x0FFFFFFF),
+        (7, 0x0FFFFFFF), (8, 0x0FFFFFFF),
+    ):
         offset = fat1_offset + cluster * 4
         image[offset:offset + 4] = next_cluster.to_bytes(4, "little")
     root_offset = first_data_sector * sector_size
@@ -2123,6 +2126,33 @@ def test_fat32_noncontiguous_subdirectory_lfn_file_keeps_selected_fat_lineage(tm
     image[short_offset + 28:short_offset + 32] = len(payload).to_bytes(4, "little")
     content_offset = (first_data_sector + 5) * sector_size
     image[content_offset:content_offset + len(payload)] = payload
+    deleted_short_name = b"DELETE~1TXT"
+    deleted_long_name = "Deleted.txt"
+    deleted_checksum = GenericTriageEngine._fat_short_name_checksum(deleted_short_name)
+    deleted_encoded_name = deleted_long_name.encode("utf-16le")
+    deleted_units = [
+        int.from_bytes(deleted_encoded_name[offset:offset + 2], "little")
+        for offset in range(0, len(deleted_encoded_name), 2)
+    ]
+    deleted_units.extend([0, *([0xFFFF] * (12 - len(deleted_units)))])
+    deleted_slot_offset = second_directory_offset + 64
+    deleted_slot = bytearray(32)
+    deleted_slot[0] = 0xE5
+    deleted_slot[11] = 0x0F
+    deleted_slot[13] = deleted_checksum
+    deleted_encoded_slot = b"".join(value.to_bytes(2, "little") for value in deleted_units)
+    deleted_slot[1:11] = deleted_encoded_slot[:10]
+    deleted_slot[14:26] = deleted_encoded_slot[10:22]
+    deleted_slot[28:32] = deleted_encoded_slot[22:26]
+    image[deleted_slot_offset:deleted_slot_offset + 32] = deleted_slot
+    deleted_short_offset = deleted_slot_offset + 32
+    image[deleted_short_offset:deleted_short_offset + 11] = b"\xe5" + deleted_short_name[1:]
+    image[deleted_short_offset + 11] = 0x20
+    image[deleted_short_offset + 26:deleted_short_offset + 28] = (8).to_bytes(2, "little")
+    deleted_payload = b"CTF{fat32_subdirectory_deleted_lfn}"
+    image[deleted_short_offset + 28:deleted_short_offset + 32] = len(deleted_payload).to_bytes(4, "little")
+    deleted_content_offset = (first_data_sector + 6) * sector_size
+    image[deleted_content_offset:deleted_content_offset + len(deleted_payload)] = deleted_payload
     evidence = tmp_path / "fat32-subdirectory-active-lfn.raw"
     evidence.write_bytes(image)
 
@@ -2132,9 +2162,15 @@ def test_fat32_noncontiguous_subdirectory_lfn_file_keeps_selected_fat_lineage(tm
     )
 
     child = next(item for item in result.artifacts if item.logical_name == long_name)
+    deleted_child = next(item for item in result.artifacts if item.logical_name == deleted_long_name)
     assert child.parent_id == result.root_artifact.id and child.size == len(payload)
+    assert deleted_child.parent_id == result.root_artifact.id and deleted_child.size == len(deleted_payload)
     assert any(
         item.value == "CTF{fat32_subdirectory_lfn_active}" and item.artifact_id == child.id
+        for item in result.flags
+    )
+    assert any(
+        item.value == "CTF{fat32_subdirectory_deleted_lfn}" and item.artifact_id == deleted_child.id
         for item in result.flags
     )
     inventory = next(
@@ -2171,6 +2207,18 @@ def test_fat32_noncontiguous_subdirectory_lfn_file_keeps_selected_fat_lineage(tm
     assert f"directory_source_entry_offset:{root_offset}" in active_evidence
     assert f"'fat_entry_offset': {fat1_offset + 7 * 4}" in active_evidence
     assert f"'physical_offset': {content_offset}" in active_evidence
+    deleted_finding = next(
+        item for item in result.findings if item.category == "fat_deleted_content_recovery"
+    )
+    deleted_evidence = next(
+        item for item in deleted_finding.supporting_evidence if f"child:{deleted_child.id}" in item
+    )
+    assert f"entry_offset:{deleted_short_offset}" in deleted_evidence
+    assert f"lfn_slot_offsets:[{deleted_slot_offset}]" in deleted_evidence
+    assert "directory_start_cluster:5" in deleted_evidence
+    assert "directory_cluster_lineage:[5, 9]" in deleted_evidence
+    assert f"directory_source_entry_offset:{root_offset}" in deleted_evidence
+    assert f"physical_offset:{deleted_content_offset}" in deleted_evidence
 
     bad_lfn = bytearray(image)
     bad_lfn[second_directory_offset + 13] ^= 0xFF

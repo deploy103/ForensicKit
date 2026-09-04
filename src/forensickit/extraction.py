@@ -1835,6 +1835,7 @@ class ExtractionManager:
                     not isinstance(size, int) or size <= 0
                     or size > self.limits.max_single_artifact_size or size > 8 * 1024 * 1024
                     or not isinstance(first_cluster, int) or first_cluster < 2
+                    or entry.get("fat32_cluster_high_reserved", 0) != 0
                     or attributes < 0 or attributes & 0x18
                 ):
                     continue
@@ -1941,7 +1942,8 @@ class ExtractionManager:
                     f"child:{child.id};entry_index:{entry_index};entry_offset:{entry.get('offset')};"
                     f"name:{logical_name};first_cluster:{first_cluster};"
                     f"physical_offset:{chain[0]['physical_offset']};cluster_chain:{chain};"
-                    f"size:{size};attributes:{attributes_text};raw_entry:{entry.get('raw_hex')};"
+                    f"size:{size};attributes:{attributes_text};lfn_slot_offsets:{entry.get('lfn_slot_offsets')};"
+                    f"raw_entry:{entry.get('raw_hex')};"
                     f"directory_start_cluster:{entry.get('directory_start_cluster')};"
                     f"directory_cluster_lineage:{entry.get('directory_cluster_lineage')};"
                     f"directory_source_entry_offset:{entry.get('directory_source_entry_offset')};"

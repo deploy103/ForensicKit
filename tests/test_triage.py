@@ -1962,7 +1962,9 @@ def test_fat32_active_subdirectory_is_bounded_but_deleted_directory_is_not_trave
         "directory_start_cluster": 5, "directory_cluster_lineage": [5],
         "directory_source_entry_offset": 1024, "entry_index": 0,
         "offset": 2560, "short_name": "?HILD.TXT", "first_character_unknown": True,
-        "attributes": "0x20", "first_cluster": 8, "size": 77,
+        "attributes": "0x20", "first_cluster": 8,
+        "cluster_field_raw": "0x00000008", "fat32_cluster_high_reserved": 0,
+        "size": 77,
         "raw_hex": bytes(image[active_content:active_content + 32]).hex(),
     }]
     assert not any(item.get("short_name") == "?IDDEN.BIN" for item in values["filesystem.fat.subdirectory_deleted_entries"])
