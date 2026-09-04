@@ -1510,6 +1510,102 @@ def test_fat32_fsinfo_and_backup_sectors_keep_signature_hint_and_divergence_prov
     assert any(item.category == "fat32_fsinfo_anomaly" for item in invalid_profile.findings)
 
 
+def test_fat12_and_fat16_duplicate_tables_preserve_match_divergence_and_truncation(tmp_path: Path) -> None:
+    sector_size = 512
+    fat12_image = bytearray(4 * sector_size)
+    fat12_image[11:13] = sector_size.to_bytes(2, "little")
+    fat12_image[13] = 1
+    fat12_image[14:16] = (1).to_bytes(2, "little")
+    fat12_image[16] = 2
+    fat12_image[17:19] = (16).to_bytes(2, "little")
+    fat12_image[19:21] = (100).to_bytes(2, "little")
+    fat12_image[21] = 0xF0
+    fat12_image[22:24] = (1).to_bytes(2, "little")
+    fat12_image[54:62] = b"FAT12   "
+    fat12_image[510:512] = b"\x55\xaa"
+    reference_table = bytes((index * 17) & 0xFF for index in range(sector_size))
+    fat12_image[sector_size:2 * sector_size] = reference_table
+    fat12_image[2 * sector_size:3 * sector_size] = reference_table
+    matching_path = tmp_path / "fat12-matching-copies.raw"
+    matching_path.write_bytes(fat12_image)
+
+    matching_observations = GenericTriageEngine().analyze(_artifact(matching_path), matching_path)
+    matching = _values(matching_observations)["filesystem.fat12.fat_copies"]
+    assert matching["available"] is True
+    assert matching["authoritative_copy_selected"] is False
+    assert matching["all_copies_match"] is True
+    assert matching["copies"] == [
+        {
+            "index": 0, "offset": sector_size, "end_offset": 2 * sector_size,
+            "length": sector_size, "within_declared_volume": True,
+            "within_supplied_image": True, "available": True,
+        },
+        {
+            "index": 1, "offset": 2 * sector_size, "end_offset": 3 * sector_size,
+            "length": sector_size, "within_declared_volume": True,
+            "within_supplied_image": True, "available": True,
+        },
+    ]
+    assert matching["comparisons"] == [{
+        "reference_index": 0, "compared_index": 1, "available": True,
+        "compared_bytes": sector_size, "full_table_compared": True,
+        "match": True, "first_difference": None,
+    }]
+    matching_profile = ProfileEngine().evaluate(_artifact(matching_path), matching_observations)
+    matching_categories = {item.category for item in matching_profile.findings}
+    assert "fat12_fat_copy_inventory" in matching_categories
+    assert "fat12_fat_copy_anomaly" not in matching_categories
+
+    divergent_image = bytearray(fat12_image)
+    divergent_image[2 * sector_size + 19] ^= 0x5A
+    divergent_path = tmp_path / "fat12-divergent-copies.raw"
+    divergent_path.write_bytes(divergent_image)
+    divergent_observations = GenericTriageEngine().analyze(_artifact(divergent_path), divergent_path)
+    divergent = _values(divergent_observations)["filesystem.fat12.fat_copies"]
+    comparison = divergent["comparisons"][0]
+    assert divergent["all_copies_match"] is False
+    assert comparison["match"] is False
+    assert comparison["full_table_compared"] is False
+    assert comparison["compared_bytes"] == 20
+    assert comparison["first_difference"] == {
+        "relative_offset": 19,
+        "reference_absolute_offset": sector_size + 19,
+        "compared_absolute_offset": 2 * sector_size + 19,
+        "reference_byte": f"0x{reference_table[19]:02X}",
+        "compared_byte": f"0x{divergent_image[2 * sector_size + 19]:02X}",
+    }
+    divergent_profile = ProfileEngine().evaluate(_artifact(divergent_path), divergent_observations)
+    assert any(item.category == "fat12_fat_copy_anomaly" for item in divergent_profile.findings)
+
+    fat16_fat_sectors = 16
+    second_fat_offset = (1 + fat16_fat_sectors) * sector_size
+    truncated_fat16 = bytearray(second_fat_offset + 100)
+    truncated_fat16[11:13] = sector_size.to_bytes(2, "little")
+    truncated_fat16[13] = 1
+    truncated_fat16[14:16] = (1).to_bytes(2, "little")
+    truncated_fat16[16] = 2
+    truncated_fat16[17:19] = (16).to_bytes(2, "little")
+    truncated_fat16[19:21] = (4_119).to_bytes(2, "little")
+    truncated_fat16[21] = 0xF8
+    truncated_fat16[22:24] = fat16_fat_sectors.to_bytes(2, "little")
+    truncated_fat16[54:62] = b"FAT16   "
+    truncated_fat16[510:512] = b"\x55\xaa"
+    truncated_path = tmp_path / "fat16-truncated-second-copy.raw"
+    truncated_path.write_bytes(truncated_fat16)
+    truncated_observations = GenericTriageEngine().analyze(_artifact(truncated_path), truncated_path)
+    truncated = _values(truncated_observations)["filesystem.fat16.fat_copies"]
+    assert truncated["available"] is True
+    assert truncated["all_copies_match"] is None
+    assert truncated["copies"][0]["available"] is True
+    assert truncated["copies"][1]["available"] is False
+    assert truncated["copies"][1]["offset"] == second_fat_offset
+    assert truncated["copies"][1]["reason"] == "declared FAT range exceeds supplied image"
+    assert truncated["comparisons"][0]["available"] is False
+    assert truncated["comparisons"][0]["match"] is None
+    truncated_profile = ProfileEngine().evaluate(_artifact(truncated_path), truncated_observations)
+    assert any(item.category == "fat16_fat_copy_anomaly" for item in truncated_profile.findings)
+
+
 def test_fat32_deleted_lfn_chain_requires_checksum_and_terminal_validation(tmp_path: Path) -> None:
     image = bytearray(4096)
     image[11:13] = (512).to_bytes(2, "little")

@@ -2090,12 +2090,22 @@ class GenericTriageEngine:
                     header[16], int.from_bytes(header[36:40], "little"),
                 ))
             elif fat16:
+                observations.extend(self._inspect_fat_duplicate_tables(
+                    artifact, path, size, header, bytes_per_sector,
+                    sectors_per_cluster, int.from_bytes(header[14:16], "little"),
+                    header[16], fat_size_16, fat_bits=16,
+                ))
                 observations.extend(self._inspect_fat_fixed_root_directory(
                     artifact, path, size, header, bytes_per_sector,
                     sectors_per_cluster, int.from_bytes(header[14:16], "little"),
                     header[16], fat_size_16, fat_bits=16,
                 ))
             elif fat12:
+                observations.extend(self._inspect_fat_duplicate_tables(
+                    artifact, path, size, header, bytes_per_sector,
+                    sectors_per_cluster, int.from_bytes(header[14:16], "little"),
+                    header[16], fat_size_16, fat_bits=12,
+                ))
                 observations.extend(self._inspect_fat_fixed_root_directory(
                     artifact, path, size, header, bytes_per_sector,
                     sectors_per_cluster, int.from_bytes(header[14:16], "little"),
@@ -3617,6 +3627,170 @@ class GenericTriageEngine:
                 name_hash = ((name_hash << 15) | (name_hash >> 1)) & 0xFFFF
                 name_hash = (name_hash + value) & 0xFFFF
         return name_hash
+
+    def _inspect_fat_duplicate_tables(
+        self,
+        artifact: Artifact,
+        path: Path,
+        image_size: int,
+        header: bytes,
+        bytes_per_sector: int,
+        sectors_per_cluster: int,
+        reserved_sectors: int,
+        fat_count: int,
+        fat_size: int,
+        *,
+        fat_bits: int,
+    ) -> list[Observation]:
+        """Compare declared FAT12/16 tables without selecting an authoritative copy."""
+        variant = f"fat{fat_bits}"
+        prefix = f"filesystem.{variant}.fat_copies"
+        root_entries = int.from_bytes(header[17:19], "little")
+        total_sectors = (
+            int.from_bytes(header[19:21], "little")
+            or int.from_bytes(header[32:36], "little")
+        )
+        root_sectors = (
+            (root_entries * 32 + bytes_per_sector - 1) // bytes_per_sector
+            if bytes_per_sector else 0
+        )
+        first_data_sector = reserved_sectors + fat_count * fat_size + root_sectors
+        data_sectors = total_sectors - first_data_sector
+        cluster_count = data_sectors // sectors_per_cluster if sectors_per_cluster else 0
+        fat_size_bytes = fat_size * bytes_per_sector
+        fat_entry_capacity = (
+            fat_size_bytes // 2 if fat_bits == 16
+            else fat_size_bytes * 2 // 3 if fat_bits == 12
+            else 0
+        )
+        geometry_valid = (
+            bytes_per_sector in {512, 1024, 2048, 4096}
+            and sectors_per_cluster > 0
+            and sectors_per_cluster & (sectors_per_cluster - 1) == 0
+            and sectors_per_cluster <= 128 and reserved_sectors > 0
+            and 1 <= fat_count <= 4 and fat_size > 0
+            and 0 < root_entries <= 65_535 and total_sectors > first_data_sector
+            and (
+                (fat_bits == 16 and 4_085 <= cluster_count < 65_525)
+                or (fat_bits == 12 and 0 < cluster_count < 4_085)
+            )
+            and fat_entry_capacity >= cluster_count + 2
+        )
+        comparison_limit = 8 * _MIB
+        inventory: dict[str, object] = {
+            "available": geometry_valid and fat_count >= 2,
+            "variant": variant,
+            "declared_count": fat_count,
+            "fat_size_bytes": fat_size_bytes,
+            "cluster_count": cluster_count,
+            "fat_entry_capacity": fat_entry_capacity,
+            "comparison_limit_bytes": comparison_limit,
+            "reference_copy_index": 0,
+            "authoritative_copy_selected": False,
+            "copies": [],
+            "comparisons": [],
+            "all_copies_match": None,
+        }
+        if not geometry_valid:
+            inventory["reason"] = f"invalid {variant.upper()} allocation-table geometry"
+            return [self._observation(artifact, prefix, inventory)]
+
+        declared_volume_bytes = total_sectors * bytes_per_sector
+        copies: list[dict[str, object]] = []
+        for copy_index in range(fat_count):
+            offset = (reserved_sectors + copy_index * fat_size) * bytes_per_sector
+            end_offset = offset + fat_size_bytes
+            within_declared_volume = end_offset <= declared_volume_bytes
+            within_supplied_image = end_offset <= image_size
+            copy_record: dict[str, object] = {
+                "index": copy_index,
+                "offset": offset,
+                "end_offset": end_offset,
+                "length": fat_size_bytes,
+                "within_declared_volume": within_declared_volume,
+                "within_supplied_image": within_supplied_image,
+                "available": within_declared_volume and within_supplied_image,
+            }
+            if not within_declared_volume:
+                copy_record["reason"] = "declared FAT range exceeds declared volume"
+            elif not within_supplied_image:
+                copy_record["reason"] = "declared FAT range exceeds supplied image"
+            copies.append(copy_record)
+        inventory["copies"] = copies
+        if fat_count < 2:
+            inventory["reason"] = "fewer than two FAT copies are declared"
+            return [self._observation(artifact, prefix, inventory)]
+
+        comparisons: list[dict[str, object]] = []
+        reference = copies[0]
+        try:
+            with path.open("rb") as stream:
+                for copy_record in copies[1:]:
+                    comparison: dict[str, object] = {
+                        "reference_index": 0,
+                        "compared_index": copy_record["index"],
+                        "available": bool(reference["available"] and copy_record["available"]),
+                        "compared_bytes": 0,
+                        "full_table_compared": False,
+                        "match": None,
+                        "first_difference": None,
+                    }
+                    if not comparison["available"]:
+                        comparison["reason"] = "one or both declared FAT copies are unavailable"
+                        comparisons.append(comparison)
+                        continue
+                    scan_bytes = min(fat_size_bytes, comparison_limit)
+                    scanned = 0
+                    difference: dict[str, object] | None = None
+                    while scanned < scan_bytes:
+                        take = min(64 * 1024, scan_bytes - scanned)
+                        stream.seek(int(reference["offset"]) + scanned)
+                        reference_chunk = stream.read(take)
+                        stream.seek(int(copy_record["offset"]) + scanned)
+                        compared_chunk = stream.read(take)
+                        if len(reference_chunk) != take or len(compared_chunk) != take:
+                            comparison["reason"] = "truncated FAT comparison read"
+                            break
+                        relative = next(
+                            (
+                                index for index, (reference_byte, compared_byte)
+                                in enumerate(zip(reference_chunk, compared_chunk, strict=True))
+                                if reference_byte != compared_byte
+                            ),
+                            None,
+                        )
+                        if relative is not None:
+                            relative += scanned
+                            difference = {
+                                "relative_offset": relative,
+                                "reference_absolute_offset": int(reference["offset"]) + relative,
+                                "compared_absolute_offset": int(copy_record["offset"]) + relative,
+                                "reference_byte": f"0x{reference_chunk[relative - scanned]:02X}",
+                                "compared_byte": f"0x{compared_chunk[relative - scanned]:02X}",
+                            }
+                            scanned = relative + 1
+                            break
+                        scanned += take
+                    comparison["compared_bytes"] = scanned
+                    comparison["first_difference"] = difference
+                    if difference is not None:
+                        comparison["match"] = False
+                    elif scanned == fat_size_bytes:
+                        comparison["full_table_compared"] = True
+                        comparison["match"] = True
+                    elif scanned == comparison_limit and fat_size_bytes > comparison_limit:
+                        comparison["comparison_bound_reached"] = True
+                        comparison["reason"] = "declared FAT exceeds bounded comparison limit"
+                    comparisons.append(comparison)
+        except OSError as exc:
+            inventory["error"] = str(exc)[:2_000]
+        inventory["comparisons"] = comparisons
+        matches = [comparison.get("match") for comparison in comparisons]
+        if any(match is False for match in matches):
+            inventory["all_copies_match"] = False
+        elif len(matches) == fat_count - 1 and all(match is True for match in matches):
+            inventory["all_copies_match"] = True
+        return [self._observation(artifact, prefix, inventory)]
 
     def _inspect_fat_fixed_root_directory(
         self,

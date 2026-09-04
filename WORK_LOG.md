@@ -1,5 +1,18 @@
 # ForensicKit Work Log
 
+## 2026-09-04 22:27 KST
+
+### FAT12/16 duplicate allocation-table validation
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/profiles/disk.py`, and `tests/test_triage.py`.
+- Every BPB-declared FAT12/16 table now retains its index, exact byte range, declared-volume bound, supplied-image bound, and availability. Available secondary copies are compared against copy zero in 64-KiB streaming chunks under an explicit 8-MiB cap; complete matches, bounded-prefix results, and the first different relative/reference/copy absolute byte offsets and values are distinct states.
+- The inventory explicitly records that no authoritative copy was selected. Disk-profile inventory and anomaly findings separate complete equality from divergence, unavailable/truncated copies, invalid geometry, and comparison-bound exhaustion.
+- Added synthetic coverage for two equal FAT12 tables, a FAT12 divergence at relative byte 19 with both absolute offsets/values, and a FAT16 image truncated inside its second declared table. Verified compileall, all 87 focused triage regressions, and `git diff --check`.
+
+### Next
+
+- Apply duplicate-table validation to FAT32 while respecting BPB ExtFlags: mirrored copies should agree, whereas mirroring-disabled volumes must retain the declared active index without treating expected inactive-copy divergence as corruption.
+
 ## 2026-09-04 22:19 KST
 
 ### FAT32 FSInfo and backup metadata validation
