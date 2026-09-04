@@ -1,5 +1,18 @@
 # ForensicKit Work Log
 
+## 2026-09-05 02:31 KST
+
+### Recursive validated-partition child materialization
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/extraction.py`, and `tests/test_engine_pipeline.py`.
+- Structurally valid primary MBR, EBR logical, and CRC-gated GPT filesystem records can now supply complete partition children only when the full declared range is present and the depth, artifact-count, single-artifact, and cumulative extraction budgets allow it. Copying uses bounded 1-MiB chunks into the isolated workspace; the original image is never mounted or modified.
+- Each `validated_partition_extraction` finding retains the exact source observation UUID/key, MBR/EBR/GPT record, partition offset/length, validated filesystem, child UUID, and extraction source. Table-entry status/usable-range/absolute-entry-offset provenance was strengthened, and an invalid entry cannot drive boot confirmation or child materialization.
+- An AUTO Engine E2E now follows whole MBR image → 2-KiB FAT12 partition child → active `FLAG.TXT` child → exact child FlagCandidate, with JSON report and parent IDs asserted. Re-running under a 1-KiB single-artifact cap yields only the root evidence and an explicit extraction-limit error. Combined triage/Engine regression passed: 143 passed, 0 failed. The full direct synthetic suite passed: 304 passed, 0 failed; compileall and `git diff --check` passed.
+
+### Next
+
+- Inventory cross-entry extent overlaps/duplicates across primary, logical, and GPT tables and prevent ambiguous overlapping partition candidates from becoming recursive children while retaining both records as evidence.
+
 ## 2026-09-05 02:19 KST
 
 ### Bounded EBR logical-partition traversal
