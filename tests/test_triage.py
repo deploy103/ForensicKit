@@ -1809,6 +1809,114 @@ def test_fat12_lost_chain_inventory_excludes_validated_active_file_chain(tmp_pat
     assert "rather than proof of deletion" in finding.explanation
 
 
+def test_fat12_subdirectory_invalid_active_and_deleted_lfns_keep_lineage(tmp_path: Path) -> None:
+    sector_size = 512
+    first_data_sector = 3
+    image = bytearray(10 * sector_size)
+    image[11:13] = sector_size.to_bytes(2, "little")
+    image[13] = 1
+    image[14:16] = (1).to_bytes(2, "little")
+    image[16] = 1
+    image[17:19] = (16).to_bytes(2, "little")
+    image[19:21] = (100).to_bytes(2, "little")
+    image[21] = 0xF0
+    image[22:24] = (1).to_bytes(2, "little")
+    image[54:62] = b"FAT12   "
+    image[510:512] = b"\x55\xaa"
+    image[sector_size:sector_size + 3] = b"\xf0\xff\xff"
+
+    def set_fat12(cluster: int, value: int) -> None:
+        offset = sector_size + cluster + cluster // 2
+        packed = int.from_bytes(image[offset:offset + 2], "little")
+        if cluster & 1:
+            packed = (packed & 0x000F) | ((value & 0x0FFF) << 4)
+        else:
+            packed = (packed & 0xF000) | (value & 0x0FFF)
+        image[offset:offset + 2] = packed.to_bytes(2, "little")
+
+    for cluster in (4, 5, 7):
+        set_fat12(cluster, 0xFFF)
+    root_offset = 2 * sector_size
+    image[root_offset:root_offset + 11] = b"ACTIVE     "
+    image[root_offset + 11] = 0x10
+    image[root_offset + 26:root_offset + 28] = (7).to_bytes(2, "little")
+    directory_offset = (first_data_sector + 5) * sector_size
+
+    def lfn_slot(long_name: str, short_name: bytes, *, deleted: bool) -> bytearray:
+        encoded_name = long_name.encode("utf-16le")
+        units = [
+            int.from_bytes(encoded_name[offset:offset + 2], "little")
+            for offset in range(0, len(encoded_name), 2)
+        ]
+        units.extend([0, *([0xFFFF] * (12 - len(units)))])
+        slot = bytearray(32)
+        slot[0] = 0xE5 if deleted else 0x41
+        slot[11] = 0x0F
+        slot[13] = GenericTriageEngine._fat_short_name_checksum(short_name)
+        encoded = b"".join(value.to_bytes(2, "little") for value in units)
+        slot[1:11] = encoded[:10]
+        slot[14:26] = encoded[10:22]
+        slot[28:32] = encoded[22:26]
+        return slot
+
+    active_short_name = b"ACTIVE~1TXT"
+    active_slot = lfn_slot("Broken.txt", active_short_name, deleted=False)
+    active_slot[13] ^= 0xFF
+    image[directory_offset:directory_offset + 32] = active_slot
+    active_short_offset = directory_offset + 32
+    image[active_short_offset:active_short_offset + 11] = active_short_name
+    image[active_short_offset + 11] = 0x20
+    image[active_short_offset + 26:active_short_offset + 28] = (4).to_bytes(2, "little")
+    image[active_short_offset + 28:active_short_offset + 32] = (1).to_bytes(4, "little")
+
+    deleted_short_name = b"DELETE~1TXT"
+    deleted_slot_offset = directory_offset + 64
+    deleted_slot = lfn_slot("Deleted.txt", deleted_short_name, deleted=True)
+    deleted_slot[12] = 1
+    image[deleted_slot_offset:deleted_slot_offset + 32] = deleted_slot
+    deleted_short_offset = directory_offset + 96
+    image[deleted_short_offset:deleted_short_offset + 11] = b"\xe5" + deleted_short_name[1:]
+    image[deleted_short_offset + 11] = 0x20
+    image[deleted_short_offset + 26:deleted_short_offset + 28] = (5).to_bytes(2, "little")
+    image[deleted_short_offset + 28:deleted_short_offset + 32] = (1).to_bytes(4, "little")
+    evidence = tmp_path / "fat12-subdirectory-invalid-lfns.raw"
+    evidence.write_bytes(image)
+
+    artifact = _artifact(evidence)
+    observations = GenericTriageEngine().analyze(artifact, evidence)
+    values = _values(observations)
+    active_files = values["filesystem.fat12.root.recoverable_regular_files"]
+    assert active_files[0]["short_name"] == "ACTIVE~1.TXT"
+    assert "long_name" not in active_files[0]
+    deleted = values["filesystem.fat12.root.subdirectory_deleted_entries"]
+    assert deleted[0]["short_name"] == "?ELETE~1.TXT"
+    assert "long_name" not in deleted[0]
+    assert values["filesystem.fat12.root.unlinked_lfn_slots"] == [
+        {
+            "directory_start_cluster": 7,
+            "directory_cluster_lineage": [7],
+            "directory_source_entry_offset": root_offset,
+            "short_entry_index": 1,
+            "short_entry_offset": active_short_offset,
+            "slot_offsets": [directory_offset],
+            "reason": "active LFN checksum does not match the short entry",
+            "raw_hex": [active_slot.hex()],
+        },
+        {
+            "directory_start_cluster": 7,
+            "directory_cluster_lineage": [7],
+            "directory_source_entry_offset": root_offset,
+            "short_entry_index": 3,
+            "short_entry_offset": deleted_short_offset,
+            "slot_offsets": [deleted_slot_offset],
+            "reason": "LFN slot type, attributes, or first-cluster field is invalid",
+            "raw_hex": [deleted_slot.hex()],
+        },
+    ]
+    profile = ProfileEngine().evaluate(artifact, observations)
+    assert any(item.category == "fat12_unlinked_lfn_slots" for item in profile.findings)
+
+
 def test_fat32_deleted_lfn_chain_requires_checksum_and_terminal_validation(tmp_path: Path) -> None:
     image = bytearray(4096)
     image[11:13] = (512).to_bytes(2, "little")

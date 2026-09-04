@@ -735,6 +735,27 @@ class DiskProfile(BaseProfile):
                     evidence=[str(item)[:2_000] for item in active_fat_files[:256]],
                     severity="info",
                 ))
+        for fat_bits in (12, 16):
+            unlinked_lfn_slots = next(
+                (
+                    value for value in context.values(
+                        f"filesystem.fat{fat_bits}.root.unlinked_lfn_slots"
+                    ) if isinstance(value, list)
+                ),
+                [],
+            )
+            if unlinked_lfn_slots:
+                result.findings.append(self.finding(
+                    context,
+                    title=f"{len(unlinked_lfn_slots)} FAT{fat_bits} LFN chain(s) could not be linked",
+                    category=f"fat{fat_bits}_unlinked_lfn_slots", confidence=0.94,
+                    explanation=(
+                        "One or more LFN slot sequences failed structure, ordinal, checksum, UTF-16, padding, or adjacent-short-entry validation. "
+                        "The short entry remains independently usable when valid, while exact LFN slot and containing-directory provenance is retained without trusting the long name."
+                    ),
+                    evidence=[str(item)[:2_000] for item in unlinked_lfn_slots[:256]],
+                    severity="low",
+                ))
         qcow_header = next((value for value in context.values("disk.qcow2.header") if isinstance(value, dict)), {})
         vhd_footer = next((value for value in context.values("disk.vhd.footer") if isinstance(value, dict)), {})
         virtual_disk = context.format_is("vhd", "qcow2") or bool(qcow_header.get("valid")) or bool(vhd_footer.get("signature"))

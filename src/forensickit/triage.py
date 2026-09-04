@@ -3985,6 +3985,7 @@ class GenericTriageEngine:
         (
             subdirectory_entries, subdirectory_inventory, subdirectory_errors,
             active_cluster_starts, subdirectory_active_files,
+            subdirectory_unlinked_lfn_slots,
         ) = (
             self._fat_fixed_subdirectory_deleted_entries(
                 path, image_size, data, entry_offsets, bytes_per_sector,
@@ -4126,7 +4127,10 @@ class GenericTriageEngine:
             self._observation(artifact, f"{prefix}.subdirectory_inventory", subdirectory_inventory),
             self._observation(artifact, f"{prefix}.subdirectory_errors", subdirectory_errors),
             self._observation(artifact, f"filesystem.{variant}.lost_chains", lost_chains),
-            self._observation(artifact, f"{prefix}.unlinked_lfn_slots", unlinked_lfn_slots),
+            self._observation(
+                artifact, f"{prefix}.unlinked_lfn_slots",
+                [*unlinked_lfn_slots, *subdirectory_unlinked_lfn_slots][:512],
+            ),
             self._observation(artifact, f"{prefix}.deleted_entries_truncated", len(deleted_entries) >= 256),
         ]
 
@@ -4146,7 +4150,7 @@ class GenericTriageEngine:
         fat_bits: int,
     ) -> tuple[
         list[dict[str, object]], list[dict[str, object]], list[str], set[int],
-        list[dict[str, object]],
+        list[dict[str, object]], list[dict[str, object]],
     ]:
         """Traverse exact-EOC active FAT12/16 directories and inventory deleted children."""
         variant = f"FAT{fat_bits}"
@@ -4159,6 +4163,7 @@ class GenericTriageEngine:
         visited_clusters: set[int] = set()
         active_cluster_starts: set[int] = set()
         active_regular_files: list[dict[str, object]] = []
+        unlinked_lfn_slots: list[dict[str, object]] = []
         total_clusters = 0
         total_bytes = 0
 
@@ -4288,6 +4293,17 @@ class GenericTriageEngine:
                     for index in range(min(len(directory_data) // 32, 2_048)):
                         entry = directory_data[index * 32:(index + 1) * 32]
                         if entry[0] == 0:
+                            if pending_lfn and len(unlinked_lfn_slots) < 256:
+                                unlinked_lfn_slots.append({
+                                    "directory_start_cluster": start,
+                                    "directory_cluster_lineage": lineage,
+                                    "directory_source_entry_offset": directory.get("source_entry_offset"),
+                                    "short_entry_index": None,
+                                    "short_entry_offset": None,
+                                    "slot_offsets": [offsets[slot_index] for slot_index, _ in pending_lfn],
+                                    "reason": "LFN slots are not followed by a short entry",
+                                    "raw_hex": [slot.hex() for _, slot in pending_lfn],
+                                })
                             break
                         attributes = entry[11]
                         if attributes == 0x0F:
@@ -4319,11 +4335,22 @@ class GenericTriageEngine:
                                         "size": file_size, "raw_hex": entry.hex(),
                                     }
                                     if pending_lfn:
-                                        lfn, _ = GenericTriageEngine._fat_active_lfn_candidate(
+                                        lfn, lfn_error = GenericTriageEngine._fat_active_lfn_candidate(
                                             pending_lfn, entry, offsets,
                                         )
                                         if lfn is not None:
                                             active_file.update(lfn)
+                                        elif len(unlinked_lfn_slots) < 256:
+                                            unlinked_lfn_slots.append({
+                                                "directory_start_cluster": start,
+                                                "directory_cluster_lineage": lineage,
+                                                "directory_source_entry_offset": directory.get("source_entry_offset"),
+                                                "short_entry_index": index,
+                                                "short_entry_offset": offsets[index],
+                                                "slot_offsets": [offsets[slot_index] for slot_index, _ in pending_lfn],
+                                                "reason": lfn_error,
+                                                "raw_hex": [slot.hex() for _, slot in pending_lfn],
+                                            })
                                     active_regular_files.append(active_file)
                             pending_lfn = []
                             continue
@@ -4344,23 +4371,37 @@ class GenericTriageEngine:
                             "raw_hex": entry.hex(),
                         }
                         if pending_lfn:
-                            lfn, _ = GenericTriageEngine._fat_deleted_lfn_candidate(
+                            lfn, lfn_error = GenericTriageEngine._fat_deleted_lfn_candidate(
                                 pending_lfn, entry, offsets
                             )
                             if lfn is not None:
                                 recovered.update(lfn)
+                            elif len(unlinked_lfn_slots) < 256:
+                                unlinked_lfn_slots.append({
+                                    "directory_start_cluster": start,
+                                    "directory_cluster_lineage": lineage,
+                                    "directory_source_entry_offset": directory.get("source_entry_offset"),
+                                    "short_entry_index": index,
+                                    "short_entry_offset": offsets[index],
+                                    "slot_offsets": [offsets[slot_index] for slot_index, _ in pending_lfn],
+                                    "reason": lfn_error,
+                                    "raw_hex": [slot.hex() for _, slot in pending_lfn],
+                                })
                         deleted.append(recovered)
                         pending_lfn = []
                         if len(deleted) >= 512:
                             return (
                                 deleted, inventory, errors, active_cluster_starts,
-                                active_regular_files,
+                                active_regular_files, unlinked_lfn_slots,
                             )
         except OSError as exc:
             errors.append(str(exc)[:2_000])
         if queue:
             errors.append(f"{variant} subdirectory traversal reached the 32-directory/64-cluster/8-MiB bound")
-        return deleted, inventory, errors, active_cluster_starts, active_regular_files
+        return (
+            deleted, inventory, errors, active_cluster_starts,
+            active_regular_files, unlinked_lfn_slots,
+        )
 
     @staticmethod
     def _fat_lost_chain_inventory(
