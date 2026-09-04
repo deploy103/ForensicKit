@@ -1950,6 +1950,114 @@ def test_mbr_partition_boot_filesystems_are_offset_validated_without_trusting_ty
     assert "'boot_sector_offset': 2560" in boot_anomaly.supporting_evidence[0]
 
 
+def test_ebr_logical_partitions_use_current_and_extended_base_relative_offsets(tmp_path: Path) -> None:
+    sector_size = 512
+    image = bytearray(20 * sector_size)
+    image[446 + 4] = 0x0F
+    image[446 + 8:446 + 12] = (1).to_bytes(4, "little")
+    image[446 + 12:446 + 16] = (15).to_bytes(4, "little")
+    image[510:512] = b"\x55\xaa"
+
+    first_ebr = sector_size
+    image[first_ebr + 446 + 4] = 0x06
+    image[first_ebr + 446 + 8:first_ebr + 446 + 12] = (1).to_bytes(4, "little")
+    image[first_ebr + 446 + 12:first_ebr + 446 + 16] = (4).to_bytes(4, "little")
+    image[first_ebr + 462 + 4] = 0x0F
+    image[first_ebr + 462 + 8:first_ebr + 462 + 12] = (6).to_bytes(4, "little")
+    image[first_ebr + 462 + 12:first_ebr + 462 + 16] = (9).to_bytes(4, "little")
+    image[first_ebr + 510:first_ebr + 512] = b"\x55\xaa"
+
+    second_ebr = 7 * sector_size
+    image[second_ebr + 446 + 4] = 0x07
+    image[second_ebr + 446 + 8:second_ebr + 446 + 12] = (1).to_bytes(4, "little")
+    image[second_ebr + 446 + 12:second_ebr + 446 + 16] = (4).to_bytes(4, "little")
+    image[second_ebr + 510:second_ebr + 512] = b"\x55\xaa"
+
+    fat = 2 * sector_size
+    image[fat:fat + 3] = b"\xeb\x3c\x90"
+    image[fat + 11:fat + 13] = sector_size.to_bytes(2, "little")
+    image[fat + 13] = 1
+    image[fat + 14:fat + 16] = (1).to_bytes(2, "little")
+    image[fat + 16] = 1
+    image[fat + 17:fat + 19] = (16).to_bytes(2, "little")
+    image[fat + 19:fat + 21] = (100).to_bytes(2, "little")
+    image[fat + 21] = 0xF8
+    image[fat + 22:fat + 24] = (1).to_bytes(2, "little")
+    image[fat + 28:fat + 32] = (2).to_bytes(4, "little")
+    image[fat + 510:fat + 512] = b"\x55\xaa"
+
+    ntfs = 8 * sector_size
+    image[ntfs:ntfs + 3] = b"\xeb\x52\x90"
+    image[ntfs + 3:ntfs + 11] = b"NTFS    "
+    image[ntfs + 11:ntfs + 13] = sector_size.to_bytes(2, "little")
+    image[ntfs + 13] = 1
+    image[ntfs + 21] = 0xF8
+    image[ntfs + 28:ntfs + 32] = (8).to_bytes(4, "little")
+    image[ntfs + 40:ntfs + 48] = (4).to_bytes(8, "little")
+    image[ntfs + 48:ntfs + 56] = (1).to_bytes(8, "little")
+    image[ntfs + 56:ntfs + 64] = (2).to_bytes(8, "little")
+    image[ntfs + 64] = 0xF6
+    image[ntfs + 68] = 0xF6
+    image[ntfs + 510:ntfs + 512] = b"\x55\xaa"
+
+    evidence = tmp_path / "ebr-logical-filesystems.raw"
+    evidence.write_bytes(image)
+    artifact = _artifact(evidence)
+    observations = GenericTriageEngine().analyze(artifact, evidence)
+    values = _values(observations)
+    chains = values["disk.mbr.ebr_chains"]
+    assert len(chains) == 1
+    assert chains[0]["termination"] == "end"
+    assert chains[0]["errors"] == []
+    assert chains[0]["extended_base_lba"] == 1
+    assert chains[0]["ebr_records"][0]["logical_entry_relative_to"] == "current_ebr_lba"
+    assert chains[0]["ebr_records"][0]["link_entry_relative_to"] == "extended_base_lba"
+    assert chains[0]["ebr_records"][0]["link_entry"]["absolute_ebr_lba"] == 7
+    logical = values["disk.mbr.logical_partitions"]
+    assert [item["start_lba"] for item in logical] == [2, 8]
+    assert [item["ebr_lba"] for item in logical] == [1, 7]
+    assert logical[0]["entry_offset"] == first_ebr + 446
+    assert logical[1]["entry_offset"] == second_ebr + 446
+
+    filesystems = values["disk.mbr.logical_partition_filesystems"]
+    assert [item["detected_filesystem"] for item in filesystems] == ["fat12", "ntfs"]
+    assert filesystems[0]["partition_table"] == "mbr_logical"
+    assert filesystems[0]["extended_base_lba"] == 1
+    assert filesystems[0]["ebr_offset"] == first_ebr
+    assert filesystems[0]["logical_entry_offset"] == first_ebr + 446
+    assert filesystems[0]["boot_sector_offset"] == fat
+    assert filesystems[0]["boot_declared_start_lba_matches_logical_entry"] is True
+    assert filesystems[0]["partition_type_matches_detected"] is False
+    assert filesystems[1]["ebr_offset"] == second_ebr
+    assert filesystems[1]["boot_sector_offset"] == ntfs
+    assert filesystems[1]["partition_type_matches_detected"] is True
+
+    profile = ProfileEngine().evaluate(artifact, observations)
+    logical_inventory = next(
+        item for item in profile.findings
+        if item.category == "mbr_logical_partition_filesystem_inventory"
+    )
+    assert "'logical_entry_offset': 958" in logical_inventory.supporting_evidence[0]
+    assert not any(item.category == "ebr_chain_anomaly" for item in profile.findings)
+
+    cyclic = bytearray(image)
+    cyclic[second_ebr + 462 + 4] = 0x0F
+    cyclic[second_ebr + 462 + 8:second_ebr + 462 + 12] = (6).to_bytes(4, "little")
+    cyclic[second_ebr + 462 + 12:second_ebr + 462 + 16] = (9).to_bytes(4, "little")
+    cyclic_path = tmp_path / "ebr-cycle.raw"
+    cyclic_path.write_bytes(cyclic)
+    cyclic_artifact = _artifact(cyclic_path)
+    cyclic_observations = GenericTriageEngine().analyze(cyclic_artifact, cyclic_path)
+    cyclic_chain = _values(cyclic_observations)["disk.mbr.ebr_chains"][0]
+    assert cyclic_chain["termination"] == "cycle"
+    assert cyclic_chain["errors"] == ["EBR chain cycles at LBA 7"]
+    cyclic_profile = ProfileEngine().evaluate(cyclic_artifact, cyclic_observations)
+    anomaly = next(
+        item for item in cyclic_profile.findings if item.category == "ebr_chain_anomaly"
+    )
+    assert "'ebr_lba': 7" in anomaly.supporting_evidence[0]
+
+
 def test_gpt_partition_filesystems_require_crc_validated_entries_and_keep_guid_provenance(tmp_path: Path) -> None:
     sector_size = 512
     image = bytearray(40 * sector_size)

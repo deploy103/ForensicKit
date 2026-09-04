@@ -746,9 +746,15 @@ class GenericTriageEngine:
         # is present; raw volume images retain filesystem-first routing.
         mbr_partitions = self._mbr_partitions(sector, size) if boot_signature else []
         mbr = bool(mbr_partitions)
+        ebr_chains, logical_partitions = self._mbr_logical_partitions(
+            path, size, mbr_partitions,
+        )
         gpt_details, gpt_partitions = self._gpt_partitions(path, size, gpt_header) if gpt else ({"valid": False}, [])
         partition_filesystems = self._inspect_mbr_partition_filesystems(
             path, size, mbr_partitions,
+        )
+        logical_partition_filesystems = self._inspect_mbr_logical_partition_filesystems(
+            path, size, logical_partitions,
         )
         gpt_filesystem_validation = {
             "eligible": bool(
@@ -777,6 +783,10 @@ class GenericTriageEngine:
             self._observation(artifact, "disk.mbr.partition_count", len(mbr_partitions)),
             self._observation(artifact, "disk.mbr.partitions", mbr_partitions),
             self._observation(artifact, "disk.mbr.partition_filesystems", partition_filesystems),
+            self._observation(artifact, "disk.mbr.ebr_chains", ebr_chains),
+            self._observation(artifact, "disk.mbr.logical_partition_count", len(logical_partitions)),
+            self._observation(artifact, "disk.mbr.logical_partitions", logical_partitions),
+            self._observation(artifact, "disk.mbr.logical_partition_filesystems", logical_partition_filesystems),
             self._observation(artifact, "disk.gpt.header", gpt_details),
             self._observation(artifact, "disk.gpt.partition_count", len(gpt_partitions)),
             self._observation(artifact, "disk.gpt.partitions", gpt_partitions),
@@ -903,6 +913,170 @@ class GenericTriageEngine:
                 "within_image": bool(sector_count and end_lba < sectors),
             })
         return partitions
+
+    @staticmethod
+    def _mbr_logical_partitions(
+        path: Path,
+        image_size: int,
+        primary_partitions: list[dict[str, object]],
+    ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+        """Follow bounded EBR chains with explicit current/base-relative semantics."""
+        extended_types = {"0x05", "0x0f", "0x85"}
+        type_names = {
+            0x01: "FAT12", 0x04: "FAT16", 0x06: "FAT16", 0x07: "NTFS/exFAT",
+            0x0B: "FAT32", 0x0C: "FAT32-LBA", 0x0E: "FAT16-LBA",
+            0x82: "Linux swap", 0x83: "Linux", 0x8E: "Linux LVM",
+        }
+        image_sectors = image_size // 512
+        chains: list[dict[str, object]] = []
+        logical_partitions: list[dict[str, object]] = []
+        for primary in primary_partitions:
+            if str(primary.get("type_code", "")).lower() not in extended_types:
+                continue
+            base_lba = int(primary.get("start_lba", 0))
+            extended_sectors = int(primary.get("sector_count", 0))
+            extended_end_lba = (
+                base_lba + extended_sectors - 1 if extended_sectors > 0 else base_lba
+            )
+            chain: dict[str, object] = {
+                "extended_primary_slot": primary.get("slot"),
+                "extended_type_code": primary.get("type_code"),
+                "extended_base_lba": base_lba,
+                "extended_end_lba": extended_end_lba,
+                "ebr_records": [],
+                "errors": [],
+                "termination": "limit",
+            }
+            records = chain["ebr_records"]
+            errors = chain["errors"]
+            if not isinstance(records, list) or not isinstance(errors, list):
+                continue
+            current_ebr_lba = base_lba
+            visited: set[int] = set()
+            for _ in range(32 - len(logical_partitions)):
+                if current_ebr_lba in visited:
+                    chain["termination"] = "cycle"
+                    errors.append(f"EBR chain cycles at LBA {current_ebr_lba}")
+                    break
+                if not (
+                    base_lba <= current_ebr_lba <= extended_end_lba
+                    and current_ebr_lba < image_sectors
+                ):
+                    chain["termination"] = "bounds"
+                    errors.append(f"EBR LBA {current_ebr_lba} is outside extended/image bounds")
+                    break
+                visited.add(current_ebr_lba)
+                ebr_offset = current_ebr_lba * 512
+                try:
+                    with path.open("rb") as stream:
+                        stream.seek(ebr_offset)
+                        sector = stream.read(512)
+                except OSError as exc:
+                    chain["termination"] = "read_error"
+                    errors.append(str(exc)[:2_000])
+                    break
+                if len(sector) != 512:
+                    chain["termination"] = "truncated_read"
+                    errors.append(f"EBR at LBA {current_ebr_lba} could not be read completely")
+                    break
+                ebr_record: dict[str, object] = {
+                    "ebr_lba": current_ebr_lba,
+                    "ebr_offset": ebr_offset,
+                    "signature_valid": sector[510:512] == b"\x55\xaa",
+                    "logical_entry_offset": ebr_offset + 446,
+                    "link_entry_offset": ebr_offset + 462,
+                    "logical_entry_relative_to": "current_ebr_lba",
+                    "link_entry_relative_to": "extended_base_lba",
+                }
+                records.append(ebr_record)
+                if not ebr_record["signature_valid"]:
+                    chain["termination"] = "invalid_signature"
+                    errors.append(f"EBR at LBA {current_ebr_lba} lacks the 55 AA marker")
+                    break
+                logical_entry = sector[446:462]
+                status, kind = logical_entry[0], logical_entry[4]
+                relative_start = int.from_bytes(logical_entry[8:12], "little")
+                sector_count = int.from_bytes(logical_entry[12:16], "little")
+                logical_start = current_ebr_lba + relative_start
+                logical_end = (
+                    logical_start + sector_count - 1 if sector_count else logical_start
+                )
+                logical_valid = (
+                    status in {0x00, 0x80}
+                    and kind != 0
+                    and f"0x{kind:02x}" not in extended_types
+                    and relative_start > 0
+                    and sector_count > 0
+                    and base_lba <= logical_start <= logical_end <= extended_end_lba
+                )
+                ebr_record["logical_entry"] = {
+                    "status": f"0x{status:02x}",
+                    "status_valid": status in {0x00, 0x80},
+                    "type_code": f"0x{kind:02x}",
+                    "relative_start_lba": relative_start,
+                    "sector_count": sector_count,
+                    "absolute_start_lba": logical_start,
+                    "absolute_end_lba": logical_end,
+                    "valid": logical_valid,
+                }
+                if kind or relative_start or sector_count:
+                    if logical_valid:
+                        logical_partitions.append({
+                            "logical_index": len(logical_partitions) + 1,
+                            "extended_primary_slot": primary.get("slot"),
+                            "extended_type_code": primary.get("type_code"),
+                            "extended_base_lba": base_lba,
+                            "extended_end_lba": extended_end_lba,
+                            "ebr_lba": current_ebr_lba,
+                            "ebr_offset": ebr_offset,
+                            "entry_offset": ebr_offset + 446,
+                            "status": f"0x{status:02x}",
+                            "bootable": status == 0x80,
+                            "type_code": f"0x{kind:02x}",
+                            "type": type_names.get(kind, "unknown"),
+                            "relative_start_lba": relative_start,
+                            "start_lba": logical_start,
+                            "sector_count": sector_count,
+                            "end_lba": logical_end,
+                            "within_extended_partition": True,
+                            "within_image": logical_end < image_sectors,
+                        })
+                    else:
+                        errors.append(f"invalid logical entry at EBR LBA {current_ebr_lba}")
+
+                link_entry = sector[462:478]
+                link_status, link_kind = link_entry[0], link_entry[4]
+                link_relative = int.from_bytes(link_entry[8:12], "little")
+                link_sectors = int.from_bytes(link_entry[12:16], "little")
+                ebr_record["link_entry"] = {
+                    "status": f"0x{link_status:02x}",
+                    "status_valid": link_status in {0x00, 0x80},
+                    "type_code": f"0x{link_kind:02x}",
+                    "relative_start_lba": link_relative,
+                    "sector_count": link_sectors,
+                    "absolute_ebr_lba": base_lba + link_relative if link_relative else None,
+                }
+                if link_kind == 0 and link_relative == 0 and link_sectors == 0:
+                    chain["termination"] = "end"
+                    break
+                next_ebr_lba = base_lba + link_relative
+                if (
+                    link_status not in {0x00, 0x80}
+                    or f"0x{link_kind:02x}" not in extended_types
+                    or link_relative <= 0
+                    or link_sectors <= 0
+                    or not base_lba <= next_ebr_lba <= extended_end_lba
+                ):
+                    chain["termination"] = "invalid_link"
+                    errors.append(f"invalid EBR link at LBA {current_ebr_lba}")
+                    break
+                current_ebr_lba = next_ebr_lba
+            else:
+                errors.append("EBR traversal reached the shared 32-logical-partition bound")
+            chains.append(chain)
+            if len(logical_partitions) >= 32:
+                break
+        return chains, logical_partitions
 
     def _inspect_mbr_partition_filesystems(
         self,
@@ -1060,6 +1234,48 @@ class GenericTriageEngine:
             record["detected_filesystem"] = detected
             if detected is not None and expected:
                 record["partition_type_matches_detected"] = detected in expected
+            results.append(record)
+        return results
+
+    def _inspect_mbr_logical_partition_filesystems(
+        self,
+        path: Path,
+        image_size: int,
+        partitions: list[dict[str, object]],
+    ) -> list[dict[str, object]]:
+        """Apply the shared boot validators to bounded EBR-derived partitions."""
+        results: list[dict[str, object]] = []
+        for partition in partitions[:32]:
+            pseudo_partition = {
+                "slot": partition.get("logical_index"),
+                "type_code": partition.get("type_code"),
+                "type": partition.get("type"),
+                "start_lba": partition.get("start_lba"),
+                "sector_count": partition.get("sector_count"),
+                "within_image": partition.get("within_image"),
+            }
+            records = self._inspect_mbr_partition_filesystems(
+                path, image_size, [pseudo_partition],
+            )
+            if not records:
+                continue
+            record = records[0]
+            record.update({
+                "partition_table": "mbr_logical",
+                "logical_partition_index": partition.get("logical_index"),
+                "extended_primary_slot": partition.get("extended_primary_slot"),
+                "extended_type_code": partition.get("extended_type_code"),
+                "extended_base_lba": partition.get("extended_base_lba"),
+                "extended_end_lba": partition.get("extended_end_lba"),
+                "ebr_lba": partition.get("ebr_lba"),
+                "ebr_offset": partition.get("ebr_offset"),
+                "logical_entry_offset": partition.get("entry_offset"),
+                "logical_relative_start_lba": partition.get("relative_start_lba"),
+            })
+            record.pop("slot", None)
+            record["boot_declared_start_lba_matches_logical_entry"] = record.pop(
+                "boot_declared_start_lba_matches_mbr", None,
+            )
             results.append(record)
         return results
 

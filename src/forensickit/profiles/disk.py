@@ -112,6 +112,109 @@ class DiskProfile(BaseProfile):
                 evidence=[str(item)[:4_000] for item in partition_boot_geometry_mismatches[:4]],
                 severity="medium",
             ))
+        ebr_chains = next(
+            (
+                value for value in context.values("disk.mbr.ebr_chains")
+                if isinstance(value, list)
+            ),
+            [],
+        )
+        ebr_errors = [
+            chain for chain in ebr_chains
+            if isinstance(chain, dict)
+            and (
+                chain.get("termination") != "end"
+                or bool(chain.get("errors"))
+            )
+        ]
+        if ebr_errors:
+            result.findings.append(self.finding(
+                context,
+                title=f"{len(ebr_errors)} extended MBR partition chain anomaly/anomalies",
+                category="ebr_chain_anomaly", confidence=0.97,
+                explanation=(
+                    "A bounded EBR walk encountered an invalid marker/entry/link, an out-of-range address, a cycle, a read failure, or the shared traversal bound. "
+                    "Logical starts remain current-EBR-relative while continuation links remain extended-base-relative in the retained provenance."
+                ),
+                evidence=[str(item)[:4_000] for item in ebr_errors[:4]],
+                severity="medium",
+            ))
+        logical_partition_filesystems = next(
+            (
+                value for value in context.values("disk.mbr.logical_partition_filesystems")
+                if isinstance(value, list)
+            ),
+            [],
+        )
+        detected_logical_filesystems = [
+            item for item in logical_partition_filesystems
+            if isinstance(item, dict) and item.get("detected_filesystem") is not None
+        ]
+        if detected_logical_filesystems:
+            result.findings.append(self.finding(
+                context,
+                title=f"{len(detected_logical_filesystems)} logical MBR partition filesystem boot structure(s) validated",
+                category="mbr_logical_partition_filesystem_inventory", confidence=0.98,
+                explanation=(
+                    "Logical partitions were derived only from bounded, signature-valid EBR records under exact relative-address rules before their boot sectors received format-specific validation. "
+                    "Every extended base, EBR, logical entry, partition, and boot byte offset is retained."
+                ),
+                evidence=[str(item)[:4_000] for item in detected_logical_filesystems[:32]],
+                severity="info",
+            ))
+        invalid_logical_boots = [
+            item for item in logical_partition_filesystems
+            if isinstance(item, dict)
+            and item.get("filesystem_candidate") is not None
+            and item.get("detected_filesystem") is None
+            and isinstance(item.get("validation"), dict)
+            and item["validation"].get("valid") is False
+        ]
+        if invalid_logical_boots:
+            result.findings.append(self.finding(
+                context,
+                title=f"{len(invalid_logical_boots)} logical partition filesystem boot candidate(s) failed validation",
+                category="partition_filesystem_boot_anomaly", confidence=0.97,
+                explanation=(
+                    "An EBR-derived logical partition contains a format candidate whose bounded boot checks failed. "
+                    "Neither its logical type code nor its containing extended entry overrides the invalid structure."
+                ),
+                evidence=[str(item)[:4_000] for item in invalid_logical_boots[:32]],
+                severity="medium",
+            ))
+        logical_type_mismatches = [
+            item for item in detected_logical_filesystems
+            if item.get("partition_type_matches_detected") is False
+        ]
+        if logical_type_mismatches:
+            result.findings.append(self.finding(
+                context,
+                title=f"{len(logical_type_mismatches)} logical MBR type code/filesystem mismatch(es)",
+                category="partition_type_filesystem_mismatch", confidence=0.99,
+                explanation=(
+                    "The validated filesystem falls outside its EBR logical-entry type code's expected family. "
+                    "The extended primary, EBR/link, logical entry, and boot structure remain separate evidence."
+                ),
+                evidence=[str(item)[:4_000] for item in logical_type_mismatches[:32]],
+                severity="low",
+            ))
+        logical_boot_geometry_mismatches = [
+            item for item in detected_logical_filesystems
+            if item.get("boot_declared_start_lba_matches_logical_entry") is False
+            or item.get("boot_declared_volume_matches_partition") is False
+        ]
+        if logical_boot_geometry_mismatches:
+            result.findings.append(self.finding(
+                context,
+                title=f"{len(logical_boot_geometry_mismatches)} logical entry/boot geometry mismatch(es)",
+                category="partition_boot_geometry_mismatch", confidence=0.99,
+                explanation=(
+                    "A validated logical-partition boot sector's embedded absolute start LBA or volume length differs from the EBR-derived partition. "
+                    "Exact values and field offsets are retained without reconciliation."
+                ),
+                evidence=[str(item)[:4_000] for item in logical_boot_geometry_mismatches[:32]],
+                severity="medium",
+            ))
         gpt_partition_filesystems = next(
             (
                 value for value in context.values("disk.gpt.partition_filesystems")

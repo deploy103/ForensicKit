@@ -1,5 +1,18 @@
 # ForensicKit Work Log
 
+## 2026-09-05 02:19 KST
+
+### Bounded EBR logical-partition traversal
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/profiles/disk.py`, and `tests/test_triage.py`.
+- Extended primary MBR entries now drive at most 32 signature-checked EBR reads. Each first entry's logical start is resolved relative to its current EBR, while each second continuation entry is resolved relative to the original extended base. Extended containment, supplied-image bounds, status/type fields, link validity, visited-LBA cycles, exact EBR/entry/link offsets, and termination/error state are retained in `disk.mbr.ebr_chains` and `disk.mbr.logical_partitions`.
+- Each valid logical entry receives the shared exact-offset FAT/NTFS/exFAT boot validation plus logical type-code and boot-embedded absolute-start/volume-length comparisons. Inventory, malformed boot, type mismatch, geometry mismatch, and EBR-chain anomaly findings preserve the extended primary, EBR, logical entry, and boot evidence independently.
+- A two-EBR fixture proves logical starts at absolute LBAs 2 and 8, a continuation computed as extended base 1 plus relative 6, FAT12/NTFS validation, and exact entry/boot provenance. A second-EBR self-link is stopped at the repeated LBA 7 with an explicit cycle finding. Focused triage/profile regression passed: 97 passed, 0 failed. The full direct synthetic suite passed: 303 passed, 0 failed; compileall and `git diff --check` passed.
+
+### Next
+
+- Copy only complete, structurally validated, size-bounded partition extents into workspace child artifacts so the existing volume-root parsers and recursive FlagHunter can operate with exact MBR/EBR/GPT lineage.
+
 ## 2026-09-05 02:12 KST
 
 ### CRC-gated GPT partition filesystem validation

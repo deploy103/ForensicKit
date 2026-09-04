@@ -1,10 +1,10 @@
 # ForensicKit Work Queue
 
-Last reviewed: 2026-09-05 02:12 KST
+Last reviewed: 2026-09-05 02:19 KST
 
 ## Post-v1.1 backlog
 
-- [ ] Traverse a bounded EBR chain for logical MBR partitions, retaining link-base semantics, cycle protection, and exact-offset filesystem boot validation.
+- [ ] Materialize complete validated small partition extents as bounded child artifacts so existing filesystem parsers can recurse with exact table-entry lineage.
 
 ## v1.1.0 release gate
 
@@ -47,6 +47,7 @@ Last reviewed: 2026-09-05 02:12 KST
 - [x] BPB cluster-count FAT12/16/32 identification without a type label, including FAT-capacity gating and exact label/structure disagreement provenance.
 - [x] Exact-offset FAT/NTFS/exFAT boot validation for bounded primary MBR partitions with type-code and embedded-geometry mismatch findings.
 - [x] CRC-gated exact-offset GPT FAT/NTFS/exFAT boot validation with GUID hints and independent backup-header/table consistency provenance.
+- [x] Bounded EBR logical-partition traversal with current/base-relative address provenance, cycle protection, and exact-offset boot validation.
 - [x] Shared bounded ext inode mapper for direct blocks and depth-zero/depth-one extent trees.
 - [x] Depth-one extent-index/leaf/data provenance, repeated-leaf protection, and recursive Engine flag E2E.
 - [x] Bounded active ext subdirectory traversal and recursively recoverable regular-file children with inode/directory/block lineage.
