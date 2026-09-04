@@ -674,6 +674,27 @@ class DiskProfile(BaseProfile):
                     ),
                     evidence=[str(lost_chain_inventory)[:4_000]], severity="low",
                 ))
+        for fat_bits in (12, 16):
+            active_fat_files = next(
+                (
+                    value for value in context.values(
+                        f"filesystem.fat{fat_bits}.root.recoverable_regular_files"
+                    ) if isinstance(value, list)
+                ),
+                [],
+            )
+            if active_fat_files:
+                result.findings.append(self.finding(
+                    context,
+                    title=f"{len(active_fat_files)} active FAT{fat_bits} regular file candidate(s) inventoried",
+                    category=f"fat{fat_bits}_active_file_inventory", confidence=0.96,
+                    explanation=(
+                        "Validated active fixed-root and traversed-subdirectory records retain their short name, optional checksum-valid intact LFN, declared size, starting cluster, entry offset, and containing-directory lineage. "
+                        "Content recovery separately requires an exact image-bounded size-required FAT chain ending at EOC."
+                    ),
+                    evidence=[str(item)[:2_000] for item in active_fat_files[:256]],
+                    severity="info",
+                ))
         qcow_header = next((value for value in context.values("disk.qcow2.header") if isinstance(value, dict)), {})
         vhd_footer = next((value for value in context.values("disk.vhd.footer") if isinstance(value, dict)), {})
         virtual_disk = context.format_is("vhd", "qcow2") or bool(qcow_header.get("valid")) or bool(vhd_footer.get("signature"))

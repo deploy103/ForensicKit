@@ -2224,6 +2224,182 @@ class ExtractionManager:
             ))
         return result
 
+    def extract_fat_active_files(self, artifact: Artifact) -> ExtractionResult:
+        """Recover bounded active FAT12/16 regular files through exact EOC chains."""
+        result = ExtractionResult()
+        values = {
+            observation.key: observation.value
+            for observation in self.workspace.database.observations(artifact.id)
+        }
+        variant = values.get("filesystem.fat.variant")
+        fat_bits = 12 if variant == "fat12" else 16 if variant == "fat16" else 0
+        entries = values.get(f"filesystem.fat{fat_bits}.root.recoverable_regular_files") if fat_bits else None
+        bytes_per_sector = values.get("filesystem.fat.bytes_per_sector")
+        sectors_per_cluster = values.get("filesystem.fat.sectors_per_cluster")
+        reserved_sectors = values.get("filesystem.fat.reserved_sector_count")
+        fat_size = values.get("filesystem.fat.size_sectors")
+        first_data_sector = values.get(f"filesystem.fat{fat_bits}.root.first_data_sector") if fat_bits else None
+        cluster_count = values.get(f"filesystem.fat{fat_bits}.root.cluster_count") if fat_bits else None
+        if not isinstance(entries, list) or not entries:
+            return result
+        if not all(isinstance(value, int) for value in (
+            bytes_per_sector, sectors_per_cluster, reserved_sectors,
+            fat_size, first_data_sector, cluster_count,
+        )):
+            result.errors.append(f"skipped active FAT{fat_bits} files: missing validated geometry")
+            return result
+        cluster_size = bytes_per_sector * sectors_per_cluster
+        fat_offset = reserved_sectors * bytes_per_sector
+        fat_end = fat_offset + fat_size * bytes_per_sector
+        if (
+            bytes_per_sector not in {512, 1024, 2048, 4096}
+            or sectors_per_cluster <= 0 or sectors_per_cluster & (sectors_per_cluster - 1)
+            or not 0 < cluster_size <= 2 * 1024 * 1024
+            or reserved_sectors <= 0 or fat_size <= 0 or first_data_sector <= 0
+            or (fat_bits == 12 and not 0 < cluster_count < 4_085)
+            or (fat_bits == 16 and not 4_085 <= cluster_count < 65_525)
+        ):
+            result.errors.append(f"skipped active FAT{fat_bits} files: invalid validated geometry")
+            return result
+        source = self.workspace.resolve_stored_path(artifact.path)
+        target_root = self.workspace.path("extracted", artifact.id, f"builtin_fat{fat_bits}_active")
+        evidence: list[str] = []
+        try:
+            source_stream = source.open("rb")
+        except OSError as exc:
+            result.errors.append(f"active FAT{fat_bits} source open failed: {exc}")
+            return result
+        eoc_minimum = 0xFF8 if fat_bits == 12 else 0xFFF8
+        with source_stream:
+            for entry_index, entry in enumerate(entries[:256]):
+                if not isinstance(entry, dict):
+                    continue
+                size = entry.get("size")
+                first_cluster = entry.get("first_cluster")
+                high_reserved = entry.get(f"fat{fat_bits}_cluster_high_reserved")
+                if (
+                    not isinstance(size, int) or not 0 < size <= 8 * 1024 * 1024
+                    or size > self.limits.max_single_artifact_size
+                    or not isinstance(first_cluster, int) or not 2 <= first_cluster < cluster_count + 2
+                    or high_reserved != 0
+                ):
+                    continue
+                required_clusters = (size + cluster_size - 1) // cluster_size
+                if not 1 <= required_clusters <= 64:
+                    continue
+                chain: list[dict[str, object]] = []
+                visited: set[int] = set()
+                current = first_cluster
+                valid = True
+                for cluster_index in range(required_clusters):
+                    if current in visited or not 2 <= current < cluster_count + 2:
+                        valid = False
+                        break
+                    visited.add(current)
+                    physical_offset = (
+                        first_data_sector + (current - 2) * sectors_per_cluster
+                    ) * bytes_per_sector
+                    fat_entry_offset = (
+                        fat_offset + current + current // 2
+                        if fat_bits == 12 else fat_offset + current * 2
+                    )
+                    if (
+                        physical_offset < 0 or physical_offset + cluster_size > artifact.size
+                        or fat_entry_offset < fat_offset or fat_entry_offset + 2 > fat_end
+                        or fat_entry_offset + 2 > artifact.size
+                    ):
+                        valid = False
+                        break
+                    source_stream.seek(fat_entry_offset)
+                    raw_next = source_stream.read(2)
+                    if len(raw_next) != 2:
+                        valid = False
+                        break
+                    packed = int.from_bytes(raw_next, "little")
+                    next_cluster = (
+                        (packed >> 4) & 0x0FFF if fat_bits == 12 and current & 1
+                        else packed & 0x0FFF if fat_bits == 12 else packed
+                    )
+                    chain.append({
+                        "cluster": current, "physical_offset": physical_offset,
+                        "length": cluster_size, "fat_entry_offset": fat_entry_offset,
+                        "fat_entry_raw": raw_next.hex(), "next_cluster": next_cluster,
+                    })
+                    if cluster_index == required_clusters - 1:
+                        if next_cluster < eoc_minimum:
+                            valid = False
+                        break
+                    if next_cluster < 2 or next_cluster >= cluster_count + 2 or next_cluster >= eoc_minimum:
+                        valid = False
+                        break
+                    current = next_cluster
+                if not valid or len(chain) != required_clusters:
+                    continue
+                reason = self.can_register(artifact, size)
+                if reason:
+                    result.errors.append(
+                        f"skipped active FAT{fat_bits} file at {entry.get('offset')}: {reason}"
+                    )
+                    continue
+                logical_name = next((
+                    value for value in (entry.get("long_name"), entry.get("short_name"))
+                    if isinstance(value, str) and value
+                ), f"ACTIVE_CLUSTER_{first_cluster:08d}.bin")[:1_024]
+                output = target_root / (
+                    f"entry_{entry_index:04d}_cluster_{first_cluster:08d}_{safe_name(logical_name)}"
+                )
+                output.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    with output.open("xb") as writer:
+                        remaining = size
+                        for segment in chain:
+                            take = min(remaining, int(segment["length"]))
+                            source_stream.seek(int(segment["physical_offset"]))
+                            payload = source_stream.read(take)
+                            if len(payload) != take:
+                                raise RuntimeError("mapped active FAT cluster is truncated")
+                            writer.write(payload)
+                            remaining -= take
+                        if remaining:
+                            raise RuntimeError("active FAT chain did not cover declared logical size")
+                except (OSError, RuntimeError) as exc:
+                    output.unlink(missing_ok=True)
+                    result.errors.append(
+                        f"failed active FAT{fat_bits} file at {entry.get('offset')}: {exc}"
+                    )
+                    continue
+                child = self.register_file(output, artifact, logical_name)
+                if child is None:
+                    result.errors.append(
+                        f"skipped active FAT{fat_bits} file at {entry.get('offset')}: duplicate or extraction limit"
+                    )
+                    continue
+                result.artifacts.append(child)
+                result.extracted_bytes += child.size
+                evidence.append(
+                    f"child:{child.id};variant:FAT{fat_bits};entry_offset:{entry.get('offset')};"
+                    f"short_name:{entry.get('short_name')};long_name:{entry.get('long_name')};"
+                    f"lfn_slot_offsets:{entry.get('lfn_slot_offsets')};size:{size};"
+                    f"first_cluster:{first_cluster};cluster_chain:{chain};"
+                    f"directory_start_cluster:{entry.get('directory_start_cluster')};"
+                    f"directory_cluster_lineage:{entry.get('directory_cluster_lineage')};"
+                    f"directory_source_entry_offset:{entry.get('directory_source_entry_offset')};"
+                    "chain_validation:exact_size_required_chain_eoc;allocation_state:active_directory_reference"
+                )
+        if result.artifacts:
+            result.findings.append(Finding(
+                artifact_id=artifact.id,
+                title=f"Recovered {len(result.artifacts)} active FAT{fat_bits} regular file(s)",
+                category=f"fat{fat_bits}_active_file_recovery", severity="info", confidence=0.96,
+                explanation=(
+                    "A validated active root/subdirectory entry supplied a bounded nonzero logical size and optional checksum-valid intact LFN. "
+                    "Only unique image-bounded FAT chains with exactly the size-required cluster count and an EOC marker on the final cluster were copied and registered recursively."
+                ),
+                source=f"builtin_fat{fat_bits}_active_file_extractor",
+                supporting_evidence=evidence[:256],
+            ))
+        return result
+
     def extract_fat_lost_chains(self, artifact: Artifact) -> ExtractionResult:
         """Materialize only complete image-bounded anonymous FAT lost chains."""
         result = ExtractionResult()
@@ -2402,6 +2578,7 @@ class ExtractionManager:
             self.extract_fat32_deleted_single_cluster(artifact),
             self.extract_fat16_deleted_files(artifact),
             self.extract_fat12_deleted_files(artifact),
+            self.extract_fat_active_files(artifact),
             self.extract_fat_lost_chains(artifact),
         )
         combined_fat_result = ExtractionResult()

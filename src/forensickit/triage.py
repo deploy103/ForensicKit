@@ -3982,7 +3982,10 @@ class GenericTriageEngine:
         entry_offsets = [root_offset + index * 32 for index in range(root_entries)]
         fat_offset = reserved_sectors * bytes_per_sector
         fat_end = fat_offset + fat_size * bytes_per_sector
-        subdirectory_entries, subdirectory_inventory, subdirectory_errors, active_cluster_starts = (
+        (
+            subdirectory_entries, subdirectory_inventory, subdirectory_errors,
+            active_cluster_starts, subdirectory_active_files,
+        ) = (
             self._fat_fixed_subdirectory_deleted_entries(
                 path, image_size, data, entry_offsets, bytes_per_sector,
                 sectors_per_cluster, first_data_sector, fat_offset, fat_end,
@@ -3998,6 +4001,7 @@ class GenericTriageEngine:
             ),
         )
         deleted_entries: list[dict[str, object]] = []
+        active_regular_files: list[dict[str, object]] = []
         unlinked_lfn_slots: list[dict[str, object]] = []
         pending_lfn: list[tuple[int, bytes]] = []
         examined = 0
@@ -4028,6 +4032,41 @@ class GenericTriageEngine:
                         "reason": "deleted LFN slots are followed by an active short entry",
                         "raw_hex": [slot.hex() for _, slot in pending_lfn],
                     })
+                elif not attributes & 0x18:
+                    first_cluster = int.from_bytes(entry[26:28], "little")
+                    high_reserved = int.from_bytes(entry[20:22], "little")
+                    file_size = int.from_bytes(entry[28:32], "little")
+                    if (
+                        high_reserved == 0 and 2 <= first_cluster < cluster_count + 2
+                        and 0 < file_size <= 8 * _MIB
+                    ):
+                        short_raw = bytes([0xE5]) + entry[1:11] if entry[0] == 0x05 else entry[:11]
+                        base = short_raw[:8].decode("cp437", errors="replace").rstrip(" ")
+                        extension = short_raw[8:11].decode("cp437", errors="replace").rstrip(" ")
+                        active_file: dict[str, object] = {
+                            "entry_index": index, "offset": entry_offsets[index],
+                            "short_name": base + (f".{extension}" if extension else ""),
+                            "attributes": f"0x{attributes:02X}",
+                            "first_cluster": first_cluster,
+                            "cluster_high_reserved": high_reserved,
+                            f"{variant}_cluster_high_reserved": high_reserved,
+                            "size": file_size, "raw_hex": entry.hex(),
+                        }
+                        if pending_lfn:
+                            lfn, lfn_error = self._fat_active_lfn_candidate(
+                                pending_lfn, entry, entry_offsets,
+                            )
+                            if lfn is not None:
+                                active_file.update(lfn)
+                            else:
+                                unlinked_lfn_slots.append({
+                                    "short_entry_index": index,
+                                    "short_entry_offset": entry_offsets[index],
+                                    "slot_offsets": [entry_offsets[slot_index] for slot_index, _ in pending_lfn],
+                                    "reason": lfn_error,
+                                    "raw_hex": [slot.hex() for _, slot in pending_lfn],
+                                })
+                        active_regular_files.append(active_file)
                 pending_lfn = []
                 continue
             base = entry[1:8].decode("cp437", errors="replace").rstrip(" ")
@@ -4079,6 +4118,10 @@ class GenericTriageEngine:
             self._observation(artifact, f"{prefix}.cluster_count", cluster_count),
             self._observation(artifact, f"{prefix}.fat_entry_capacity", fat_entry_capacity),
             self._observation(artifact, f"{prefix}.deleted_entries", deleted_entries),
+            self._observation(
+                artifact, f"{prefix}.recoverable_regular_files",
+                [*active_regular_files, *subdirectory_active_files][:512],
+            ),
             self._observation(artifact, f"{prefix}.subdirectory_deleted_entries", subdirectory_entries),
             self._observation(artifact, f"{prefix}.subdirectory_inventory", subdirectory_inventory),
             self._observation(artifact, f"{prefix}.subdirectory_errors", subdirectory_errors),
@@ -4101,7 +4144,10 @@ class GenericTriageEngine:
         cluster_count: int,
         *,
         fat_bits: int,
-    ) -> tuple[list[dict[str, object]], list[dict[str, object]], list[str], set[int]]:
+    ) -> tuple[
+        list[dict[str, object]], list[dict[str, object]], list[str], set[int],
+        list[dict[str, object]],
+    ]:
         """Traverse exact-EOC active FAT12/16 directories and inventory deleted children."""
         variant = f"FAT{fat_bits}"
         cluster_size = bytes_per_sector * sectors_per_cluster
@@ -4112,6 +4158,7 @@ class GenericTriageEngine:
         visited_starts: set[int] = set()
         visited_clusters: set[int] = set()
         active_cluster_starts: set[int] = set()
+        active_regular_files: list[dict[str, object]] = []
         total_clusters = 0
         total_bytes = 0
 
@@ -4248,6 +4295,36 @@ class GenericTriageEngine:
                                 pending_lfn.append((index, entry))
                             continue
                         if entry[0] != 0xE5:
+                            if (
+                                not attributes & 0x18
+                                and int.from_bytes(entry[20:22], "little") == 0
+                                and len(active_regular_files) < 512
+                            ):
+                                first_cluster = int.from_bytes(entry[26:28], "little")
+                                file_size = int.from_bytes(entry[28:32], "little")
+                                if 2 <= first_cluster < cluster_count + 2 and 0 < file_size <= 8 * _MIB:
+                                    short_raw = bytes([0xE5]) + entry[1:11] if entry[0] == 0x05 else entry[:11]
+                                    base = short_raw[:8].decode("cp437", errors="replace").rstrip(" ")
+                                    extension = short_raw[8:11].decode("cp437", errors="replace").rstrip(" ")
+                                    active_file: dict[str, object] = {
+                                        "directory_start_cluster": start,
+                                        "directory_cluster_lineage": lineage,
+                                        "directory_source_entry_offset": directory.get("source_entry_offset"),
+                                        "entry_index": index, "offset": offsets[index],
+                                        "short_name": base + (f".{extension}" if extension else ""),
+                                        "attributes": f"0x{attributes:02X}",
+                                        "first_cluster": first_cluster,
+                                        "cluster_high_reserved": 0,
+                                        f"fat{fat_bits}_cluster_high_reserved": 0,
+                                        "size": file_size, "raw_hex": entry.hex(),
+                                    }
+                                    if pending_lfn:
+                                        lfn, _ = GenericTriageEngine._fat_active_lfn_candidate(
+                                            pending_lfn, entry, offsets,
+                                        )
+                                        if lfn is not None:
+                                            active_file.update(lfn)
+                                    active_regular_files.append(active_file)
                             pending_lfn = []
                             continue
                         base = entry[1:8].decode("cp437", errors="replace").rstrip(" ")
@@ -4275,12 +4352,15 @@ class GenericTriageEngine:
                         deleted.append(recovered)
                         pending_lfn = []
                         if len(deleted) >= 512:
-                            return deleted, inventory, errors, active_cluster_starts
+                            return (
+                                deleted, inventory, errors, active_cluster_starts,
+                                active_regular_files,
+                            )
         except OSError as exc:
             errors.append(str(exc)[:2_000])
         if queue:
             errors.append(f"{variant} subdirectory traversal reached the 32-directory/64-cluster/8-MiB bound")
-        return deleted, inventory, errors, active_cluster_starts
+        return deleted, inventory, errors, active_cluster_starts, active_regular_files
 
     @staticmethod
     def _fat_lost_chain_inventory(
@@ -4994,6 +5074,62 @@ class GenericTriageEngine:
             checksum = (((checksum & 1) << 7) | (checksum >> 1)) + value
             checksum &= 0xFF
         return checksum
+
+    @staticmethod
+    def _fat_active_lfn_candidate(
+        slots: list[tuple[int, bytes]], short_entry: bytes, entry_offsets: list[int]
+    ) -> tuple[dict[str, object] | None, str | None]:
+        """Validate an intact active LFN chain immediately preceding its short entry."""
+        if not 1 <= len(slots) <= 20:
+            return None, "LFN chain exceeds the 20-slot/255-character bound"
+        if any(
+            slot[0] == 0xE5 or slot[11] != 0x0F or slot[12] != 0
+            or slot[26:28] != b"\x00\x00"
+            for _, slot in slots
+        ):
+            return None, "active LFN slot structure is invalid or deleted"
+        expected_ordinals = [
+            (len(slots) | 0x40) if index == 0 else len(slots) - index
+            for index in range(len(slots))
+        ]
+        if [slot[0] for _, slot in slots] != expected_ordinals:
+            return None, "active LFN ordinal order or terminal marker is invalid"
+        checksum = GenericTriageEngine._fat_short_name_checksum(short_entry[:11])
+        if any(slot[13] != checksum for _, slot in slots):
+            return None, "active LFN checksum does not match the short entry"
+        units: list[int] = []
+        for _, slot in reversed(slots):
+            raw_name = slot[1:11] + slot[14:26] + slot[28:32]
+            units.extend(
+                int.from_bytes(raw_name[index:index + 2], "little")
+                for index in range(0, 26, 2)
+            )
+        if 0 in units:
+            terminator = units.index(0)
+            if any(value != 0xFFFF for value in units[terminator + 1:]):
+                return None, "active LFN bytes after NUL are not 0xFFFF padding"
+            units = units[:terminator]
+            terminal_validation = "nul_terminator_with_ffff_padding"
+        else:
+            if 0xFFFF in units:
+                return None, "active LFN padding exists without a NUL terminator"
+            terminal_validation = "exact_full_slot_name_without_padding"
+        if not units or len(units) > 255:
+            return None, "active LFN decoded length is invalid"
+        raw_utf16 = b"".join(value.to_bytes(2, "little") for value in units)
+        try:
+            long_name = raw_utf16.decode("utf-16le", errors="strict")
+        except UnicodeDecodeError:
+            return None, "active LFN is not valid UTF-16LE"
+        if any(character in long_name for character in "\x00/\\"):
+            return None, "active LFN contains a path separator or NUL"
+        return {
+            "long_name": long_name,
+            "lfn_slot_offsets": [entry_offsets[index] for index, _ in slots],
+            "lfn_checksum": f"0x{checksum:02X}",
+            "lfn_order_validation": "stored_ordinals_and_terminal_marker",
+            "lfn_terminal_validation": terminal_validation,
+        }, None
 
     @staticmethod
     def _fat_deleted_lfn_candidate(
