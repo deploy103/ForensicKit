@@ -331,6 +331,51 @@ class DiskProfile(BaseProfile):
                 evidence=[str(item)[:2_000] for item in subdirectory_deleted[:128]],
                 severity="info",
             ))
+        fat32_fat_copies = next(
+            (value for value in context.values("filesystem.fat32.fat_copies") if isinstance(value, dict)),
+            {},
+        )
+        fat32_declared_copies = fat32_fat_copies.get("declared_count")
+        if isinstance(fat32_declared_copies, int) and fat32_declared_copies >= 2:
+            if fat32_fat_copies.get("available"):
+                result.findings.append(self.finding(
+                    context,
+                    title=f"{fat32_declared_copies} declared FAT32 allocation-table copies inventoried",
+                    category="fat32_fat_copy_inventory", confidence=0.96,
+                    explanation=(
+                        "Each declared FAT range was independently checked against volume and image bounds and compared with copy zero under an 8-MiB limit. "
+                        "BPB ExtFlags determine whether copies are expected to mirror and, when mirroring is disabled, which declared table supplies chain traversal; no active copy is inferred from content."
+                    ),
+                    evidence=[str(fat32_fat_copies)[:2_000]], severity="info",
+                ))
+            copies = fat32_fat_copies.get("copies")
+            unavailable_copy = isinstance(copies, list) and any(
+                isinstance(item, dict) and item.get("available") is not True for item in copies
+            )
+            invalid_selection = (
+                fat32_fat_copies.get("active_copy_index_valid") is False
+                or fat32_fat_copies.get("active_copy_available") is False
+                or fat32_fat_copies.get("ext_flags_reserved_bits_zero") is False
+            )
+            mirrored_incomplete_or_different = (
+                fat32_fat_copies.get("mirroring_enabled") is True
+                and fat32_fat_copies.get("all_copies_match") is not True
+            )
+            if (
+                not fat32_fat_copies.get("available") or unavailable_copy
+                or invalid_selection or mirrored_incomplete_or_different
+            ):
+                result.findings.append(self.finding(
+                    context,
+                    title="FAT32 allocation-table copy or ExtFlags state is inconsistent",
+                    category="fat32_fat_copy_anomaly", confidence=0.97,
+                    explanation=(
+                        "A declared FAT range is unavailable, ExtFlags contain reserved bits or select an invalid/unavailable active table, or mirrored copies differ/could not be compared completely. "
+                        "When mirroring is explicitly disabled, byte divergence alone is retained as provenance and is not classified as corruption."
+                    ),
+                    evidence=[str(fat32_fat_copies)[:2_000]],
+                    severity="medium" if invalid_selection or mirrored_incomplete_or_different else "low",
+                ))
         fat32_fsinfo = next(
             (value for value in context.values("filesystem.fat32.fsinfo") if isinstance(value, dict)),
             {},

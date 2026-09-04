@@ -1,5 +1,18 @@
 # ForensicKit Work Log
 
+## 2026-09-04 22:34 KST
+
+### FAT32 ExtFlags and duplicate allocation tables
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/profiles/disk.py`, and `tests/test_triage.py`.
+- FAT32 now applies the bounded table-copy inventory to every BPB-declared FAT. It records raw ExtFlags, reserved-bit validity, mirroring state, whether copies are expected to agree, the declared active index/availability, selection basis, complete equality or first exact divergent bytes, and explicitly avoids content-based authority selection.
+- Root, subdirectory, and deleted-file chain evidence now reads FAT zero when mirroring is enabled and the exact ExtFlags-selected table when mirroring is disabled. Invalid active indices prevent native chain traversal. Divergent inactive copies are retained without an anomaly verdict; mirrored divergence, incomplete/unavailable declared ranges, invalid selection, and reserved ExtFlags emit a profile anomaly.
+- Added a valid FAT32-sized synthetic volume where FAT zero ends root cluster 2 but ExtFlags selects FAT one's `2 -> 5 -> EOC` chain, proving the deleted entry is recovered only from cluster 5 with active-FAT provenance. Mirrored divergence and an out-of-range active index are separately covered. Verified compileall, all 88 focused triage regressions, and `git diff --check`.
+
+### Next
+
+- Validate the format-specific reserved FAT entries in every available copy against the BPB media descriptor, retaining raw values and per-copy offsets without treating a malformed header as permission to switch tables.
+
 ## 2026-09-04 22:27 KST
 
 ### FAT12/16 duplicate allocation-table validation
