@@ -412,6 +412,25 @@ class DiskProfile(BaseProfile):
                     evidence=[str(fat32_fat_copies)[:2_000]],
                     severity="medium" if invalid_selection or mirrored_incomplete_or_different else "low",
                 ))
+        fat_bpb_validation = next(
+            (
+                value for value in context.values("filesystem.fat.bpb_validation")
+                if isinstance(value, dict)
+            ),
+            {},
+        )
+        if fat_bpb_validation.get("available") is True and fat_bpb_validation.get("valid") is False:
+            fat_bits = fat_bpb_validation.get("fat_bits")
+            result.findings.append(self.finding(
+                context,
+                title=f"FAT{fat_bits} BIOS Parameter Block relationships are inconsistent",
+                category="fat_bpb_structure_anomaly", confidence=0.97,
+                explanation=(
+                    "The bounded boot-sector validator found an invalid jump encoding, boot marker, fundamental sector/FAT geometry, mutually exclusive total-size fields, format-specific FAT-size/root-entry fields, cluster-count class, FAT32 version, or FAT32 reserved BPB bytes. "
+                    "Every raw-derived field and failed check is retained; a supplied image shorter than the declared volume is reported separately and does not by itself make the BPB structurally invalid."
+                ),
+                evidence=[str(fat_bpb_validation)[:4_000]], severity="medium",
+            ))
         fat32_fsinfo = next(
             (value for value in context.values("filesystem.fat32.fsinfo") if isinstance(value, dict)),
             {},
