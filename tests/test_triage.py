@@ -1711,6 +1711,108 @@ def test_fat_bpb_relationship_validation_is_variant_specific_and_image_length_ne
     assert "fat32_reserved_bpb_bytes_zero" in finding.supporting_evidence[0]
 
 
+def test_fat_variant_is_derived_without_a_label_and_label_conflicts_are_preserved(tmp_path: Path) -> None:
+    sector_size = 512
+
+    def boot_image(fat_bits: int) -> bytearray:
+        if fat_bits == 12:
+            image = bytearray(4 * sector_size)
+            fat_size, total_sectors, root_entries = 1, 100, 16
+        elif fat_bits == 16:
+            image = bytearray(20 * sector_size)
+            fat_size, total_sectors, root_entries = 17, 4_119, 16
+        else:
+            fat_size, total_sectors, root_entries = 600, 70_000, 0
+            image = bytearray((1 + fat_size + 1) * sector_size)
+        image[:3] = b"\xeb\x3c\x90"
+        image[11:13] = sector_size.to_bytes(2, "little")
+        image[13] = 1
+        image[14:16] = (1).to_bytes(2, "little")
+        image[16] = 1
+        image[17:19] = root_entries.to_bytes(2, "little")
+        image[21] = 0xF8
+        if fat_bits == 32:
+            image[32:36] = total_sectors.to_bytes(4, "little")
+            image[36:40] = fat_size.to_bytes(4, "little")
+            image[44:48] = (2).to_bytes(4, "little")
+            image[sector_size:sector_size + 8] = b"\xf8\xff\xff\x0f\xff\xff\xff\x0f"
+            image[sector_size + 8:sector_size + 12] = (0x0FFFFFFF).to_bytes(4, "little")
+        else:
+            image[19:21] = total_sectors.to_bytes(2, "little")
+            image[22:24] = fat_size.to_bytes(2, "little")
+            image[sector_size:sector_size + (3 if fat_bits == 12 else 4)] = (
+                b"\xf8\xff\xff" if fat_bits == 12 else b"\xf8\xff\xff\xff"
+            )
+        image[510:512] = b"\x55\xaa"
+        return image
+
+    for fat_bits in (12, 16, 32):
+        path = tmp_path / f"fat{fat_bits}-without-label.raw"
+        path.write_bytes(boot_image(fat_bits))
+        artifact = _artifact(path)
+        observations = GenericTriageEngine().analyze(artifact, path)
+        values = _values(observations)
+        assert values["filesystem.fat.label_signature"] is False
+        assert values["filesystem.fat_signature"] is True
+        assert values["filesystem.type"] == "fat"
+        assert values["filesystem.fat.variant"] == f"fat{fat_bits}"
+        assert values["filesystem.fat.variant_evidence"] == {
+            "text_label_records": [],
+            "text_label_fat_bits": None,
+            "text_label_ambiguous": False,
+            "bpb_cluster_count_fat_bits": fat_bits,
+            "bpb_structure_recognized": True,
+            "label_structure_agree": None,
+            "selected_fat_bits": fat_bits,
+            "selection_basis": "bpb_cluster_count",
+        }
+        assert values["filesystem.fat.bpb_validation"]["valid"] is True
+        assert values["filesystem.fat.bpb_validation"]["checks"]["fat_entry_capacity_sufficient"] is True
+        root_key = (
+            "filesystem.fat.root.available"
+            if fat_bits == 32 else f"filesystem.fat{fat_bits}.root.available"
+        )
+        assert values[root_key] is True
+        identified = IdentificationEngine().identify(artifact, observations)
+        assert identified.format == "filesystem"
+        assert artifact.artifact_type == "filesystem"
+
+    conflict = boot_image(12)
+    conflict[54:62] = b"FAT16   "
+    conflict_path = tmp_path / "fat12-with-conflicting-fat16-label.raw"
+    conflict_path.write_bytes(conflict)
+    conflict_artifact = _artifact(conflict_path)
+    conflict_observations = GenericTriageEngine().analyze(conflict_artifact, conflict_path)
+    conflict_values = _values(conflict_observations)
+    variant = conflict_values["filesystem.fat.variant_evidence"]
+    assert conflict_values["filesystem.fat.variant"] == "fat12"
+    assert variant["text_label_fat_bits"] == 16
+    assert variant["bpb_cluster_count_fat_bits"] == 12
+    assert variant["label_structure_agree"] is False
+    assert variant["selection_basis"] == "bpb_cluster_count"
+    assert variant["text_label_records"][0]["offset"] == 54
+    assert conflict_values["filesystem.fat12.root.available"] is True
+    conflict_profile = ProfileEngine().evaluate(conflict_artifact, conflict_observations)
+    mismatch = next(
+        item for item in conflict_profile.findings
+        if item.category == "fat_variant_label_mismatch"
+    )
+    assert "'offset': 54" in mismatch.supporting_evidence[0]
+    assert not any(
+        item.category == "fat_bpb_structure_anomaly"
+        for item in conflict_profile.findings
+    )
+
+    false_candidate = bytearray(sector_size)
+    false_candidate[:3] = b"\xeb\x3c\x90"
+    false_candidate[11:13] = sector_size.to_bytes(2, "little")
+    false_candidate[510:512] = b"\x55\xaa"
+    false_path = tmp_path / "not-a-fat-volume.raw"
+    false_path.write_bytes(false_candidate)
+    false_values = _values(GenericTriageEngine().analyze(_artifact(false_path), false_path))
+    assert false_values["filesystem.fat_signature"] is False
+
+
 def test_fat32_extflags_control_copy_consistency_and_active_chain_traversal(tmp_path: Path) -> None:
     sector_size = 512
     reserved = 1

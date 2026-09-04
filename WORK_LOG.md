@@ -1,5 +1,18 @@
 # ForensicKit Work Log
 
+## 2026-09-05 01:52 KST
+
+### Label-independent FAT variant identification
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/profiles/disk.py`, and `tests/test_triage.py`.
+- FAT12/16/32 variant selection now follows the specification's cluster-count thresholds when the complete boot sector passes the jump/marker, BPB relationship, and newly explicit FAT-entry-capacity checks. This promotes label-free valid volumes into the existing duplicate-table, root/subdirectory, recovery, and recursive-analysis paths without trusting an extension or informational type string.
+- `filesystem.fat.variant_evidence` keeps every `FAT*` label field's raw bytes and absolute boot-sector offset, the label and BPB candidates, recognition state, agreement result, selected variant, and selection basis. A structurally valid BPB wins over a conflicting label and emits the dedicated `fat_variant_label_mismatch` finding; an invalid label-free lookalike is not classified as FAT.
+- Valid label-free FAT12/16/32, a FAT12 volume mislabeled FAT16, and a rejected incomplete lookalike passed focused triage/identification/profile regression: 94 passed, 0 failed. The full direct synthetic suite passed: 300 passed, 0 failed; compileall and `git diff --check` passed.
+
+### Next
+
+- Validate filesystem boot structures at exact image offsets declared by bounded MBR entries, without mounting, executing, or assuming a partition type code proves the on-disk filesystem.
+
 ## 2026-09-05 01:42 KST
 
 ### Variant-specific FAT BPB relationship validation
