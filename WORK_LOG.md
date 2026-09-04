@@ -7,6 +7,7 @@
 - Created release commit `b9810d391b2e402f186ba12ac1f36fac9392afdb` (`release: ForensicKit v1.1.0`) and annotated tag `v1.1.0`; pushed both to `origin`.
 - Published the non-draft, non-prerelease GitHub release at `https://github.com/deploy103/ForensicKit/releases/tag/v1.1.0`.
 - Authoritative release inspection confirmed uploaded assets `forensickit-1.1.0-py3-none-any.whl` (264,363 bytes) and `SHA256SUMS` (101 bytes), both in `uploaded` state.
+- Downloaded both published assets into an isolated `/tmp` audit directory. The remote checksum manifest validated the remote wheel as `0b6781a26c26759105b64f4222699cec3d7dbf4cf5465dcdb4da64fe882fa74a`, and byte comparison matched both local release artifacts exactly.
 
 ## 2026-09-04 20:55 KST
 
