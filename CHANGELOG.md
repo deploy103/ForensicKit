@@ -19,6 +19,7 @@ Notable user-facing changes are documented here. This project follows Semantic V
 - Per-copy FAT12/16/32 reserved-entry validation now cross-checks the BPB media descriptor and preserves FAT16/32 clean-shutdown and hard-error status bits.
 - Bounded FAT12/16/32 allocation scans now inventory complete, fragmentary, cross-linked, and cyclic chain components absent from the validated active-directory reference sample.
 - Complete image-bounded FAT lost chains can now become anonymous, full-cluster child artifacts for recursive signature and flag analysis with explicit unknown-size/slack and ownership caveats.
+- Active FAT12/16 root and subdirectory files now preserve validated intact LFNs and recurse only through exact size-required chains ending at EOC.
 
 ## [1.1.0] - 2026-09-04
 

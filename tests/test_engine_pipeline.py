@@ -1879,6 +1879,114 @@ def test_fat12_complete_lost_chain_becomes_anonymous_recursive_flag_artifact(tmp
     assert "CTF{fat12_lost_chain_recursive}" in report
 
 
+def test_fat12_active_lfn_file_requires_exact_eoc_chain_and_recurses(tmp_path: Path) -> None:
+    sector_size = 512
+    first_data_sector = 3
+    image = bytearray(8 * sector_size)
+    image[11:13] = sector_size.to_bytes(2, "little")
+    image[13] = 1
+    image[14:16] = (1).to_bytes(2, "little")
+    image[16] = 1
+    image[17:19] = (16).to_bytes(2, "little")
+    image[19:21] = (100).to_bytes(2, "little")
+    image[21] = 0xF0
+    image[22:24] = (1).to_bytes(2, "little")
+    image[54:62] = b"FAT12   "
+    image[510:512] = b"\x55\xaa"
+    image[sector_size:sector_size + 3] = b"\xf0\xff\xff"
+
+    def set_fat12(cluster: int, value: int) -> None:
+        offset = sector_size + cluster + cluster // 2
+        packed = int.from_bytes(image[offset:offset + 2], "little")
+        if cluster & 1:
+            packed = (packed & 0x000F) | ((value & 0x0FFF) << 4)
+        else:
+            packed = (packed & 0xF000) | (value & 0x0FFF)
+        image[offset:offset + 2] = packed.to_bytes(2, "little")
+
+    set_fat12(5, 0xFFF)
+    short_name = b"ACTIVE~1TXT"
+    long_name = "Active.txt"
+    checksum = GenericTriageEngine._fat_short_name_checksum(short_name)
+    units = [
+        int.from_bytes(long_name.encode("utf-16le")[offset:offset + 2], "little")
+        for offset in range(0, len(long_name.encode("utf-16le")), 2)
+    ]
+    units.extend([0, *([0xFFFF] * (12 - len(units)))])
+    slot = bytearray(32)
+    slot[0] = 0x41
+    slot[11] = 0x0F
+    slot[13] = checksum
+    encoded = b"".join(value.to_bytes(2, "little") for value in units)
+    slot[1:11] = encoded[:10]
+    slot[14:26] = encoded[10:22]
+    slot[28:32] = encoded[22:26]
+    root_offset = 2 * sector_size
+    image[root_offset:root_offset + 32] = slot
+    short_offset = root_offset + 32
+    image[short_offset:short_offset + 11] = short_name
+    image[short_offset + 11] = 0x20
+    image[short_offset + 26:short_offset + 28] = (5).to_bytes(2, "little")
+    payload = b"CTF{fat12_active_lfn_recursive}"
+    image[short_offset + 28:short_offset + 32] = len(payload).to_bytes(4, "little")
+    content_offset = (first_data_sector + 3) * sector_size
+    image[content_offset:content_offset + len(payload)] = payload
+    evidence = tmp_path / "fat12-active-lfn.raw"
+    evidence.write_bytes(image)
+
+    result = AnalysisEngine().analyze(
+        evidence, tmp_path / "fat12-active-cases", mode=AnalysisMode.AUTO, execute=False,
+    )
+
+    values = {
+        observation.key: observation.value
+        for observation in result.observations
+        if observation.artifact_id == result.root_artifact.id
+    }
+    active = values["filesystem.fat12.root.recoverable_regular_files"]
+    assert active == [{
+        "entry_index": 1, "offset": short_offset, "short_name": "ACTIVE~1.TXT",
+        "attributes": "0x20", "first_cluster": 5, "cluster_high_reserved": 0,
+        "fat12_cluster_high_reserved": 0, "size": len(payload),
+        "raw_hex": bytes(image[short_offset:short_offset + 32]).hex(),
+        "long_name": long_name, "lfn_slot_offsets": [root_offset],
+        "lfn_checksum": f"0x{checksum:02X}",
+        "lfn_order_validation": "stored_ordinals_and_terminal_marker",
+        "lfn_terminal_validation": "nul_terminator_with_ffff_padding",
+    }]
+    child = next(item for item in result.artifacts if item.logical_name == long_name)
+    assert child.parent_id == result.root_artifact.id and child.size == len(payload)
+    assert any(
+        item.value == "CTF{fat12_active_lfn_recursive}" and item.artifact_id == child.id
+        for item in result.flags
+    )
+    finding = next(
+        item for item in result.findings if item.category == "fat12_active_file_recovery"
+    )
+    assert finding.source == "builtin_fat12_active_file_extractor"
+    assert f"entry_offset:{short_offset}" in finding.supporting_evidence[0]
+    assert f"lfn_slot_offsets:[{root_offset}]" in finding.supporting_evidence[0]
+    assert f"physical_offset': {content_offset}" in finding.supporting_evidence[0]
+    assert "chain_validation:exact_size_required_chain_eoc" in finding.supporting_evidence[0]
+
+    non_eoc = bytearray(image)
+    packed_offset = sector_size + 5 + 5 // 2
+    packed = int.from_bytes(non_eoc[packed_offset:packed_offset + 2], "little")
+    non_eoc[packed_offset:packed_offset + 2] = (
+        (packed & 0x000F) | (6 << 4)
+    ).to_bytes(2, "little")
+    non_eoc_path = tmp_path / "fat12-active-lfn-non-eoc.raw"
+    non_eoc_path.write_bytes(non_eoc)
+    non_eoc_result = AnalysisEngine().analyze(
+        non_eoc_path, tmp_path / "fat12-active-non-eoc-cases",
+        mode=AnalysisMode.AUTO, execute=False,
+    )
+    assert not any(item.logical_name == long_name for item in non_eoc_result.artifacts)
+    assert not any(
+        item.category == "fat12_active_file_recovery" for item in non_eoc_result.findings
+    )
+
+
 def test_recycle_bin_exact_supplied_content_pair_is_correlated(tmp_path: Path) -> None:
     bundle = tmp_path / "recycle"
     bundle.mkdir()

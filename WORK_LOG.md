@@ -1,5 +1,18 @@
 # ForensicKit Work Log
 
+## 2026-09-04 23:04 KST
+
+### Active FAT12/16 named-file recursion
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/extraction.py`, `src/forensickit/profiles/disk.py`, and `tests/test_engine_pipeline.py`.
+- Bounded active regular-file entries from FAT12/16 fixed roots and validated active subdirectories now retain exact entry/directory lineage, short names, sizes, clusters, raw bytes, and optional intact LFNs. Active LFNs require contiguous stored ordinals/terminal marker, matching short-name checksum, valid UTF-16LE, correct NUL/`FFFF` padding, and no path separators.
+- The extractor independently requires 1–64 unique in-range clusters, exact packed FAT12 or FAT16 next values, every FAT/data range inside the image, exactly the declared size coverage, and EOC at the final size-required cluster. Named children re-enter recursive analysis; chain/FAT/LFN/directory evidence is preserved. FAT extractors are combined so active, deleted, and anonymous lost-chain results do not mask one another.
+- Added a FAT12 active-LFN Engine E2E recovering `Active.txt` from cluster 5 and attributing `CTF{fat12_active_lfn_recursive}` to the child with entry/LFN/FAT/data provenance. A same-size chain whose final cluster points to cluster 6 instead of EOC is explicitly not recovered. Combined Engine/triage regression: 132 passed, 0 failed.
+
+### Next
+
+- Extend the same active-file inventory/recovery to FAT32 using 28-bit-masked directory clusters and the exact BPB ExtFlags-selected active FAT, including subdirectory lineage and a non-mirrored active-copy E2E.
+
 ## 2026-09-04 22:57 KST
 
 ### Anonymous FAT lost-chain recursive recovery

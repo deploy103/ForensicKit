@@ -1,10 +1,10 @@
 # ForensicKit Work Queue
 
-Last reviewed: 2026-09-04 22:57 KST
+Last reviewed: 2026-09-04 23:04 KST
 
 ## Post-v1.1 backlog
 
-- [ ] Inventory and recursively recover bounded active FAT12/16 regular files from validated root/subdirectory entries with exact name, directory, FAT-chain, and physical-segment provenance.
+- [ ] Inventory and recursively recover bounded active FAT32 regular files from validated root/subdirectory entries using the ExtFlags-selected FAT and masked 28-bit cluster fields.
 
 ## v1.1.0 release gate
 
@@ -29,6 +29,7 @@ Last reviewed: 2026-09-04 22:57 KST
 - [x] Per-copy FAT12/16/32 reserved-entry and BPB media validation with retained clean-shutdown/hard-error status.
 - [x] Bounded FAT12/16/32 active-reference exclusion and ownership-free lost allocation-chain inventory with exact FAT/data provenance.
 - [x] Anonymous recursive artifact recovery for complete image-bounded FAT lost chains with final-cluster slack and ownership caveats.
+- [x] Active FAT12/16 root/subdirectory regular-file inventory, intact LFN validation, exact EOC mapping, and recursive child recovery.
 - [x] Shared bounded ext inode mapper for direct blocks and depth-zero/depth-one extent trees.
 - [x] Depth-one extent-index/leaf/data provenance, repeated-leaf protection, and recursive Engine flag E2E.
 - [x] Bounded active ext subdirectory traversal and recursively recoverable regular-file children with inode/directory/block lineage.
