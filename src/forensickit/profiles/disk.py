@@ -419,6 +419,24 @@ class DiskProfile(BaseProfile):
             ),
             {},
         )
+        fat_variant_evidence = next(
+            (
+                value for value in context.values("filesystem.fat.variant_evidence")
+                if isinstance(value, dict)
+            ),
+            {},
+        )
+        if fat_variant_evidence.get("label_structure_agree") is False:
+            result.findings.append(self.finding(
+                context,
+                title="FAT textual type label disagrees with BPB cluster-count geometry",
+                category="fat_variant_label_mismatch", confidence=0.99,
+                explanation=(
+                    "The FAT type label is informational, while the specification classifies FAT12/16/32 by the data-cluster count. "
+                    "A fully validated BPB-derived variant was selected for bounded parsing, and every conflicting label field, offset, and raw value is retained for review."
+                ),
+                evidence=[str(fat_variant_evidence)[:4_000]], severity="low",
+            ))
         if fat_bpb_validation.get("available") is True and fat_bpb_validation.get("valid") is False:
             fat_bits = fat_bpb_validation.get("fat_bits")
             result.findings.append(self.finding(
@@ -426,7 +444,7 @@ class DiskProfile(BaseProfile):
                 title=f"FAT{fat_bits} BIOS Parameter Block relationships are inconsistent",
                 category="fat_bpb_structure_anomaly", confidence=0.97,
                 explanation=(
-                    "The bounded boot-sector validator found an invalid jump encoding, boot marker, fundamental sector/FAT geometry, mutually exclusive total-size fields, format-specific FAT-size/root-entry fields, cluster-count class, FAT32 version, or FAT32 reserved BPB bytes. "
+                    "The bounded boot-sector validator found an invalid jump encoding, boot marker, fundamental sector/FAT geometry, mutually exclusive total-size fields, format-specific FAT-size/root-entry fields, cluster-count class, FAT entry capacity, FAT32 version, or FAT32 reserved BPB bytes. "
                     "Every raw-derived field and failed check is retained; a supplied image shorter than the declared volume is reported separately and does not by itself make the BPB structurally invalid."
                 ),
                 evidence=[str(fat_bpb_validation)[:4_000]], severity="medium",

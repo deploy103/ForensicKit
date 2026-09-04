@@ -2008,9 +2008,49 @@ class GenericTriageEngine:
     def _inspect_filesystem_signatures(
         self, artifact: Artifact, path: Path, header: bytes, size: int
     ) -> list[Observation]:
+        boot_sector = header
+        if size >= 512 and len(boot_sector) < 512:
+            try:
+                with path.open("rb") as stream:
+                    boot_sector = stream.read(512)
+            except OSError:
+                pass
         ntfs = len(header) >= 11 and header[3:11] == b"NTFS    "
         exfat = len(header) >= 11 and header[3:11] == b"EXFAT   "
-        fat = len(header) >= 90 and (header[54:62].startswith(b"FAT") or header[82:90].startswith(b"FAT"))
+        fat_label_records: list[dict[str, object]] = []
+        for offset, field in ((54, boot_sector[54:62]), (82, boot_sector[82:90])):
+            if not field.startswith(b"FAT"):
+                continue
+            explicit_bits = (
+                12 if field.startswith(b"FAT12")
+                else 16 if field.startswith(b"FAT16")
+                else 32 if field.startswith(b"FAT32")
+                else None
+            )
+            fat_label_records.append({
+                "offset": offset,
+                "raw_hex": field.hex(),
+                "text": field.decode("ascii", errors="replace"),
+                "explicit_fat_bits": explicit_bits,
+            })
+        explicit_label_bits = {
+            int(item["explicit_fat_bits"])
+            for item in fat_label_records
+            if isinstance(item.get("explicit_fat_bits"), int)
+        }
+        fat_label_bits = next(iter(explicit_label_bits)) if len(explicit_label_bits) == 1 else 0
+        bpb_fat_bits = self._fat_bpb_cluster_count_variant(boot_sector)
+        bpb_validation = (
+            self._fat_bpb_validation(boot_sector, size, bpb_fat_bits)
+            if bpb_fat_bits else None
+        )
+        bpb_fat_recognized = bool(
+            bpb_validation
+            and bpb_validation.get("available") is True
+            and bpb_validation.get("valid") is True
+        )
+        fat = bool(fat_label_records) or bpb_fat_recognized
+        selected_fat_bits = bpb_fat_bits if bpb_fat_recognized else fat_label_bits
         ext = False
         ext_superblock = b""
         if size >= 1082:
@@ -2025,6 +2065,7 @@ class GenericTriageEngine:
             self._observation(artifact, "filesystem.ntfs_signature", ntfs),
             self._observation(artifact, "filesystem.exfat_signature", exfat),
             self._observation(artifact, "filesystem.fat_signature", fat),
+            self._observation(artifact, "filesystem.fat.label_signature", bool(fat_label_records)),
             self._observation(artifact, "filesystem.ext_signature", ext),
         ]
         if exfat:
@@ -2059,75 +2100,92 @@ class GenericTriageEngine:
                 )
             )
         if fat:
-            bytes_per_sector = int.from_bytes(header[11:13], "little")
-            sectors_per_cluster = header[13]
-            fat_size_16 = int.from_bytes(header[22:24], "little")
-            fat32 = header[82:90].startswith(b"FAT")
-            fat16 = not fat32 and header[54:62].startswith(b"FAT16")
-            fat12 = not fat32 and not fat16 and header[54:62].startswith(b"FAT12")
+            fat_header = boot_sector
+            bytes_per_sector = int.from_bytes(fat_header[11:13], "little")
+            sectors_per_cluster = fat_header[13]
+            fat_size_16 = int.from_bytes(fat_header[22:24], "little")
+            fat32 = selected_fat_bits == 32
+            fat16 = selected_fat_bits == 16
+            fat12 = selected_fat_bits == 12
+            label_structure_agree = (
+                explicit_label_bits == {bpb_fat_bits}
+                if explicit_label_bits and bpb_fat_recognized else None
+            )
+            variant_evidence = {
+                "text_label_records": fat_label_records,
+                "text_label_fat_bits": fat_label_bits or None,
+                "text_label_ambiguous": len(explicit_label_bits) > 1,
+                "bpb_cluster_count_fat_bits": bpb_fat_bits or None,
+                "bpb_structure_recognized": bpb_fat_recognized,
+                "label_structure_agree": label_structure_agree,
+                "selected_fat_bits": selected_fat_bits or None,
+                "selection_basis": (
+                    "bpb_cluster_count" if bpb_fat_recognized
+                    else "text_label" if selected_fat_bits
+                    else "unresolved_text_label"
+                ),
+            }
             observations.extend((
                 self._observation(
                     artifact, "filesystem.fat.variant",
                     "fat32" if fat32 else "fat16" if fat16 else "fat12" if fat12 else "fat12_or_fat16",
                 ),
+                self._observation(artifact, "filesystem.fat.variant_evidence", variant_evidence),
                 self._observation(artifact, "filesystem.fat.bytes_per_sector", bytes_per_sector),
                 self._observation(artifact, "filesystem.fat.sectors_per_cluster", sectors_per_cluster),
-                self._observation(artifact, "filesystem.fat.reserved_sector_count", int.from_bytes(header[14:16], "little")),
-                self._observation(artifact, "filesystem.fat.count", header[16]),
-                self._observation(artifact, "filesystem.fat.total_sectors", int.from_bytes(header[19:21], "little") or int.from_bytes(header[32:36], "little")),
-                self._observation(artifact, "filesystem.fat.size_sectors", int.from_bytes(header[36:40], "little") if fat32 else fat_size_16),
-                self._observation(artifact, "filesystem.fat.volume_label", (header[71:82] if fat32 else header[43:54]).decode("ascii", errors="replace").strip()),
+                self._observation(artifact, "filesystem.fat.reserved_sector_count", int.from_bytes(fat_header[14:16], "little")),
+                self._observation(artifact, "filesystem.fat.count", fat_header[16]),
+                self._observation(artifact, "filesystem.fat.total_sectors", int.from_bytes(fat_header[19:21], "little") or int.from_bytes(fat_header[32:36], "little")),
+                self._observation(artifact, "filesystem.fat.size_sectors", int.from_bytes(fat_header[36:40], "little") if fat32 else fat_size_16),
+                self._observation(artifact, "filesystem.fat.volume_label", (fat_header[71:82] if fat32 else fat_header[43:54]).decode("ascii", errors="replace").strip()),
             ))
             fat_bits = 32 if fat32 else 16 if fat16 else 12 if fat12 else 0
             if fat_bits:
-                fat_boot_sector = header
-                if size >= 512 and len(fat_boot_sector) < 512:
-                    try:
-                        with path.open("rb") as stream:
-                            fat_boot_sector = stream.read(512)
-                    except OSError:
-                        pass
+                if not bpb_fat_recognized or bpb_validation is None:
+                    bpb_validation = self._fat_bpb_validation(
+                        boot_sector, size, fat_bits,
+                    )
                 observations.append(self._observation(
                     artifact, "filesystem.fat.bpb_validation",
-                    self._fat_bpb_validation(fat_boot_sector, size, fat_bits),
+                    bpb_validation,
                 ))
             if fat32:
                 observations.extend(self._inspect_fat_duplicate_tables(
-                    artifact, path, size, header, bytes_per_sector,
-                    sectors_per_cluster, int.from_bytes(header[14:16], "little"),
-                    header[16], int.from_bytes(header[36:40], "little"), fat_bits=32,
+                    artifact, path, size, fat_header, bytes_per_sector,
+                    sectors_per_cluster, int.from_bytes(fat_header[14:16], "little"),
+                    fat_header[16], int.from_bytes(fat_header[36:40], "little"), fat_bits=32,
                 ))
                 observations.extend(self._inspect_fat32_metadata_sectors(
-                    artifact, path, size, header, bytes_per_sector,
-                    sectors_per_cluster, int.from_bytes(header[14:16], "little"),
-                    header[16], int.from_bytes(header[36:40], "little"),
+                    artifact, path, size, fat_header, bytes_per_sector,
+                    sectors_per_cluster, int.from_bytes(fat_header[14:16], "little"),
+                    fat_header[16], int.from_bytes(fat_header[36:40], "little"),
                 ))
                 observations.extend(self._inspect_fat32_root_directory(
-                    artifact, path, size, header, bytes_per_sector,
-                    sectors_per_cluster, int.from_bytes(header[14:16], "little"),
-                    header[16], int.from_bytes(header[36:40], "little"),
+                    artifact, path, size, fat_header, bytes_per_sector,
+                    sectors_per_cluster, int.from_bytes(fat_header[14:16], "little"),
+                    fat_header[16], int.from_bytes(fat_header[36:40], "little"),
                 ))
             elif fat16:
                 observations.extend(self._inspect_fat_duplicate_tables(
-                    artifact, path, size, header, bytes_per_sector,
-                    sectors_per_cluster, int.from_bytes(header[14:16], "little"),
-                    header[16], fat_size_16, fat_bits=16,
+                    artifact, path, size, fat_header, bytes_per_sector,
+                    sectors_per_cluster, int.from_bytes(fat_header[14:16], "little"),
+                    fat_header[16], fat_size_16, fat_bits=16,
                 ))
                 observations.extend(self._inspect_fat_fixed_root_directory(
-                    artifact, path, size, header, bytes_per_sector,
-                    sectors_per_cluster, int.from_bytes(header[14:16], "little"),
-                    header[16], fat_size_16, fat_bits=16,
+                    artifact, path, size, fat_header, bytes_per_sector,
+                    sectors_per_cluster, int.from_bytes(fat_header[14:16], "little"),
+                    fat_header[16], fat_size_16, fat_bits=16,
                 ))
             elif fat12:
                 observations.extend(self._inspect_fat_duplicate_tables(
-                    artifact, path, size, header, bytes_per_sector,
-                    sectors_per_cluster, int.from_bytes(header[14:16], "little"),
-                    header[16], fat_size_16, fat_bits=12,
+                    artifact, path, size, fat_header, bytes_per_sector,
+                    sectors_per_cluster, int.from_bytes(fat_header[14:16], "little"),
+                    fat_header[16], fat_size_16, fat_bits=12,
                 ))
                 observations.extend(self._inspect_fat_fixed_root_directory(
-                    artifact, path, size, header, bytes_per_sector,
-                    sectors_per_cluster, int.from_bytes(header[14:16], "little"),
-                    header[16], fat_size_16, fat_bits=12,
+                    artifact, path, size, fat_header, bytes_per_sector,
+                    sectors_per_cluster, int.from_bytes(fat_header[14:16], "little"),
+                    fat_header[16], fat_size_16, fat_bits=12,
                 ))
         if ext and len(ext_superblock) >= 136:
             log_block_size = int.from_bytes(ext_superblock[24:28], "little")
@@ -2149,8 +2207,39 @@ class GenericTriageEngine:
         return observations
 
     @staticmethod
+    def _fat_bpb_cluster_count_variant(header: bytes) -> int:
+        """Derive the FAT variant using the specification's cluster-count thresholds."""
+        if len(header) < 64:
+            return 0
+        bytes_per_sector = int.from_bytes(header[11:13], "little")
+        sectors_per_cluster = header[13]
+        reserved_sectors = int.from_bytes(header[14:16], "little")
+        fat_count = header[16]
+        root_entries = int.from_bytes(header[17:19], "little")
+        total_sectors = (
+            int.from_bytes(header[19:21], "little")
+            or int.from_bytes(header[32:36], "little")
+        )
+        fat_size = (
+            int.from_bytes(header[22:24], "little")
+            or int.from_bytes(header[36:40], "little")
+        )
+        if not bytes_per_sector or not sectors_per_cluster or not fat_size:
+            return 0
+        root_sectors = (
+            root_entries * 32 + bytes_per_sector - 1
+        ) // bytes_per_sector
+        first_data_sector = reserved_sectors + fat_count * fat_size + root_sectors
+        if total_sectors <= first_data_sector:
+            return 0
+        cluster_count = (total_sectors - first_data_sector) // sectors_per_cluster
+        if cluster_count < 4_085:
+            return 12 if cluster_count > 0 else 0
+        return 16 if cluster_count < 65_525 else 32
+
+    @staticmethod
     def _fat_bpb_validation(header: bytes, image_size: int, fat_bits: int) -> dict[str, object]:
-        """Validate format-specific FAT BPB relationships without reading evidence content."""
+        """Validate format-specific relationships from one bounded FAT boot sector."""
         bytes_per_sector = int.from_bytes(header[11:13], "little")
         sectors_per_cluster = header[13] if len(header) > 13 else 0
         reserved_sectors = int.from_bytes(header[14:16], "little")
@@ -2207,6 +2296,13 @@ class GenericTriageEngine:
             )
             fs_version_valid = True
             reserved_bpb_bytes_zero = True
+        fat_bytes = fat_size * bytes_per_sector
+        fat_entry_capacity = (
+            fat_bytes * 2 // 3 if fat_bits == 12
+            else fat_bytes // 2 if fat_bits == 16
+            else fat_bytes // 4 if fat_bits == 32
+            else 0
+        )
         checks = {
             "jump_instruction_valid": jump_valid,
             "end_marker_valid": header[510:512] == b"\x55\xaa",
@@ -2223,6 +2319,7 @@ class GenericTriageEngine:
             "root_entry_count_valid": root_entry_count_valid,
             "data_region_nonempty": total_sectors > first_data_sector,
             "cluster_count_matches_variant": cluster_class_valid,
+            "fat_entry_capacity_sufficient": fat_entry_capacity >= cluster_count + 2,
             "fat32_fs_version_valid": fs_version_valid,
             "fat32_reserved_bpb_bytes_zero": reserved_bpb_bytes_zero,
         }
@@ -2253,6 +2350,7 @@ class GenericTriageEngine:
             "first_data_sector": first_data_sector,
             "data_sectors": data_sectors,
             "cluster_count": cluster_count,
+            "fat_entry_capacity": fat_entry_capacity,
             "declared_volume_bytes": declared_volume_bytes,
             "declared_volume_within_supplied_image": declared_volume_bytes <= image_size,
         }

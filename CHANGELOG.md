@@ -33,6 +33,7 @@ Notable user-facing changes are documented here. This project follows Semantic V
 - Nested active/deleted FAT12/16/32 file records and recursive recovery findings now retain their immediate containing directory's short name, validated LFN, LFN slot offsets, source entry, and cluster lineage without fabricating a full path.
 - Deeper FAT file records now carry a bounded ordered directory-identity lineage, with per-level short/LFN names, source offsets, LFN slots, and start clusters kept distinct from any inferred path string.
 - FAT12/16/32 boot sectors now receive variant-specific BPB relationship validation covering jump/marker structure, geometry, mutually exclusive size fields, root/FAT layout, cluster-count class, and FAT32 version/reserved bytes; malformed structures produce provenance-rich profile findings.
+- FAT volumes with missing or misleading informational type labels are now classified by fully validated BPB cluster-count geometry and FAT entry capacity; label fields, raw offsets, the selected basis, and any disagreement remain explicit provenance.
 
 ## [1.1.0] - 2026-09-04
 
