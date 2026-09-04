@@ -1647,13 +1647,14 @@ class ExtractionManager:
                     f"inode:{entry.get('inode')};inode_offset:{entry.get('inode_offset')};"
                     f"inode_mode:{entry.get('inode_mode')};inode_flags:{entry.get('inode_flags')};"
                     f"link_count:{entry.get('link_count')};mapping_mode:{entry.get('mapping_mode')};"
+                    f"mapping_provenance:{entry.get('mapping_provenance')};"
                     f"directory_inode:{entry.get('directory_inode')};"
                     f"directory_inode_offset:{entry.get('directory_inode_offset')};"
                     f"directory_path:{entry.get('directory_path')};"
                     f"directory_inode_lineage:{entry.get('directory_inode_lineage')};"
                     f"directory_source_entry_offset:{entry.get('directory_source_entry_offset')};"
                     f"directory_block_lineage:{entry.get('directory_block_lineage')};"
-                    f"size:{size};data_segments:{normalized}"
+                    f"size:{size};data_segments:{normalized};source_data_segments:{segments}"
                 )
         if result.artifacts:
             result.findings.append(Finding(
@@ -1661,8 +1662,8 @@ class ExtractionManager:
                 title=f"Recovered {len(result.artifacts)} bounded active ext file(s)",
                 category="ext_root_file_recovery", severity="info", confidence=0.96,
                 explanation=(
-                    "Validated active root/subdirectory entries resolved to allocated regular-file inodes with complete initialized depth-zero extent or direct-block mappings. "
-                    "Only image-bounded declared bytes were registered as recursive children; sparse, indirect, extent-tree, deleted, and incomplete mappings were excluded."
+                    "Validated active root/subdirectory entries resolved to allocated regular-file inodes with complete initialized depth-zero/depth-one extent-tree or direct-block mappings. "
+                    "Only image-bounded declared bytes were registered as recursive children; index/leaf/data offsets are preserved while sparse, deeper-tree, indirect, deleted, and incomplete mappings are excluded."
                 ),
                 source="builtin_ext_root_extractor", supporting_evidence=evidence[:128],
             ))

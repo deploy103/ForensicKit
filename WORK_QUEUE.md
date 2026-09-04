@@ -1,10 +1,11 @@
 # ForensicKit Work Queue
 
-Last reviewed: 2026-09-03 18:50 KST
+Last reviewed: 2026-09-04 20:55 KST
 
-## Post-v1.0 backlog
+## v1.1.0 release gate
 
-- [ ] Add bounded ext4 depth-one extent-tree traversal for directories and regular files, retaining index/leaf block provenance and cycle protection.
+- [x] Add bounded ext4 depth-one extent-tree traversal for directories and regular files, retaining index/leaf block provenance and cycle protection.
+- [x] Build the v1.1.0 wheel, validate it from an isolated environment, refresh checksums, and create the release commit/tag.
 
 ## Environment-dependent
 
@@ -12,6 +13,8 @@ Last reviewed: 2026-09-03 18:50 KST
 
 ## Completed this session
 
+- [x] Shared bounded ext inode mapper for direct blocks and depth-zero/depth-one extent trees.
+- [x] Depth-one extent-index/leaf/data provenance, repeated-leaf protection, and recursive Engine flag E2E.
 - [x] Bounded active ext subdirectory traversal and recursively recoverable regular-file children with inode/directory/block lineage.
 - [x] Bounded active ext root regular-file inode mapping, child registration, recursive flag detection, and Engine E2E.
 - [x] Bounded ext2/3 direct-block and ext4 depth-zero-extent root directory inventory with exact inode/block/entry offsets.

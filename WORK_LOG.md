@@ -1,5 +1,23 @@
 # ForensicKit Work Log
 
+## 2026-09-04 20:55 KST
+
+### ext4 depth-one extent-tree traversal and recursive recovery
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/extraction.py`, `src/forensickit/profiles/disk.py`, and `tests/test_triage.py`.
+- Replaced three divergent ext mapping paths with one bounded validator for ext2/3 direct blocks and ext4 depth-zero/depth-one trees. Depth-one indices must be strictly ordered and point to unique image-bounded leaves; leaf headers, logical ownership ranges, initialized extents, tree/data non-aliasing, complete logical coverage, and existing byte/block limits all validate before use.
+- Root directories, active subdirectories, and regular files retain exact index-entry, leaf-block/header/entry, and final data-block provenance. The extractor revalidates read segments independently and carries the full tree provenance into its finding before recursive child analysis.
+- Added a synthetic depth-one root/file image proving native directory parsing, child recovery, `CTF{ext4_depth_one_leaf}` lineage, and rejection of a repeated leaf pointer.
+- Verified `python -m compileall -q src tests scripts`, focused triage regression (**83 passed, 0 failed**), and the full direct suite (**283 passed, 0 failed**).
+
+### v1.1.0 release validation
+
+- Bumped package/runtime/help/README metadata to `1.1.0`, added the changelog and release notes, and built `dist/forensickit-1.1.0-py3-none-any.whl` without dependency or network resolution.
+- Verified wheel metadata and bundled YAML resources, then installed it with `--no-index --no-deps` into an isolated Python 3.12 environment. The installed package reported `1.1.0`, CLI help rendered, and `forensickit doctor` exited 0 while accurately distinguishing present and missing optional tools.
+- A full release rerun exposed a scheduler-dependent test assumption: a 0.1-second timeout could expire before the fixture's shebang-launched Python wrote its flushed marker. The output-preservation subcase now allows 1 second against a 30-second sleep; production timeout behavior is unchanged. The 16 tool-runner tests passed three consecutive runs afterward.
+- Re-ran the full direct suite after the version bump (**283 passed, 0 failed**), re-ran compileall, validated the release artifact structure, and verified final SHA-256 `0b6781a26c26759105b64f4222699cec3d7dbf4cf5465dcdb4da64fe882fa74a` against `SHA256SUMS`.
+- Release gate is ready for the `release: ForensicKit v1.1.0` commit and annotated `v1.1.0` tag.
+
 ## 2026-09-03 13:30 KST
 
 ### Active ext subdirectory traversal and nested-file recovery

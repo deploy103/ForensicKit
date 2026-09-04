@@ -2,6 +2,19 @@
 
 Notable user-facing changes are documented here. This project follows Semantic Versioning.
 
+## [1.1.0] - 2026-09-04
+
+### Added
+
+- Bounded ext4 depth-one extent-tree traversal for root/subdirectories and active regular files.
+- Exact extent-index, leaf-block, leaf-entry, and data-block provenance in observations and recursive recovery findings.
+
+### Changed
+
+- Ext inode mapping now shares one validator across root directories, active subdirectories, and regular files.
+- Extent trees reject repeated leaf pointers, invalid index ranges, tree/data block aliasing, sparse mappings, uninitialized extents, deeper trees, and mappings outside filesystem/image/resource bounds.
+- 283 deterministic synthetic regression tests are runnable without pytest.
+
 ## [1.0.0] - 2026-09-03
 
 ### Added

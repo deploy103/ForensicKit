@@ -2156,67 +2156,21 @@ class GenericTriageEngine:
                 required_blocks = (directory_size + block_size - 1) // block_size
                 if not 1 <= required_blocks <= 64:
                     raise RuntimeError("root directory exceeds the 64-block bound")
-                logical_blocks: dict[int, int] = {}
-                mapping_mode = "ext4_depth0_extents" if flags & 0x00080000 else "ext2_3_direct_blocks"
-                extent_inventory: list[dict[str, object]] = []
-                if flags & 0x00080000:
-                    extent_root = inode[40:100]
-                    magic = int.from_bytes(extent_root[0:2], "little")
-                    entry_count = int.from_bytes(extent_root[2:4], "little")
-                    maximum = int.from_bytes(extent_root[4:6], "little")
-                    depth = int.from_bytes(extent_root[6:8], "little")
-                    if magic != 0xF30A or depth != 0 or entry_count > maximum or maximum > 4:
-                        raise RuntimeError("unsupported or invalid root extent header")
-                    previous_end = 0
-                    for extent_index in range(entry_count):
-                        offset = 12 + extent_index * 12
-                        logical_start = int.from_bytes(extent_root[offset:offset + 4], "little")
-                        raw_length = int.from_bytes(extent_root[offset + 4:offset + 6], "little")
-                        uninitialized = bool(raw_length & 0x8000)
-                        extent_length = raw_length & 0x7FFF
-                        physical_start = (
-                            int.from_bytes(extent_root[offset + 6:offset + 8], "little") << 32
-                            | int.from_bytes(extent_root[offset + 8:offset + 12], "little")
-                        )
-                        if (
-                            extent_length == 0 or uninitialized or logical_start < previous_end
-                            or physical_start <= 0 or physical_start + extent_length > blocks_count
-                        ):
-                            raise RuntimeError("invalid, overlapping, or uninitialized root extent")
-                        extent_inventory.append({
-                            "logical_block": logical_start, "block_count": extent_length,
-                            "physical_block": physical_start, "uninitialized": uninitialized,
-                            "inode_byte_offset": root_inode_offset + 40 + offset,
-                        })
-                        for part in range(extent_length):
-                            logical = logical_start + part
-                            if logical < required_blocks:
-                                logical_blocks[logical] = physical_start + part
-                        previous_end = logical_start + extent_length
-                else:
-                    if required_blocks > 12:
-                        raise RuntimeError("root directory requires unsupported indirect block pointers")
-                    for logical in range(required_blocks):
-                        physical = int.from_bytes(inode[40 + logical * 4:44 + logical * 4], "little")
-                        if physical <= 0 or physical >= blocks_count:
-                            raise RuntimeError("root direct block pointer is missing or outside filesystem bounds")
-                        logical_blocks[logical] = physical
-                        extent_inventory.append({
-                            "logical_block": logical, "block_count": 1,
-                            "physical_block": physical, "uninitialized": False,
-                            "inode_byte_offset": root_inode_offset + 40 + logical * 4,
-                        })
-                if set(logical_blocks) != set(range(required_blocks)):
-                    raise RuntimeError("root directory mapping has a logical block gap")
+                root_segments, mapping_mode, mapping_error, extent_inventory = self._ext_inode_segments(
+                    stream, inode, root_inode_offset, block_size=block_size,
+                    blocks_count=blocks_count, image_size=image_size,
+                    size_limit=_MIB, block_limit=64,
+                )
+                if not root_segments:
+                    raise RuntimeError(f"root directory mapping failed: {mapping_error}")
                 block_payloads: list[tuple[int, int, bytes]] = []
                 block_segments: list[dict[str, int]] = []
-                remaining = directory_size
-                for logical in range(required_blocks):
-                    physical = logical_blocks[logical]
-                    physical_offset = physical * block_size
-                    if physical_offset < 0 or physical_offset + block_size > image_size:
-                        raise RuntimeError("root directory block maps outside supplied image")
-                    take = min(block_size, remaining)
+                for segment in root_segments:
+                    logical_offset = int(segment["logical_offset"])
+                    logical = logical_offset // block_size
+                    physical = int(segment["physical_block"])
+                    physical_offset = int(segment["physical_offset"])
+                    take = int(segment["length"])
                     stream.seek(physical_offset)
                     block = stream.read(take)
                     if len(block) != take:
@@ -2226,7 +2180,6 @@ class GenericTriageEngine:
                         "logical_block": logical, "physical_block": physical,
                         "physical_offset": physical_offset, "data_length": take,
                     })
-                    remaining -= take
         except (OSError, RuntimeError) as exc:
             return [
                 self._observation(artifact, f"{prefix}.available", False),
@@ -2311,8 +2264,8 @@ class GenericTriageEngine:
                     if child_links == 0:
                         subdirectory_errors.append(f"directory inode {candidate_inode}: zero link count")
                         continue
-                    child_segments, child_mapping_mode, mapping_error = self._ext_inode_segments(
-                        child_inode, child_inode_offset, block_size=block_size,
+                    child_segments, child_mapping_mode, mapping_error, child_mapping_provenance = self._ext_inode_segments(
+                        stream, child_inode, child_inode_offset, block_size=block_size,
                         blocks_count=blocks_count, image_size=image_size,
                         size_limit=_MIB, block_limit=64,
                     )
@@ -2357,7 +2310,8 @@ class GenericTriageEngine:
                         "source_entry_offset": candidate.get("physical_offset"),
                         "parent_inode_lineage": candidate.get("parent_inode_lineage", [2]),
                         "inode_lineage": inode_lineage, "link_count": child_links,
-                        "mapping_mode": child_mapping_mode, "data_segments": child_segments,
+                        "mapping_mode": child_mapping_mode, "mapping_provenance": child_mapping_provenance,
+                        "data_segments": child_segments,
                     })
                     subdirectory_errors.extend(
                         f"directory inode {candidate_inode}: {error}" for error in child_parse_errors[:64]
@@ -2423,88 +2377,21 @@ class GenericTriageEngine:
                         continue
                     file_mode = int.from_bytes(file_inode[0:2], "little")
                     link_count = int.from_bytes(file_inode[26:28], "little")
-                    file_flags = int.from_bytes(file_inode[32:36], "little")
                     file_size = int.from_bytes(file_inode[4:8], "little")
                     if len(file_inode) >= 112:
                         file_size |= int.from_bytes(file_inode[108:112], "little") << 32
                     if file_mode & 0xF000 != 0x8000 or link_count == 0 or not 0 < file_size <= 8 * _MIB:
                         file_errors.append(f"inode {inode_number}: not an allocated bounded regular file")
                         continue
-                    required_file_blocks = (file_size + block_size - 1) // block_size
-                    if not 1 <= required_file_blocks <= 64:
-                        file_errors.append(f"inode {inode_number}: exceeds 64-block recovery bound")
+                    data_segments, file_mapping_mode, mapping_error, file_mapping_provenance = self._ext_inode_segments(
+                        stream, file_inode, file_inode_offset, block_size=block_size,
+                        blocks_count=blocks_count, image_size=image_size,
+                        size_limit=8 * _MIB, block_limit=64,
+                    )
+                    if not data_segments:
+                        file_errors.append(f"inode {inode_number}: {mapping_error}")
                         continue
-                    file_blocks: dict[int, int] = {}
-                    file_mapping_mode = "ext4_depth0_extents" if file_flags & 0x00080000 else "ext2_3_direct_blocks"
-                    if file_flags & 0x00080000:
-                        extent_root = file_inode[40:100]
-                        extent_count = int.from_bytes(extent_root[2:4], "little")
-                        extent_max = int.from_bytes(extent_root[4:6], "little")
-                        extent_depth = int.from_bytes(extent_root[6:8], "little")
-                        if (
-                            int.from_bytes(extent_root[0:2], "little") != 0xF30A
-                            or extent_depth != 0 or extent_count > extent_max or extent_max > 4
-                        ):
-                            file_errors.append(f"inode {inode_number}: invalid/unsupported extent root")
-                            continue
-                        previous_end = 0
-                        mapping_invalid = False
-                        for extent_index in range(extent_count):
-                            offset = 12 + extent_index * 12
-                            logical_start = int.from_bytes(extent_root[offset:offset + 4], "little")
-                            raw_length = int.from_bytes(extent_root[offset + 4:offset + 6], "little")
-                            extent_length = raw_length & 0x7FFF
-                            physical_start = (
-                                int.from_bytes(extent_root[offset + 6:offset + 8], "little") << 32
-                                | int.from_bytes(extent_root[offset + 8:offset + 12], "little")
-                            )
-                            if (
-                                raw_length & 0x8000 or extent_length == 0 or logical_start < previous_end
-                                or physical_start <= 0 or physical_start + extent_length > blocks_count
-                            ):
-                                mapping_invalid = True
-                                break
-                            for part in range(extent_length):
-                                logical = logical_start + part
-                                if logical < required_file_blocks:
-                                    file_blocks[logical] = physical_start + part
-                            previous_end = logical_start + extent_length
-                        if mapping_invalid:
-                            file_errors.append(f"inode {inode_number}: invalid/uninitialized extent")
-                            continue
-                    else:
-                        if required_file_blocks > 12:
-                            file_errors.append(f"inode {inode_number}: indirect blocks are unsupported")
-                            continue
-                        for logical in range(required_file_blocks):
-                            physical = int.from_bytes(file_inode[40 + logical * 4:44 + logical * 4], "little")
-                            if physical <= 0 or physical >= blocks_count:
-                                file_blocks = {}
-                                break
-                            file_blocks[logical] = physical
-                    if set(file_blocks) != set(range(required_file_blocks)):
-                        file_errors.append(f"inode {inode_number}: sparse, missing, or incomplete logical mapping")
-                        continue
-                    data_segments: list[dict[str, int]] = []
-                    remaining_bytes = file_size
-                    mapping_valid = True
-                    for logical in range(required_file_blocks):
-                        physical = file_blocks[logical]
-                        physical_offset = physical * block_size
-                        if physical_offset < 0 or physical_offset + block_size > image_size:
-                            mapping_valid = False
-                            break
-                        take = min(block_size, remaining_bytes)
-                        data_segments.append({
-                            "logical_offset": logical * block_size,
-                            "physical_block": physical,
-                            "physical_offset": physical_offset,
-                            "length": take,
-                        })
-                        remaining_bytes -= take
-                    if not mapping_valid or remaining_bytes:
-                        file_errors.append(f"inode {inode_number}: data block outside supplied image")
-                        continue
+                    file_flags = int.from_bytes(file_inode[32:36], "little")
                     recoverable_files.append({
                         "name": entry.get("name"),
                         "directory_entry_offset": entry.get("physical_offset"),
@@ -2515,6 +2402,7 @@ class GenericTriageEngine:
                         "link_count": link_count,
                         "size": file_size,
                         "mapping_mode": file_mapping_mode,
+                        "mapping_provenance": file_mapping_provenance,
                         "data_segments": data_segments,
                         "directory_inode": entry.get("directory_inode", 2),
                         "directory_inode_offset": entry.get("directory_inode_offset", root_inode_offset),
@@ -2589,6 +2477,7 @@ class GenericTriageEngine:
 
     @staticmethod
     def _ext_inode_segments(
+        stream: BinaryIO,
         inode: bytes,
         inode_offset: int,
         *,
@@ -2597,69 +2486,172 @@ class GenericTriageEngine:
         image_size: int,
         size_limit: int,
         block_limit: int,
-    ) -> tuple[list[dict[str, int]], str | None, str | None]:
+    ) -> tuple[list[dict[str, int]], str | None, str | None, list[dict[str, object]]]:
         size = int.from_bytes(inode[4:8], "little")
         if len(inode) >= 112:
             size |= int.from_bytes(inode[108:112], "little") << 32
         if not 0 < size <= size_limit:
-            return [], None, "inode size outside configured bound"
+            return [], None, "inode size outside configured bound", []
         required = (size + block_size - 1) // block_size
         if not 1 <= required <= block_limit:
-            return [], None, "inode block count outside configured bound"
+            return [], None, "inode block count outside configured bound", []
         flags = int.from_bytes(inode[32:36], "little")
         logical_blocks: dict[int, int] = {}
-        mode = "ext4_depth0_extents" if flags & 0x00080000 else "ext2_3_direct_blocks"
+        block_provenance: dict[int, dict[str, int]] = {}
+        mapping_provenance: list[dict[str, object]] = []
+        mode = "ext2_3_direct_blocks"
         if flags & 0x00080000:
             root = inode[40:100]
             count = int.from_bytes(root[2:4], "little")
             maximum = int.from_bytes(root[4:6], "little")
             depth = int.from_bytes(root[6:8], "little")
-            if int.from_bytes(root[0:2], "little") != 0xF30A or depth != 0 or count > maximum or maximum > 4:
-                return [], mode, "invalid or unsupported extent root"
+            mode = "ext4_depth0_extents" if depth == 0 else f"ext4_depth{depth}_extent_tree"
+            if (
+                int.from_bytes(root[0:2], "little") != 0xF30A
+                or depth not in {0, 1} or not 1 <= count <= maximum or maximum > 4
+            ):
+                return [], mode, "invalid or unsupported extent root", []
+            extent_sources: list[tuple[bytes, int, int | None, int | None]] = []
+            extent_tree_blocks: set[int] = set()
+            if depth == 0:
+                extent_sources.append((root, inode_offset + 40, None, None))
+            else:
+                indices: list[tuple[int, int, int]] = []
+                previous_index_logical = -1
+                for index_number in range(count):
+                    relative_offset = 12 + index_number * 12
+                    logical_start = int.from_bytes(root[relative_offset:relative_offset + 4], "little")
+                    leaf_block = (
+                        int.from_bytes(root[relative_offset + 8:relative_offset + 10], "little") << 32
+                        | int.from_bytes(root[relative_offset + 4:relative_offset + 8], "little")
+                    )
+                    index_offset = inode_offset + 40 + relative_offset
+                    if (
+                        logical_start <= previous_index_logical or leaf_block <= 0
+                        or leaf_block >= blocks_count or leaf_block in extent_tree_blocks
+                        or leaf_block * block_size + block_size > image_size
+                    ):
+                        return [], mode, "invalid, unsorted, or repeated depth-one extent index", []
+                    extent_tree_blocks.add(leaf_block)
+                    indices.append((logical_start, leaf_block, index_offset))
+                    mapping_provenance.append({
+                        "kind": "extent_index", "logical_block": logical_start,
+                        "leaf_block": leaf_block, "index_entry_offset": index_offset,
+                    })
+                    previous_index_logical = logical_start
+                for index_number, (logical_start, leaf_block, index_offset) in enumerate(indices):
+                    leaf_offset = leaf_block * block_size
+                    stream.seek(leaf_offset)
+                    leaf = stream.read(block_size)
+                    if len(leaf) != block_size:
+                        return [], mode, "truncated depth-one extent leaf", mapping_provenance
+                    leaf_count = int.from_bytes(leaf[2:4], "little")
+                    leaf_maximum = int.from_bytes(leaf[4:6], "little")
+                    leaf_depth = int.from_bytes(leaf[6:8], "little")
+                    leaf_capacity = (block_size - 12) // 12
+                    if (
+                        int.from_bytes(leaf[0:2], "little") != 0xF30A or leaf_depth != 0
+                        or not 1 <= leaf_count <= leaf_maximum or leaf_maximum > leaf_capacity
+                    ):
+                        return [], mode, "invalid depth-one extent leaf header", mapping_provenance
+                    upper_logical = indices[index_number + 1][0] if index_number + 1 < len(indices) else None
+                    mapping_provenance.append({
+                        "kind": "extent_leaf", "index_logical_block": logical_start,
+                        "leaf_block": leaf_block, "leaf_offset": leaf_offset,
+                        "entry_count": leaf_count, "maximum": leaf_maximum,
+                        "index_entry_offset": index_offset,
+                    })
+                    extent_sources.append((leaf, leaf_offset, logical_start, upper_logical))
+            if sum(int.from_bytes(node[2:4], "little") for node, *_ in extent_sources) > block_limit:
+                return [], mode, "extent entry count exceeds configured block bound", mapping_provenance
             previous_end = 0
-            for extent_index in range(count):
-                offset = 12 + extent_index * 12
-                logical_start = int.from_bytes(root[offset:offset + 4], "little")
-                raw_length = int.from_bytes(root[offset + 4:offset + 6], "little")
-                length = raw_length & 0x7FFF
-                physical_start = (
-                    int.from_bytes(root[offset + 6:offset + 8], "little") << 32
-                    | int.from_bytes(root[offset + 8:offset + 12], "little")
-                )
-                if (
-                    raw_length & 0x8000 or length == 0 or logical_start < previous_end
-                    or physical_start <= 0 or physical_start + length > blocks_count
-                ):
-                    return [], mode, "invalid, overlapping, or uninitialized extent"
-                for part in range(length):
-                    logical = logical_start + part
-                    if logical < required:
-                        logical_blocks[logical] = physical_start + part
-                previous_end = logical_start + length
+            physical_intervals: list[tuple[int, int]] = []
+            for extent_node, node_offset, lower_logical, upper_logical in extent_sources:
+                node_count = int.from_bytes(extent_node[2:4], "little")
+                for extent_index in range(node_count):
+                    offset = 12 + extent_index * 12
+                    logical_start = int.from_bytes(extent_node[offset:offset + 4], "little")
+                    raw_length = int.from_bytes(extent_node[offset + 4:offset + 6], "little")
+                    length = raw_length & 0x7FFF
+                    physical_start = (
+                        int.from_bytes(extent_node[offset + 6:offset + 8], "little") << 32
+                        | int.from_bytes(extent_node[offset + 8:offset + 12], "little")
+                    )
+                    if (
+                        raw_length & 0x8000 or length == 0 or logical_start < previous_end
+                        or (lower_logical is not None and logical_start < lower_logical)
+                        or (upper_logical is not None and logical_start >= upper_logical)
+                        or (upper_logical is not None and logical_start + length > upper_logical)
+                        or physical_start <= 0 or physical_start + length > blocks_count
+                        or (physical_start + length) * block_size > image_size
+                        or any(
+                            physical_start <= tree_block < physical_start + length
+                            for tree_block in extent_tree_blocks
+                        )
+                        or any(
+                            physical_start < interval_end and physical_start + length > interval_start
+                            for interval_start, interval_end in physical_intervals
+                        )
+                    ):
+                        return [], mode, "invalid, overlapping, repeated, tree-referencing, or uninitialized extent", mapping_provenance
+                    entry_offset = node_offset + offset
+                    extent_evidence: dict[str, object] = {
+                        "kind": "extent", "logical_block": logical_start,
+                        "block_count": length, "physical_block": physical_start,
+                        "uninitialized": False,
+                    }
+                    if depth == 0:
+                        extent_evidence["inode_byte_offset"] = entry_offset
+                    else:
+                        extent_evidence.update({
+                            "leaf_block": node_offset // block_size,
+                            "leaf_offset": node_offset,
+                            "leaf_entry_offset": entry_offset,
+                        })
+                    mapping_provenance.append(extent_evidence)
+                    physical_intervals.append((physical_start, physical_start + length))
+                    for part in range(min(length, max(0, required - logical_start))):
+                        logical = logical_start + part
+                        if logical < required:
+                            logical_blocks[logical] = physical_start + part
+                            if depth == 1:
+                                block_provenance[logical] = {
+                                    "extent_leaf_block": node_offset // block_size,
+                                    "extent_leaf_offset": node_offset,
+                                    "extent_entry_offset": entry_offset,
+                                }
+                    previous_end = logical_start + length
         else:
             if required > 12:
-                return [], mode, "indirect block pointers are unsupported"
+                return [], mode, "indirect block pointers are unsupported", []
             for logical in range(required):
                 physical = int.from_bytes(inode[40 + logical * 4:44 + logical * 4], "little")
                 if physical <= 0 or physical >= blocks_count:
-                    return [], mode, "missing or invalid direct block pointer"
+                    return [], mode, "missing or invalid direct block pointer", mapping_provenance
                 logical_blocks[logical] = physical
+                mapping_provenance.append({
+                    "logical_block": logical, "block_count": 1,
+                    "physical_block": physical, "uninitialized": False,
+                    "inode_byte_offset": inode_offset + 40 + logical * 4,
+                })
         if set(logical_blocks) != set(range(required)):
-            return [], mode, "sparse, missing, or incomplete logical mapping"
+            return [], mode, "sparse, missing, or incomplete logical mapping", mapping_provenance
         segments: list[dict[str, int]] = []
         remaining = size
         for logical in range(required):
             physical = logical_blocks[logical]
             physical_offset = physical * block_size
             if physical_offset < 0 or physical_offset + block_size > image_size:
-                return [], mode, "data block outside supplied image"
+                return [], mode, "data block outside supplied image", mapping_provenance
             take = min(block_size, remaining)
-            segments.append({
+            segment = {
                 "logical_offset": logical * block_size, "physical_block": physical,
                 "physical_offset": physical_offset, "length": take,
-            })
+            }
+            segment.update(block_provenance.get(logical, {}))
+            segments.append(segment)
             remaining -= take
-        return segments, mode, None
+        return segments, mode, None, mapping_provenance
 
     @staticmethod
     def _ext_directory_entries_from_segments(
