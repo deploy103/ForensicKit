@@ -3670,6 +3670,15 @@ class GenericTriageEngine:
             ]
         data = stored[:root_logical_bytes]
         entry_offsets = [root_offset + index * 32 for index in range(root_entries)]
+        fat_offset = reserved_sectors * bytes_per_sector
+        fat_end = fat_offset + fat_size * bytes_per_sector
+        subdirectory_entries, subdirectory_inventory, subdirectory_errors = (
+            self._fat16_subdirectory_deleted_entries(
+                path, image_size, data, entry_offsets, bytes_per_sector,
+                sectors_per_cluster, first_data_sector, fat_offset, fat_end,
+                cluster_count,
+            )
+        )
         deleted_entries: list[dict[str, object]] = []
         unlinked_lfn_slots: list[dict[str, object]] = []
         pending_lfn: list[tuple[int, bytes]] = []
@@ -3751,9 +3760,179 @@ class GenericTriageEngine:
             self._observation(artifact, f"{prefix}.cluster_count", cluster_count),
             self._observation(artifact, f"{prefix}.fat_entry_capacity", fat_entry_capacity),
             self._observation(artifact, f"{prefix}.deleted_entries", deleted_entries),
+            self._observation(artifact, f"{prefix}.subdirectory_deleted_entries", subdirectory_entries),
+            self._observation(artifact, f"{prefix}.subdirectory_inventory", subdirectory_inventory),
+            self._observation(artifact, f"{prefix}.subdirectory_errors", subdirectory_errors),
             self._observation(artifact, f"{prefix}.unlinked_lfn_slots", unlinked_lfn_slots),
             self._observation(artifact, f"{prefix}.deleted_entries_truncated", len(deleted_entries) >= 256),
         ]
+
+    @staticmethod
+    def _fat16_subdirectory_deleted_entries(
+        path: Path,
+        image_size: int,
+        root_data: bytes,
+        root_entry_offsets: list[int],
+        bytes_per_sector: int,
+        sectors_per_cluster: int,
+        first_data_sector: int,
+        fat_offset: int,
+        fat_end: int,
+        cluster_count: int,
+    ) -> tuple[list[dict[str, object]], list[dict[str, object]], list[str]]:
+        """Traverse exact-EOC active FAT16 directories and inventory deleted children."""
+        cluster_size = bytes_per_sector * sectors_per_cluster
+        queue: list[dict[str, object]] = []
+        deleted: list[dict[str, object]] = []
+        inventory: list[dict[str, object]] = []
+        errors: list[str] = []
+        visited_starts: set[int] = set()
+        visited_clusters: set[int] = set()
+        total_clusters = 0
+        total_bytes = 0
+
+        def active_directories(data: bytes, offsets: list[int], parent_lineage: list[int]) -> None:
+            for index in range(min(len(data) // 32, 2_048)):
+                entry = data[index * 32:(index + 1) * 32]
+                if entry[0] == 0:
+                    break
+                attributes = entry[11]
+                if (
+                    entry[0] == 0xE5 or attributes == 0x0F or not attributes & 0x10
+                    or int.from_bytes(entry[20:22], "little") != 0
+                ):
+                    continue
+                name = entry[:8].decode("cp437", errors="replace").rstrip(" ")
+                if name in {".", ".."}:
+                    continue
+                start = int.from_bytes(entry[26:28], "little")
+                if 2 <= start < cluster_count + 2 and len(queue) < 64:
+                    queue.append({
+                        "name": name, "start_cluster": start,
+                        "source_entry_offset": offsets[index],
+                        "parent_cluster_lineage": parent_lineage,
+                    })
+
+        active_directories(root_data, root_entry_offsets, [])
+        try:
+            with path.open("rb") as stream:
+                while queue and len(inventory) < 32 and total_clusters < 64 and total_bytes < 8 * _MIB:
+                    directory = queue.pop(0)
+                    start = directory["start_cluster"]
+                    if not isinstance(start, int) or start in visited_starts:
+                        continue
+                    visited_starts.add(start)
+                    current = start
+                    chain: list[dict[str, int]] = []
+                    chunks: list[bytes] = []
+                    offsets: list[int] = []
+                    local_seen: set[int] = set()
+                    termination = "limit"
+                    while total_clusters < 64 and total_bytes + cluster_size <= 8 * _MIB:
+                        if current in local_seen or current in visited_clusters:
+                            termination = "loop_or_shared_cluster"
+                            errors.append(f"FAT16 subdirectory cluster {start}: loop/shared cluster {current}")
+                            break
+                        if not 2 <= current < cluster_count + 2:
+                            termination = "cluster_bounds"
+                            errors.append(f"FAT16 subdirectory cluster {start}: invalid cluster {current}")
+                            break
+                        physical_offset = (
+                            first_data_sector + (current - 2) * sectors_per_cluster
+                        ) * bytes_per_sector
+                        if physical_offset < 0 or physical_offset + cluster_size > image_size:
+                            termination = "image_bounds"
+                            errors.append(f"FAT16 subdirectory cluster {start}: cluster {current} outside image")
+                            break
+                        local_seen.add(current)
+                        visited_clusters.add(current)
+                        stream.seek(physical_offset)
+                        chunk = stream.read(cluster_size)
+                        if len(chunk) != cluster_size:
+                            termination = "truncated_read"
+                            errors.append(f"FAT16 subdirectory cluster {start}: truncated cluster {current}")
+                            break
+                        chunks.append(chunk)
+                        chain.append({"cluster": current, "offset": physical_offset, "length": cluster_size})
+                        offsets.extend(physical_offset + index * 32 for index in range(cluster_size // 32))
+                        total_clusters += 1
+                        total_bytes += cluster_size
+                        fat_entry_offset = fat_offset + current * 2
+                        if fat_entry_offset < fat_offset or fat_entry_offset + 2 > fat_end or fat_entry_offset + 2 > image_size:
+                            termination = "fat_bounds"
+                            errors.append(f"FAT16 subdirectory cluster {start}: FAT entry outside bounds")
+                            break
+                        stream.seek(fat_entry_offset)
+                        raw_next = stream.read(2)
+                        if len(raw_next) != 2:
+                            termination = "truncated_fat"
+                            errors.append(f"FAT16 subdirectory cluster {start}: truncated FAT entry")
+                            break
+                        next_cluster = int.from_bytes(raw_next, "little")
+                        if next_cluster >= 0xFFF8:
+                            termination = "eoc"
+                            break
+                        if (
+                            next_cluster < 2 or next_cluster >= cluster_count + 2
+                            or next_cluster == 0xFFF7 or 0xFFF0 <= next_cluster <= 0xFFF6
+                        ):
+                            termination = "invalid_fat_value"
+                            errors.append(
+                                f"FAT16 subdirectory cluster {start}: invalid next cluster 0x{next_cluster:04X}"
+                            )
+                            break
+                        current = next_cluster
+                    inventory.append({
+                        **directory, "cluster_chain": chain, "termination": termination,
+                    })
+                    if termination != "eoc":
+                        continue
+                    directory_data = b"".join(chunks)
+                    lineage = [int(item["cluster"]) for item in chain]
+                    active_directories(directory_data, offsets, lineage)
+                    pending_lfn: list[tuple[int, bytes]] = []
+                    for index in range(min(len(directory_data) // 32, 2_048)):
+                        entry = directory_data[index * 32:(index + 1) * 32]
+                        if entry[0] == 0:
+                            break
+                        attributes = entry[11]
+                        if attributes == 0x0F:
+                            if len(pending_lfn) < 21:
+                                pending_lfn.append((index, entry))
+                            continue
+                        if entry[0] != 0xE5:
+                            pending_lfn = []
+                            continue
+                        base = entry[1:8].decode("cp437", errors="replace").rstrip(" ")
+                        extension = entry[8:11].decode("cp437", errors="replace").rstrip(" ")
+                        recovered: dict[str, object] = {
+                            "directory_start_cluster": start,
+                            "directory_cluster_lineage": lineage,
+                            "directory_source_entry_offset": directory.get("source_entry_offset"),
+                            "entry_index": index, "offset": offsets[index],
+                            "short_name": f"?{base}" + (f".{extension}" if extension else ""),
+                            "first_character_unknown": True,
+                            "attributes": f"0x{attributes:02X}",
+                            "first_cluster": int.from_bytes(entry[26:28], "little"),
+                            "fat16_cluster_high_reserved": int.from_bytes(entry[20:22], "little"),
+                            "size": int.from_bytes(entry[28:32], "little"),
+                            "raw_hex": entry.hex(),
+                        }
+                        if pending_lfn:
+                            lfn, _ = GenericTriageEngine._fat_deleted_lfn_candidate(
+                                pending_lfn, entry, offsets
+                            )
+                            if lfn is not None:
+                                recovered.update(lfn)
+                        deleted.append(recovered)
+                        pending_lfn = []
+                        if len(deleted) >= 512:
+                            return deleted, inventory, errors
+        except OSError as exc:
+            errors.append(str(exc)[:2_000])
+        if queue:
+            errors.append("FAT16 subdirectory traversal reached the 32-directory/64-cluster/8-MiB bound")
+        return deleted, inventory, errors
 
     def _inspect_fat32_root_directory(
         self,

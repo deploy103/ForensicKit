@@ -1,5 +1,20 @@
 # ForensicKit Work Log
 
+## 2026-09-04 21:59 KST
+
+### Active FAT16 subdirectory traversal and deleted-child recovery
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/extraction.py`, `src/forensickit/profiles/disk.py`, and `tests/test_engine_pipeline.py`.
+- Active fixed-root and descendant directory entries now enter a bounded FAT16 traversal only with a zero reserved high cluster word. Directory chains share 32-directory/64-cluster/8-MiB limits plus visited start/data cluster sets and must terminate exactly at EOC before their entries can drive traversal or recovery.
+- Deleted child entries retain the active parent entry offset, complete containing-directory cluster lineage, exact child entry offset, raw bytes, and any independently validated LFN fields. The existing FAT16 recovery path now consumes both fixed-root and validated subdirectory candidates without relaxing content-chain checks.
+- Extended the Engine fixture with active directory cluster 9 and deleted child cluster 10, recovering `CTF{fat16_subdirectory}` with exact parent/child/data provenance. A directory chain changed to `9 → 9` produces an anomaly finding and no child recovery.
+- Verified `python -m compileall -q src tests scripts` and all 40 Engine regressions.
+- Full direct regression passed (**286 passed, 0 failed**) and `git diff --check` remained clean.
+
+### Next
+
+- Add strict FAT12 fixed-root inventory and single-cluster recovery with correct packed 12-bit cluster handling.
+
 ## 2026-09-04 21:53 KST
 
 ### FAT16 fixed-root inventory and deleted-file recursion
