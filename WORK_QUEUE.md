@@ -1,10 +1,10 @@
 # ForensicKit Work Queue
 
-Last reviewed: 2026-09-04 21:59 KST
+Last reviewed: 2026-09-04 22:07 KST
 
 ## Post-v1.1 backlog
 
-- [ ] Add bounded FAT12 fixed-root deleted-entry inventory and single-cluster recovery without weakening 12-bit cluster classification/packing checks.
+- [ ] Traverse bounded active FAT12 subdirectory chains using exact packed 12-bit entries and retain directory lineage on deleted children.
 
 ## v1.1.0 release gate
 
@@ -21,6 +21,7 @@ Last reviewed: 2026-09-04 21:59 KST
 - [x] Bounded ext2/3 single-indirect directory/file mapping, pointer provenance, alias protection, and recursive Engine E2E.
 - [x] FAT16 fixed-root/LFN inventory and cautious single/multi-cluster deleted-file recursive recovery.
 - [x] Active FAT16 subdirectory exact-chain traversal and deleted-child recursive recovery with directory lineage.
+- [x] FAT12 fixed-root inventory and direct/exact packed-chain deleted-file recursion.
 - [x] Shared bounded ext inode mapper for direct blocks and depth-zero/depth-one extent trees.
 - [x] Depth-one extent-index/leaf/data provenance, repeated-leaf protection, and recursive Engine flag E2E.
 - [x] Bounded active ext subdirectory traversal and recursively recoverable regular-file children with inode/directory/block lineage.

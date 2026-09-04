@@ -1,5 +1,20 @@
 # ForensicKit Work Log
 
+## 2026-09-04 22:07 KST
+
+### FAT12 fixed-root and packed-chain recovery
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/extraction.py`, `src/forensickit/profiles/disk.py`, and `tests/test_engine_pipeline.py`.
+- Generalized fixed-root parsing without conflating formats: the explicit FAT12 label must agree with a sub-4,085 BPB-derived cluster count and enough packed 12-bit FAT capacity; FAT16 retains its independent 4,085..65,524 gate. Exact root offsets, short/LFN metadata, reserved high word, and raw entries remain preserved.
+- Deleted FAT12 files may recover directly from one bounded cluster or through at most 64 unique in-range clusters. Even cluster entries use the low 12 bits, odd entries the high 12 bits, and every packed two-byte offset/raw value/decoded next cluster is retained; the final size-required cluster must point to FAT12 EOC.
+- Added Engine coverage for direct `CTF{fat12_single_cluster}`, noncontiguous packed `6 → 8 → EOC` recovery of `CTF{fat12_packed_chain}`, FAT16-sized geometry rejection, and withholding a chain whose final packed entry is not EOC.
+- Verified `python -m compileall -q src tests scripts` and 126 combined Engine/triage regressions (**126 passed, 0 failed**).
+- Full direct regression passed (**287 passed, 0 failed**) and `git diff --check` remained clean.
+
+### Next
+
+- Traverse exact-EOC active FAT12 subdirectories with packed-entry provenance, shared-cluster protection, and deleted-child directory lineage.
+
 ## 2026-09-04 21:59 KST
 
 ### Active FAT16 subdirectory traversal and deleted-child recovery

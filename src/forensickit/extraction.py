@@ -1376,6 +1376,202 @@ class ExtractionManager:
             ))
         return result
 
+    def extract_fat12_deleted_files(self, artifact: Artifact) -> ExtractionResult:
+        """Recover bounded FAT12 files using exact packed 12-bit chain decoding."""
+        result = ExtractionResult()
+        values = {
+            observation.key: observation.value
+            for observation in self.workspace.database.observations(artifact.id)
+        }
+        entries = values.get("filesystem.fat12.root.deleted_entries")
+        bytes_per_sector = values.get("filesystem.fat.bytes_per_sector")
+        sectors_per_cluster = values.get("filesystem.fat.sectors_per_cluster")
+        reserved_sectors = values.get("filesystem.fat.reserved_sector_count")
+        fat_size = values.get("filesystem.fat.size_sectors")
+        first_data_sector = values.get("filesystem.fat12.root.first_data_sector")
+        cluster_count = values.get("filesystem.fat12.root.cluster_count")
+        if not isinstance(entries, list) or not entries:
+            return result
+        if not all(isinstance(value, int) for value in (
+            bytes_per_sector, sectors_per_cluster, reserved_sectors, fat_size,
+            first_data_sector, cluster_count,
+        )):
+            result.errors.append("skipped FAT12 deleted content: missing validated geometry")
+            return result
+        cluster_size = bytes_per_sector * sectors_per_cluster
+        if (
+            bytes_per_sector not in {512, 1024, 2048, 4096}
+            or sectors_per_cluster <= 0
+            or sectors_per_cluster & (sectors_per_cluster - 1)
+            or not 0 < cluster_size <= 2 * 1024 * 1024
+            or reserved_sectors <= 0 or fat_size <= 0
+            or first_data_sector <= 0 or not 0 < cluster_count < 4_085
+        ):
+            result.errors.append("skipped FAT12 deleted content: invalid validated geometry")
+            return result
+        source = self.workspace.resolve_stored_path(artifact.path)
+        fat_offset = reserved_sectors * bytes_per_sector
+        fat_end = fat_offset + fat_size * bytes_per_sector
+        target_root = self.workspace.path("extracted", artifact.id, "builtin_fat12_deleted")
+        evidence: list[str] = []
+        try:
+            source_stream = source.open("rb")
+        except OSError as exc:
+            result.errors.append(f"FAT12 deleted content source open failed: {exc}")
+            return result
+        with source_stream:
+            for entry in entries[:256]:
+                if not isinstance(entry, dict):
+                    continue
+                size = entry.get("size")
+                first_cluster = entry.get("first_cluster")
+                attributes_text = entry.get("attributes")
+                high_reserved = entry.get("fat12_cluster_high_reserved")
+                try:
+                    attributes = int(attributes_text, 16) if isinstance(attributes_text, str) else -1
+                except ValueError:
+                    attributes = -1
+                if (
+                    not isinstance(size, int) or not 0 < size <= 8 * 1024 * 1024
+                    or size > self.limits.max_single_artifact_size
+                    or not isinstance(first_cluster, int) or not 2 <= first_cluster < cluster_count + 2
+                    or high_reserved != 0 or attributes < 0 or attributes & 0x18
+                ):
+                    continue
+                required_clusters = (size + cluster_size - 1) // cluster_size
+                if not 1 <= required_clusters <= 64:
+                    continue
+                chain: list[dict[str, int | str]] = []
+                visited: set[int] = set()
+                current_cluster = first_cluster
+                chain_validation = "single_cluster_direct"
+                chain_valid = True
+                for cluster_index in range(required_clusters):
+                    if (
+                        current_cluster in visited
+                        or not 2 <= current_cluster < cluster_count + 2
+                    ):
+                        chain_valid = False
+                        break
+                    visited.add(current_cluster)
+                    physical_offset = (
+                        first_data_sector + (current_cluster - 2) * sectors_per_cluster
+                    ) * bytes_per_sector
+                    if physical_offset < 0 or physical_offset + cluster_size > artifact.size:
+                        chain_valid = False
+                        break
+                    segment: dict[str, int | str] = {
+                        "cluster": current_cluster, "physical_offset": physical_offset,
+                        "length": cluster_size,
+                    }
+                    chain.append(segment)
+                    if required_clusters == 1:
+                        break
+                    fat_entry_offset = fat_offset + current_cluster + current_cluster // 2
+                    if (
+                        fat_entry_offset < fat_offset or fat_entry_offset + 2 > fat_end
+                        or fat_entry_offset + 2 > artifact.size
+                    ):
+                        chain_valid = False
+                        break
+                    source_stream.seek(fat_entry_offset)
+                    raw_next = source_stream.read(2)
+                    if len(raw_next) != 2:
+                        chain_valid = False
+                        break
+                    packed = int.from_bytes(raw_next, "little")
+                    next_cluster = (
+                        (packed >> 4) & 0x0FFF if current_cluster & 1
+                        else packed & 0x0FFF
+                    )
+                    segment.update({
+                        "fat_entry_offset": fat_entry_offset,
+                        "fat_entry_raw": raw_next.hex(),
+                        "next_cluster": next_cluster,
+                    })
+                    if cluster_index == required_clusters - 1:
+                        if next_cluster < 0xFF8:
+                            chain_valid = False
+                        else:
+                            chain_validation = "complete_fat12_chain_eoc"
+                        break
+                    if (
+                        next_cluster < 2 or next_cluster >= cluster_count + 2
+                        or next_cluster == 0xFF7 or 0xFF0 <= next_cluster <= 0xFF6
+                        or next_cluster >= 0xFF8
+                    ):
+                        chain_valid = False
+                        break
+                    current_cluster = next_cluster
+                if not chain_valid or len(chain) != required_clusters:
+                    continue
+                reason = self.can_register(artifact, size)
+                if reason:
+                    result.errors.append(
+                        f"skipped FAT12 deleted entry {entry.get('entry_index')}: {reason}"
+                    )
+                    continue
+                logical_name = next((
+                    value for value in (
+                        entry.get("long_name"), entry.get("reconstructed_short_name"),
+                        entry.get("short_name"),
+                    ) if isinstance(value, str) and value
+                ), f"deleted_cluster_{first_cluster}")[:1_024]
+                entry_index = entry.get("entry_index")
+                output = target_root / (
+                    f"entry_{entry_index if isinstance(entry_index, int) else 0:04d}_"
+                    f"cluster_{first_cluster:04d}_{safe_name(logical_name)}"
+                )
+                output.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    with output.open("xb") as writer:
+                        remaining = size
+                        for segment in chain:
+                            segment_length = int(segment["length"])
+                            take = min(remaining, segment_length)
+                            source_stream.seek(int(segment["physical_offset"]))
+                            payload = source_stream.read(take)
+                            if len(payload) != take:
+                                raise RuntimeError("mapped FAT12 cluster bytes are truncated")
+                            writer.write(payload)
+                            remaining -= take
+                        if remaining:
+                            raise RuntimeError("validated FAT12 cluster chain did not cover declared size")
+                except (OSError, RuntimeError) as exc:
+                    output.unlink(missing_ok=True)
+                    result.errors.append(
+                        f"failed FAT12 deleted entry {entry_index} recovery: {exc}"
+                    )
+                    continue
+                child = self.register_file(output, artifact, logical_name)
+                if child is None:
+                    result.errors.append(
+                        f"skipped FAT12 deleted entry {entry_index}: duplicate or extraction limit"
+                    )
+                    continue
+                result.artifacts.append(child)
+                result.extracted_bytes += child.size
+                evidence.append(
+                    f"child:{child.id};entry_index:{entry_index};entry_offset:{entry.get('offset')};"
+                    f"name:{logical_name};first_cluster:{first_cluster};"
+                    f"physical_offset:{chain[0]['physical_offset']};cluster_chain:{chain};"
+                    f"size:{size};attributes:{attributes_text};lfn_slot_offsets:{entry.get('lfn_slot_offsets')};"
+                    f"raw_entry:{entry.get('raw_hex')};chain_validation:{chain_validation};"
+                    "allocation_state:unknown_deleted_cluster_may_be_reused"
+                )
+        if result.artifacts:
+            result.findings.append(Finding(
+                artifact_id=artifact.id,
+                title=f"Recovered {len(result.artifacts)} bounded deleted FAT12 file(s)",
+                category="fat12_deleted_content_recovery", severity="info", confidence=0.68,
+                explanation=(
+                    "A strict FAT12 fixed-root candidate declared bounded nonzero content. Single-cluster candidates map directly; larger candidates require an exact, non-looping sequence of correctly packed 12-bit FAT entries and EOC after the final size-required cluster. "
+                    "The recursively registered bytes retain every packed-entry offset/raw value and a deleted-cluster reuse caveat."
+                ),
+                source="builtin_fat12_deleted_extractor", supporting_evidence=evidence[:256],
+            ))
+        return result
+
     def extract_fat16_deleted_files(self, artifact: Artifact) -> ExtractionResult:
         """Recover bounded FAT16 deleted files directly or through an exact FAT chain."""
         result = ExtractionResult()
@@ -2045,6 +2241,9 @@ class ExtractionManager:
         fat16_result = self.extract_fat16_deleted_files(artifact)
         if fat16_result.artifacts or fat16_result.errors:
             return fat16_result
+        fat12_result = self.extract_fat12_deleted_files(artifact)
+        if fat12_result.artifacts or fat12_result.errors:
+            return fat12_result
         exfat_result = self.extract_exfat_deleted_contiguous(artifact)
         if exfat_result.artifacts or exfat_result.errors:
             return exfat_result

@@ -403,6 +403,25 @@ class DiskProfile(BaseProfile):
                 evidence=[str(item)[:2_000] for item in fat16_subdirectory_errors[:128]],
                 severity="low",
             ))
+        fat12_deleted = next(
+            (
+                value for value in context.values("filesystem.fat12.root.deleted_entries")
+                if isinstance(value, list)
+            ),
+            [],
+        )
+        if fat12_deleted:
+            result.findings.append(self.finding(
+                context,
+                title=f"{len(fat12_deleted)} deleted FAT12 fixed-root entry candidate(s) recovered",
+                category="fat12_deleted_directory_entry", confidence=0.89,
+                explanation=(
+                    "The BPB-derived cluster count and packed-FAT capacity classify the volume as FAT12 before its bounded fixed root is read. "
+                    "Candidates retain exact root offsets, low cluster, reserved high word, size, timestamps, raw bytes, and validated LFN provenance where available."
+                ),
+                evidence=[str(item)[:2_000] for item in fat12_deleted[:128]],
+                severity="info",
+            ))
         qcow_header = next((value for value in context.values("disk.qcow2.header") if isinstance(value, dict)), {})
         vhd_footer = next((value for value in context.values("disk.vhd.footer") if isinstance(value, dict)), {})
         virtual_disk = context.format_is("vhd", "qcow2") or bool(qcow_header.get("valid")) or bool(vhd_footer.get("signature"))
