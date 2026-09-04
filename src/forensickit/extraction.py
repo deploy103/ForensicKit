@@ -1564,6 +1564,9 @@ class ExtractionManager:
                     f"directory_start_cluster:{entry.get('directory_start_cluster')};"
                     f"directory_cluster_lineage:{entry.get('directory_cluster_lineage')};"
                     f"directory_source_entry_offset:{entry.get('directory_source_entry_offset')};"
+                    f"directory_short_name:{entry.get('directory_short_name')};"
+                    f"directory_long_name:{entry.get('directory_long_name')};"
+                    f"directory_lfn_slot_offsets:{entry.get('directory_lfn_slot_offsets')};"
                     f"raw_entry:{entry.get('raw_hex')};chain_validation:{chain_validation};"
                     "allocation_state:unknown_deleted_cluster_may_be_reused"
                 )
@@ -1758,6 +1761,9 @@ class ExtractionManager:
                     f"directory_start_cluster:{entry.get('directory_start_cluster')};"
                     f"directory_cluster_lineage:{entry.get('directory_cluster_lineage')};"
                     f"directory_source_entry_offset:{entry.get('directory_source_entry_offset')};"
+                    f"directory_short_name:{entry.get('directory_short_name')};"
+                    f"directory_long_name:{entry.get('directory_long_name')};"
+                    f"directory_lfn_slot_offsets:{entry.get('directory_lfn_slot_offsets')};"
                     f"raw_entry:{entry.get('raw_hex')};chain_validation:{chain_validation};"
                     "allocation_state:unknown_deleted_cluster_may_be_reused"
                 )
@@ -1947,6 +1953,9 @@ class ExtractionManager:
                     f"directory_start_cluster:{entry.get('directory_start_cluster')};"
                     f"directory_cluster_lineage:{entry.get('directory_cluster_lineage')};"
                     f"directory_source_entry_offset:{entry.get('directory_source_entry_offset')};"
+                    f"directory_short_name:{entry.get('directory_short_name')};"
+                    f"directory_long_name:{entry.get('directory_long_name')};"
+                    f"directory_lfn_slot_offsets:{entry.get('directory_lfn_slot_offsets')};"
                     f"chain_validation:{chain_validation};"
                     "allocation_state:unknown_deleted_cluster_may_be_reused"
                 )
@@ -2414,6 +2423,9 @@ class ExtractionManager:
                     f"directory_start_cluster:{entry.get('directory_start_cluster')};"
                     f"directory_cluster_lineage:{entry.get('directory_cluster_lineage')};"
                     f"directory_source_entry_offset:{entry.get('directory_source_entry_offset')};"
+                    f"directory_short_name:{entry.get('directory_short_name')};"
+                    f"directory_long_name:{entry.get('directory_long_name')};"
+                    f"directory_lfn_slot_offsets:{entry.get('directory_lfn_slot_offsets')};"
                     "chain_validation:exact_size_required_chain_eoc;allocation_state:active_directory_reference"
                 )
         if result.artifacts:

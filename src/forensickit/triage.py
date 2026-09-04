@@ -4202,30 +4202,48 @@ class GenericTriageEngine:
         total_bytes = 0
 
         def active_directories(data: bytes, offsets: list[int], parent_lineage: list[int]) -> None:
+            pending_directory_lfn: list[tuple[int, bytes]] = []
             for index in range(min(len(data) // 32, 2_048)):
                 entry = data[index * 32:(index + 1) * 32]
                 if entry[0] == 0:
                     break
                 attributes = entry[11]
+                if attributes == 0x0F:
+                    if len(pending_directory_lfn) < 21:
+                        pending_directory_lfn.append((index, entry))
+                    continue
                 if (
-                    entry[0] == 0xE5 or attributes == 0x0F or attributes & 0x08
+                    entry[0] == 0xE5 or attributes & 0x08
                     or int.from_bytes(entry[20:22], "little") != 0
                 ):
+                    pending_directory_lfn = []
                     continue
                 start = int.from_bytes(entry[26:28], "little")
                 if 2 <= start < cluster_count + 2:
                     active_cluster_starts.add(start)
                 if not attributes & 0x10:
+                    pending_directory_lfn = []
                     continue
-                name = entry[:8].decode("cp437", errors="replace").rstrip(" ")
-                if name in {".", ".."}:
+                base = entry[:8].decode("cp437", errors="replace").rstrip(" ")
+                extension = entry[8:11].decode("cp437", errors="replace").rstrip(" ")
+                short_name = base + (f".{extension}" if extension else "")
+                if base in {".", ".."}:
+                    pending_directory_lfn = []
                     continue
                 if 2 <= start < cluster_count + 2 and len(queue) < 64:
-                    queue.append({
-                        "name": name, "start_cluster": start,
+                    directory_record: dict[str, object] = {
+                        "name": short_name, "start_cluster": start,
                         "source_entry_offset": offsets[index],
                         "parent_cluster_lineage": parent_lineage,
-                    })
+                    }
+                    if pending_directory_lfn:
+                        directory_lfn, _ = GenericTriageEngine._fat_active_lfn_candidate(
+                            pending_directory_lfn, entry, offsets,
+                        )
+                        if directory_lfn is not None:
+                            directory_record.update(directory_lfn)
+                    queue.append(directory_record)
+                pending_directory_lfn = []
 
         active_directories(root_data, root_entry_offsets, [])
         try:
@@ -4397,6 +4415,9 @@ class GenericTriageEngine:
                                         "directory_start_cluster": start,
                                         "directory_cluster_lineage": lineage,
                                         "directory_source_entry_offset": directory.get("source_entry_offset"),
+                                        "directory_short_name": directory.get("name"),
+                                        "directory_long_name": directory.get("long_name"),
+                                        "directory_lfn_slot_offsets": directory.get("lfn_slot_offsets"),
                                         "entry_index": index, "offset": offsets[index],
                                         "short_name": base + (f".{extension}" if extension else ""),
                                         "attributes": f"0x{attributes:02X}",
@@ -4431,6 +4452,9 @@ class GenericTriageEngine:
                             "directory_start_cluster": start,
                             "directory_cluster_lineage": lineage,
                             "directory_source_entry_offset": directory.get("source_entry_offset"),
+                            "directory_short_name": directory.get("name"),
+                            "directory_long_name": directory.get("long_name"),
+                            "directory_lfn_slot_offsets": directory.get("lfn_slot_offsets"),
                             "entry_index": index, "offset": offsets[index],
                             "short_name": f"?{base}" + (f".{extension}" if extension else ""),
                             "first_character_unknown": True,
@@ -5159,27 +5183,46 @@ class GenericTriageEngine:
         total_clusters = 0
 
         def active_directories(data: bytes, offsets: list[int], parent_lineage: list[int]) -> None:
+            pending_directory_lfn: list[tuple[int, bytes]] = []
             for index in range(min(len(data) // 32, 2_048)):
                 entry = data[index * 32:(index + 1) * 32]
                 if entry[0] == 0:
                     break
-                if entry[0] == 0xE5 or entry[11] == 0x0F or entry[11] & 0x08:
+                attributes = entry[11]
+                if attributes == 0x0F:
+                    if len(pending_directory_lfn) < 21:
+                        pending_directory_lfn.append((index, entry))
+                    continue
+                if entry[0] == 0xE5 or attributes & 0x08:
+                    pending_directory_lfn = []
                     continue
                 raw_start = int.from_bytes(entry[20:22], "little") << 16 | int.from_bytes(entry[26:28], "little")
                 start = raw_start & 0x0FFFFFFF
                 if raw_start >> 28 == 0 and start >= 2:
                     active_cluster_starts.add(start)
-                if not entry[11] & 0x10:
+                if not attributes & 0x10:
+                    pending_directory_lfn = []
                     continue
-                name = entry[:8].decode("cp437", errors="replace").rstrip(" ")
-                if name in {".", ".."}:
+                base = entry[:8].decode("cp437", errors="replace").rstrip(" ")
+                extension = entry[8:11].decode("cp437", errors="replace").rstrip(" ")
+                short_name = base + (f".{extension}" if extension else "")
+                if base in {".", ".."}:
+                    pending_directory_lfn = []
                     continue
                 if raw_start >> 28 == 0 and start >= 2 and len(queue) < 64:
-                    queue.append({
-                        "name": name, "start_cluster": start,
+                    directory_record: dict[str, object] = {
+                        "name": short_name, "start_cluster": start,
                         "source_entry_offset": offsets[index],
                         "parent_cluster_lineage": parent_lineage,
-                    })
+                    }
+                    if pending_directory_lfn:
+                        directory_lfn, _ = GenericTriageEngine._fat_active_lfn_candidate(
+                            pending_directory_lfn, entry, offsets,
+                        )
+                        if directory_lfn is not None:
+                            directory_record.update(directory_lfn)
+                    queue.append(directory_record)
+                pending_directory_lfn = []
 
         active_directories(root_data, root_entry_offsets, [])
         try:
@@ -5325,6 +5368,9 @@ class GenericTriageEngine:
                                         "directory_start_cluster": start,
                                         "directory_cluster_lineage": lineage,
                                         "directory_source_entry_offset": directory.get("source_entry_offset"),
+                                        "directory_short_name": directory.get("name"),
+                                        "directory_long_name": directory.get("long_name"),
+                                        "directory_lfn_slot_offsets": directory.get("lfn_slot_offsets"),
                                         "entry_index": index, "offset": offsets[index],
                                         "short_name": base + (f".{extension}" if extension else ""),
                                         "attributes": f"0x{attributes:02X}",
@@ -5361,6 +5407,9 @@ class GenericTriageEngine:
                             "directory_start_cluster": start,
                             "directory_cluster_lineage": lineage,
                             "directory_source_entry_offset": directory.get("source_entry_offset"),
+                            "directory_short_name": directory.get("name"),
+                            "directory_long_name": directory.get("long_name"),
+                            "directory_lfn_slot_offsets": directory.get("lfn_slot_offsets"),
                             "entry_index": index,
                             "offset": offsets[index],
                             "short_name": f"?{base}" + (f".{extension}" if extension else ""),

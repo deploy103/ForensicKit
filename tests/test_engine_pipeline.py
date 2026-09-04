@@ -1709,8 +1709,26 @@ def test_fat12_fixed_root_recovers_single_and_exact_packed_multicluster_chain(tm
 
     set_fat12(6, 8)
     set_fat12(8, 0xFFF)
-    active_directory_offset = multi + 32
-    image[active_directory_offset:active_directory_offset + 11] = b"ACTIVE     "
+    directory_short_name = b"ACTIVE     "
+    directory_long_name = "Evidence Dir"
+    directory_checksum = GenericTriageEngine._fat_short_name_checksum(directory_short_name)
+    directory_units = [
+        int.from_bytes(directory_long_name.encode("utf-16le")[offset:offset + 2], "little")
+        for offset in range(0, len(directory_long_name.encode("utf-16le")), 2)
+    ]
+    directory_units.extend([0, *([0xFFFF] * (12 - len(directory_units)))])
+    directory_slot = bytearray(32)
+    directory_slot[0] = 0x41
+    directory_slot[11] = 0x0F
+    directory_slot[13] = directory_checksum
+    encoded_directory = b"".join(value.to_bytes(2, "little") for value in directory_units)
+    directory_slot[1:11] = encoded_directory[:10]
+    directory_slot[14:26] = encoded_directory[10:22]
+    directory_slot[28:32] = encoded_directory[22:26]
+    directory_lfn_offset = multi + 32
+    image[directory_lfn_offset:directory_lfn_offset + 32] = directory_slot
+    active_directory_offset = multi + 64
+    image[active_directory_offset:active_directory_offset + 11] = directory_short_name
     image[active_directory_offset + 11] = 0x10
     image[active_directory_offset + 26:active_directory_offset + 28] = (7).to_bytes(2, "little")
     set_fat12(7, 0xFFF)
@@ -1751,6 +1769,9 @@ def test_fat12_fixed_root_recovers_single_and_exact_packed_multicluster_chain(tm
     assert sub_deleted[0]["directory_start_cluster"] == 7
     assert sub_deleted[0]["directory_cluster_lineage"] == [7]
     assert sub_deleted[0]["directory_source_entry_offset"] == active_directory_offset
+    assert sub_deleted[0]["directory_short_name"] == "ACTIVE"
+    assert sub_deleted[0]["directory_long_name"] == directory_long_name
+    assert sub_deleted[0]["directory_lfn_slot_offsets"] == [directory_lfn_offset]
     assert sub_deleted[0]["offset"] == subdirectory_offset
     child = next(item for item in result.artifacts if item.logical_name == "?LAG.TXT")
     multi_child = next(item for item in result.artifacts if item.logical_name == "?ULTI.BIN")
@@ -1785,6 +1806,9 @@ def test_fat12_fixed_root_recovers_single_and_exact_packed_multicluster_chain(tm
     assert "directory_start_cluster:7" in sub_evidence
     assert "directory_cluster_lineage:[7]" in sub_evidence
     assert f"directory_source_entry_offset:{active_directory_offset}" in sub_evidence
+    assert "directory_short_name:ACTIVE" in sub_evidence
+    assert f"directory_long_name:{directory_long_name}" in sub_evidence
+    assert f"directory_lfn_slot_offsets:[{directory_lfn_offset}]" in sub_evidence
 
     fat16_sized = bytearray(image)
     fat16_sized[19:21] = (5000).to_bytes(2, "little")
