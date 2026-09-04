@@ -331,6 +331,40 @@ class DiskProfile(BaseProfile):
                 evidence=[str(item)[:2_000] for item in subdirectory_deleted[:128]],
                 severity="info",
             ))
+        fat16_deleted = next(
+            (
+                value for value in context.values("filesystem.fat16.root.deleted_entries")
+                if isinstance(value, list)
+            ),
+            [],
+        )
+        if fat16_deleted:
+            result.findings.append(self.finding(
+                context,
+                title=f"{len(fat16_deleted)} deleted FAT16 fixed-root entry candidate(s) recovered",
+                category="fat16_deleted_directory_entry", confidence=0.9,
+                explanation=(
+                    "The BPB-defined fixed root directory was read only after sector, FAT, root-entry, declared-volume, image, and FAT16 cluster-count geometry validated. "
+                    "Each deleted short entry retains its exact root offset, low cluster, reserved high word, size, timestamps, and raw bytes; candidates are not ownership verdicts."
+                ),
+                evidence=[str(item)[:2_000] for item in fat16_deleted[:128]],
+                severity="info",
+            ))
+            linked_fat16_lfn = [
+                item for item in fat16_deleted
+                if isinstance(item, dict) and isinstance(item.get("long_name"), str)
+            ]
+            if linked_fat16_lfn:
+                result.findings.append(self.finding(
+                    context,
+                    title=f"{len(linked_fat16_lfn)} deleted FAT16 long-name chain(s) validated",
+                    category="fat16_deleted_lfn_entry", confidence=0.93,
+                    explanation=(
+                        "Contiguous fixed-root LFN slots were joined to a deleted short entry only after checksum, UTF-16, terminal padding, physical order, and unique missing-first-byte reconstruction validated."
+                    ),
+                    evidence=[str(item)[:2_000] for item in linked_fat16_lfn[:128]],
+                    severity="info",
+                ))
         qcow_header = next((value for value in context.values("disk.qcow2.header") if isinstance(value, dict)), {})
         vhd_footer = next((value for value in context.values("disk.vhd.footer") if isinstance(value, dict)), {})
         virtual_disk = context.format_is("vhd", "qcow2") or bool(qcow_header.get("valid")) or bool(vhd_footer.get("signature"))

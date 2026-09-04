@@ -1,5 +1,19 @@
 # ForensicKit Work Log
 
+## 2026-09-04 21:53 KST
+
+### FAT16 fixed-root inventory and deleted-file recursion
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/extraction.py`, `src/forensickit/profiles/disk.py`, and `tests/test_engine_pipeline.py`.
+- FAT16 activation now requires its BPB label plus valid sector/cluster/FAT/fixed-root geometry, a cluster count in the FAT16 range, and enough 16-bit FAT entries for the declared clusters. The bounded fixed root retains exact entry offsets, timestamps, low cluster, reserved high word, raw bytes, and validated deleted-LFN provenance.
+- Regular deleted entries with a zero FAT16 reserved high word may recurse from one image-bounded cluster. Multi-cluster files require at most 64 unique, in-range 16-bit FAT pointers and EOC immediately after the size-required final cluster; current allocation is always labeled as a reuse-prone recovery candidate rather than ownership proof.
+- Added Engine coverage for deleted LFN recovery to `Very Long Flag.txt`, direct `CTF{fat16_fixed_root}`, noncontiguous `6 → 8 → EOC` recovery of `CTF{fat16_multicluster}`, reserved-high-word exclusion, FAT12-sized geometry rejection, and withholding a chain that does not terminate at EOC.
+- Verified `python -m compileall -q src tests scripts`, the 40 Engine regressions, and the full direct suite (**286 passed, 0 failed**); `git diff --check` remained clean.
+
+### Next
+
+- Traverse bounded active FAT16 subdirectories and retain directory source/cluster lineage on deleted children before invoking the same recovery checks.
+
 ## 2026-09-04 21:41 KST
 
 ### ext2/3 single-indirect directory and file mapping

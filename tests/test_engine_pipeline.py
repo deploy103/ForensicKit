@@ -14,8 +14,9 @@ from zipfile import ZipFile
 from forensickit.engine import AnalysisEngine
 from forensickit.config import ForensicKitConfig
 from forensickit.evidence import EvidenceManager
-from forensickit.models import AnalysisMode, AnalysisResult, Observation
+from forensickit.models import AnalysisMode, AnalysisResult, Artifact, Observation
 from forensickit.tools import ToolDefinition, ToolRegistry
+from forensickit.triage import GenericTriageEngine
 from forensickit.workspace import CaseWorkspace
 
 
@@ -1464,6 +1465,142 @@ def test_deleted_fat32_single_and_complete_multi_cluster_files_become_recursive_
     report = Path(result.case.workspace, "reports", "report.json").read_text(encoding="utf-8")
     assert "builtin_fat32_deleted_extractor" in report
     assert "CTF{fat32_deleted_child}" in report
+
+
+def test_fat16_fixed_root_deleted_lfn_recovers_one_cluster_with_lineage(tmp_path: Path) -> None:
+    sector_size = 512
+    image = bytearray(27 * sector_size)
+    image[11:13] = sector_size.to_bytes(2, "little")
+    image[13] = 1
+    image[14:16] = (1).to_bytes(2, "little")
+    image[16] = 1
+    image[17:19] = (16).to_bytes(2, "little")
+    image[19:21] = (4103).to_bytes(2, "little")
+    image[21] = 0xF8
+    image[22:24] = (16).to_bytes(2, "little")
+    image[54:62] = b"FAT16   "
+    image[510:512] = b"\x55\xaa"
+    root_offset = 17 * sector_size
+    first_data_sector = 18
+
+    short_name = b"VERYL~1 TXT"
+    checksum = GenericTriageEngine._fat_short_name_checksum(short_name)
+    long_name = "Very Long Flag.txt"
+    encoded_name = long_name.encode("utf-16le")
+    units = [
+        int.from_bytes(encoded_name[offset:offset + 2], "little")
+        for offset in range(0, len(encoded_name), 2)
+    ]
+    units.extend([0, *([0xFFFF] * (26 - len(units) - 1))])
+    for physical_index, chunk_index in enumerate((1, 0)):
+        slot = bytearray(32)
+        slot[0] = 0xE5
+        slot[11] = 0x0F
+        slot[13] = checksum
+        encoded = b"".join(
+            value.to_bytes(2, "little")
+            for value in units[chunk_index * 13:(chunk_index + 1) * 13]
+        )
+        slot[1:11] = encoded[:10]
+        slot[14:26] = encoded[10:22]
+        slot[28:32] = encoded[22:26]
+        image[root_offset + physical_index * 32:root_offset + (physical_index + 1) * 32] = slot
+    short_offset = root_offset + 64
+    image[short_offset:short_offset + 11] = b"\xe5ERYL~1 TXT"
+    image[short_offset + 11] = 0x20
+    image[short_offset + 26:short_offset + 28] = (5).to_bytes(2, "little")
+    payload = b"CTF{fat16_fixed_root}"
+    image[short_offset + 28:short_offset + 32] = len(payload).to_bytes(4, "little")
+    invalid_high = short_offset + 32
+    image[invalid_high:invalid_high + 11] = b"\xe5LIAS   BIN"
+    image[invalid_high + 11] = 0x20
+    image[invalid_high + 20:invalid_high + 22] = (1).to_bytes(2, "little")
+    image[invalid_high + 26:invalid_high + 28] = (7).to_bytes(2, "little")
+    image[invalid_high + 28:invalid_high + 32] = (8).to_bytes(4, "little")
+    multi_offset = invalid_high + 32
+    image[multi_offset:multi_offset + 11] = b"\xe5ULTI   BIN"
+    image[multi_offset + 11] = 0x20
+    image[multi_offset + 26:multi_offset + 28] = (6).to_bytes(2, "little")
+    multi_payload = b"M" * sector_size + b"CTF{fat16_multicluster}"
+    image[multi_offset + 28:multi_offset + 32] = len(multi_payload).to_bytes(4, "little")
+    image[sector_size + 6 * 2:sector_size + 6 * 2 + 2] = (8).to_bytes(2, "little")
+    image[sector_size + 8 * 2:sector_size + 8 * 2 + 2] = (0xFFFF).to_bytes(2, "little")
+    content_offset = (first_data_sector + 3) * sector_size
+    image[content_offset:content_offset + len(payload)] = payload
+    multi_first_offset = (first_data_sector + 4) * sector_size
+    multi_second_offset = (first_data_sector + 6) * sector_size
+    image[multi_first_offset:multi_first_offset + sector_size] = multi_payload[:sector_size]
+    image[multi_second_offset:multi_second_offset + len(multi_payload) - sector_size] = multi_payload[sector_size:]
+    evidence = tmp_path / "fat16-deleted.raw"
+    evidence.write_bytes(image)
+
+    result = AnalysisEngine().analyze(
+        evidence, tmp_path / "fat16-cases", mode=AnalysisMode.AUTO, execute=False,
+    )
+
+    values = {
+        observation.key: observation.value
+        for observation in result.observations
+        if observation.artifact_id == result.root_artifact.id
+    }
+    assert values["filesystem.fat.variant"] == "fat16"
+    assert values["filesystem.fat16.root.available"] is True
+    assert values["filesystem.fat16.root.offset"] == root_offset
+    assert values["filesystem.fat16.root.first_data_sector"] == first_data_sector
+    assert values["filesystem.fat16.root.fat_entry_capacity"] == 4096
+    deleted = values["filesystem.fat16.root.deleted_entries"]
+    assert deleted[0]["long_name"] == long_name
+    assert deleted[0]["lfn_slot_offsets"] == [root_offset, root_offset + 32]
+    assert deleted[0]["first_cluster"] == 5
+    assert deleted[0]["fat16_cluster_high_reserved"] == 0
+    assert deleted[1]["fat16_cluster_high_reserved"] == 1
+    child = next(item for item in result.artifacts if item.logical_name == long_name)
+    multi_child = next(item for item in result.artifacts if item.logical_name == "?ULTI.BIN")
+    assert not any(item.logical_name == "?LIAS.BIN" for item in result.artifacts)
+    assert any(
+        item.value == "CTF{fat16_fixed_root}" and item.artifact_id == child.id
+        for item in result.flags
+    )
+    assert any(
+        item.value == "CTF{fat16_multicluster}" and item.artifact_id == multi_child.id
+        for item in result.flags
+    )
+    assert any(item.category == "fat16_deleted_directory_entry" for item in result.findings)
+    assert any(item.category == "fat16_deleted_lfn_entry" for item in result.findings)
+    recovery = next(item for item in result.findings if item.category == "fat16_deleted_content_recovery")
+    assert "builtin_fat16_deleted_extractor" in recovery.source
+    assert f"entry_offset:{short_offset}" in recovery.supporting_evidence[0]
+    assert f"physical_offset:{content_offset}" in recovery.supporting_evidence[0]
+    assert "chain_validation:single_cluster_direct" in recovery.supporting_evidence[0]
+    multi_evidence = next(item for item in recovery.supporting_evidence if multi_child.id in item)
+    assert f"physical_offset:{multi_first_offset}" in multi_evidence
+    assert f"'physical_offset': {multi_second_offset}" in multi_evidence
+    assert "chain_validation:complete_fat16_chain_eoc" in multi_evidence
+
+    fat12_sized = bytearray(image)
+    fat12_sized[19:21] = (100).to_bytes(2, "little")
+    invalid = tmp_path / "fat16-label-fat12-geometry.raw"
+    invalid.write_bytes(fat12_sized)
+    invalid_artifact = Artifact(
+        id="fat16-invalid", case_id="case", path=str(invalid), logical_name=invalid.name,
+        sha256="0" * 64, size=len(fat12_sized),
+    )
+    invalid_values = {
+        item.key: item.value for item in GenericTriageEngine().analyze(invalid_artifact, invalid)
+    }
+    assert invalid_values["filesystem.fat16.root.available"] is False
+    assert invalid_values["filesystem.fat16.root.error"] == "invalid FAT16 fixed-root geometry"
+
+    non_eoc = bytearray(image)
+    non_eoc[sector_size + 8 * 2:sector_size + 8 * 2 + 2] = (9).to_bytes(2, "little")
+    incomplete = tmp_path / "fat16-non-eoc-chain.raw"
+    incomplete.write_bytes(non_eoc)
+    incomplete_result = AnalysisEngine().analyze(
+        incomplete, tmp_path / "fat16-incomplete-cases",
+        mode=AnalysisMode.AUTO, execute=False,
+    )
+    assert any(item.logical_name == long_name for item in incomplete_result.artifacts)
+    assert not any(item.logical_name == "?ULTI.BIN" for item in incomplete_result.artifacts)
 
 
 def test_recycle_bin_exact_supplied_content_pair_is_correlated(tmp_path: Path) -> None:
