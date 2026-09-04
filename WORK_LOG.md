@@ -1,5 +1,18 @@
 # ForensicKit Work Log
 
+## 2026-09-04 23:25 KST
+
+### Noncontiguous FAT32 subdirectory LFN provenance
+
+- Changed `src/forensickit/triage.py`, `tests/test_triage.py`, and `tests/test_engine_pipeline.py`.
+- FAT32 active-subdirectory chain segments now retain the exact ExtFlags-selected FAT entry offset, raw four bytes, and masked next cluster in addition to each physical directory-data range. Intact active LFNs inside those directories feed named-file recovery; invalid chains retain slot bytes/offsets, short-entry offset, directory source entry, and complete directory cluster lineage while safely falling back to the intact short name.
+- Added a mirroring-disabled E2E where root directory entry cluster 5 follows the active FAT's noncontiguous `5 -> 9 -> EOC` chain, cluster 9 supplies `Nested.txt`, and file cluster 7 supplies a recursively attributed flag. Directory FAT offsets, `[5, 9]` lineage, LFN slot/short-entry offsets, file FAT offset, and data offset are asserted. A bad LFN checksum produces `NESTED~1.TXT` plus exact unlinked-LFN evidence rather than trusting the long name.
+- Verified the new E2E directly, the combined Engine/triage suite (134 passed), and the full direct synthetic suite: 295 passed, 0 failed. Compileall and `git diff --check` also passed.
+
+### Next
+
+- Apply the existing deleted-LFN reconstruction safeguards to deleted FAT32 entries inside validated active subdirectories, carrying their containing directory source and cluster lineage into recursive recovery findings.
+
 ## 2026-09-04 23:14 KST
 
 ### ExtFlags-aware active FAT32 file recursion

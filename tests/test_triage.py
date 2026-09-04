@@ -1951,7 +1951,11 @@ def test_fat32_active_subdirectory_is_bounded_but_deleted_directory_is_not_trave
     assert values["filesystem.fat.subdirectory_inventory"] == [{
         "name": "ACTIVE", "start_cluster": 5, "source_entry_offset": 1024,
         "parent_cluster_lineage": [],
-        "cluster_chain": [{"cluster": 5, "offset": 2560, "length": 512}],
+        "cluster_chain": [{
+            "cluster": 5, "offset": 2560, "length": 512,
+            "fat_entry_offset": 532, "fat_entry_raw": "ffffff0f",
+            "next_cluster": 0x0FFFFFFF,
+        }],
         "termination": "eoc",
     }]
     assert values["filesystem.fat.subdirectory_deleted_entries"] == [{

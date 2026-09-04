@@ -1,10 +1,10 @@
 # ForensicKit Work Queue
 
-Last reviewed: 2026-09-04 23:14 KST
+Last reviewed: 2026-09-04 23:25 KST
 
 ## Post-v1.1 backlog
 
-- [ ] Validate active FAT32 LFN file recovery inside a noncontiguous active subdirectory and preserve both directory and selected-FAT chain provenance end to end.
+- [ ] Link deleted FAT32 subdirectory LFN slots to deleted short entries using the same checksum/UTF-16/order safeguards and retain containing-directory provenance.
 
 ## v1.1.0 release gate
 
@@ -31,6 +31,7 @@ Last reviewed: 2026-09-04 23:14 KST
 - [x] Anonymous recursive artifact recovery for complete image-bounded FAT lost chains with final-cluster slack and ownership caveats.
 - [x] Active FAT12/16 root/subdirectory regular-file inventory, intact LFN validation, exact EOC mapping, and recursive child recovery.
 - [x] Active FAT32 root/subdirectory regular-file inventory and exact EOC recovery using 28-bit cluster fields and the ExtFlags-selected FAT.
+- [x] Noncontiguous active FAT32 subdirectory LFN recursion with selected-FAT directory/file chain provenance and invalid-LFN fallback evidence.
 - [x] Shared bounded ext inode mapper for direct blocks and depth-zero/depth-one extent trees.
 - [x] Depth-one extent-index/leaf/data provenance, repeated-leaf protection, and recursive Engine flag E2E.
 - [x] Bounded active ext subdirectory traversal and recursively recoverable regular-file children with inode/directory/block lineage.
