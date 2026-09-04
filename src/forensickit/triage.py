@@ -2063,8 +2063,9 @@ class GenericTriageEngine:
             sectors_per_cluster = header[13]
             fat_size_16 = int.from_bytes(header[22:24], "little")
             fat32 = header[82:90].startswith(b"FAT")
+            fat16 = not fat32 and header[54:62].startswith(b"FAT16")
             observations.extend((
-                self._observation(artifact, "filesystem.fat.variant", "fat32" if fat32 else "fat12_or_fat16"),
+                self._observation(artifact, "filesystem.fat.variant", "fat32" if fat32 else "fat16" if fat16 else "fat12_or_fat16"),
                 self._observation(artifact, "filesystem.fat.bytes_per_sector", bytes_per_sector),
                 self._observation(artifact, "filesystem.fat.sectors_per_cluster", sectors_per_cluster),
                 self._observation(artifact, "filesystem.fat.reserved_sector_count", int.from_bytes(header[14:16], "little")),
@@ -2078,6 +2079,12 @@ class GenericTriageEngine:
                     artifact, path, size, header, bytes_per_sector,
                     sectors_per_cluster, int.from_bytes(header[14:16], "little"),
                     header[16], int.from_bytes(header[36:40], "little"),
+                ))
+            elif fat16:
+                observations.extend(self._inspect_fat16_root_directory(
+                    artifact, path, size, header, bytes_per_sector,
+                    sectors_per_cluster, int.from_bytes(header[14:16], "little"),
+                    header[16], fat_size_16,
                 ))
         if ext and len(ext_superblock) >= 136:
             log_block_size = int.from_bytes(ext_superblock[24:28], "little")
@@ -3595,6 +3602,158 @@ class GenericTriageEngine:
                 name_hash = ((name_hash << 15) | (name_hash >> 1)) & 0xFFFF
                 name_hash = (name_hash + value) & 0xFFFF
         return name_hash
+
+    def _inspect_fat16_root_directory(
+        self,
+        artifact: Artifact,
+        path: Path,
+        image_size: int,
+        header: bytes,
+        bytes_per_sector: int,
+        sectors_per_cluster: int,
+        reserved_sectors: int,
+        fat_count: int,
+        fat_size: int,
+    ) -> list[Observation]:
+        prefix = "filesystem.fat16.root"
+        root_entries = int.from_bytes(header[17:19], "little")
+        total_sectors = (
+            int.from_bytes(header[19:21], "little")
+            or int.from_bytes(header[32:36], "little")
+        )
+        cluster_size = bytes_per_sector * sectors_per_cluster
+        root_logical_bytes = root_entries * 32
+        root_sectors = (
+            (root_logical_bytes + bytes_per_sector - 1) // bytes_per_sector
+            if bytes_per_sector else 0
+        )
+        root_sector = reserved_sectors + fat_count * fat_size
+        first_data_sector = root_sector + root_sectors
+        data_sectors = total_sectors - first_data_sector
+        cluster_count = data_sectors // sectors_per_cluster if sectors_per_cluster else 0
+        fat_entry_capacity = fat_size * bytes_per_sector // 2 if bytes_per_sector else 0
+        root_offset = root_sector * bytes_per_sector
+        root_storage_bytes = root_sectors * bytes_per_sector
+        valid_geometry = (
+            bytes_per_sector in {512, 1024, 2048, 4096}
+            and sectors_per_cluster > 0
+            and sectors_per_cluster & (sectors_per_cluster - 1) == 0
+            and sectors_per_cluster <= 128 and reserved_sectors > 0
+            and 1 <= fat_count <= 4 and fat_size > 0
+            and 0 < root_entries <= 65_535 and 0 < root_logical_bytes <= 8 * _MIB
+            and total_sectors > first_data_sector and 4_085 <= cluster_count < 65_525
+            and fat_entry_capacity >= cluster_count + 2
+            and root_offset >= 0 and root_storage_bytes >= root_logical_bytes
+            and root_offset + root_storage_bytes <= image_size
+            and (root_sector + root_sectors) <= total_sectors
+            and 0 < cluster_size <= 2 * _MIB
+        )
+        if not valid_geometry:
+            return [
+                self._observation(artifact, f"{prefix}.available", False),
+                self._observation(artifact, f"{prefix}.offset", root_offset if bytes_per_sector else None),
+                self._observation(artifact, f"{prefix}.error", "invalid FAT16 fixed-root geometry"),
+            ]
+        try:
+            with path.open("rb") as stream:
+                stream.seek(root_offset)
+                stored = stream.read(root_storage_bytes)
+        except OSError as exc:
+            return [
+                self._observation(artifact, f"{prefix}.available", False),
+                self._observation(artifact, f"{prefix}.error", str(exc)[:2_000], confidence=0.9),
+            ]
+        if len(stored) != root_storage_bytes:
+            return [
+                self._observation(artifact, f"{prefix}.available", False),
+                self._observation(artifact, f"{prefix}.error", "truncated FAT16 fixed-root directory"),
+            ]
+        data = stored[:root_logical_bytes]
+        entry_offsets = [root_offset + index * 32 for index in range(root_entries)]
+        deleted_entries: list[dict[str, object]] = []
+        unlinked_lfn_slots: list[dict[str, object]] = []
+        pending_lfn: list[tuple[int, bytes]] = []
+        examined = 0
+        scan_limit = min(root_entries, 4_096)
+        for index in range(scan_limit):
+            entry = data[index * 32:(index + 1) * 32]
+            if entry[0] == 0:
+                if pending_lfn and any(slot[0] == 0xE5 for _, slot in pending_lfn):
+                    unlinked_lfn_slots.append({
+                        "short_entry_index": None, "short_entry_offset": None,
+                        "slot_offsets": [entry_offsets[slot_index] for slot_index, _ in pending_lfn],
+                        "reason": "deleted LFN slots are not followed by a deleted short entry",
+                        "raw_hex": [slot.hex() for _, slot in pending_lfn],
+                    })
+                break
+            examined += 1
+            attributes = entry[11]
+            if attributes == 0x0F:
+                if len(pending_lfn) < 21:
+                    pending_lfn.append((index, entry))
+                continue
+            if entry[0] != 0xE5:
+                if pending_lfn and any(slot[0] == 0xE5 for _, slot in pending_lfn):
+                    unlinked_lfn_slots.append({
+                        "short_entry_index": index,
+                        "short_entry_offset": entry_offsets[index],
+                        "slot_offsets": [entry_offsets[slot_index] for slot_index, _ in pending_lfn],
+                        "reason": "deleted LFN slots are followed by an active short entry",
+                        "raw_hex": [slot.hex() for _, slot in pending_lfn],
+                    })
+                pending_lfn = []
+                continue
+            base = entry[1:8].decode("cp437", errors="replace").rstrip(" ")
+            extension = entry[8:11].decode("cp437", errors="replace").rstrip(" ")
+            recovered: dict[str, object] = {
+                "entry_index": index, "offset": entry_offsets[index],
+                "short_name": f"?{base}" + (f".{extension}" if extension else ""),
+                "first_character_unknown": True, "attributes": f"0x{attributes:02X}",
+                "first_cluster": int.from_bytes(entry[26:28], "little"),
+                "fat16_cluster_high_reserved": int.from_bytes(entry[20:22], "little"),
+                "size": int.from_bytes(entry[28:32], "little"),
+                "created": self._fat_datetime(
+                    int.from_bytes(entry[16:18], "little"),
+                    int.from_bytes(entry[14:16], "little"), entry[13],
+                ),
+                "accessed": self._fat_datetime(int.from_bytes(entry[18:20], "little"), 0),
+                "modified": self._fat_datetime(
+                    int.from_bytes(entry[24:26], "little"),
+                    int.from_bytes(entry[22:24], "little"),
+                ),
+                "raw_hex": entry.hex(),
+            }
+            if pending_lfn:
+                lfn, lfn_error = self._fat_deleted_lfn_candidate(pending_lfn, entry, entry_offsets)
+                if lfn is not None:
+                    recovered.update(lfn)
+                else:
+                    unlinked_lfn_slots.append({
+                        "short_entry_index": index,
+                        "short_entry_offset": entry_offsets[index],
+                        "slot_offsets": [entry_offsets[slot_index] for slot_index, _ in pending_lfn],
+                        "reason": lfn_error,
+                        "raw_hex": [slot.hex() for _, slot in pending_lfn],
+                    })
+            deleted_entries.append(recovered)
+            pending_lfn = []
+            if len(deleted_entries) >= 256:
+                break
+        return [
+            self._observation(artifact, f"{prefix}.available", True),
+            self._observation(artifact, f"{prefix}.offset", root_offset),
+            self._observation(artifact, f"{prefix}.storage_bytes", root_storage_bytes),
+            self._observation(artifact, f"{prefix}.logical_bytes", root_logical_bytes),
+            self._observation(artifact, f"{prefix}.declared_entries", root_entries),
+            self._observation(artifact, f"{prefix}.entries_examined", examined),
+            self._observation(artifact, f"{prefix}.scan_truncated", root_entries > scan_limit),
+            self._observation(artifact, f"{prefix}.first_data_sector", first_data_sector),
+            self._observation(artifact, f"{prefix}.cluster_count", cluster_count),
+            self._observation(artifact, f"{prefix}.fat_entry_capacity", fat_entry_capacity),
+            self._observation(artifact, f"{prefix}.deleted_entries", deleted_entries),
+            self._observation(artifact, f"{prefix}.unlinked_lfn_slots", unlinked_lfn_slots),
+            self._observation(artifact, f"{prefix}.deleted_entries_truncated", len(deleted_entries) >= 256),
+        ]
 
     def _inspect_fat32_root_directory(
         self,

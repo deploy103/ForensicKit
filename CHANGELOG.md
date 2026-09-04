@@ -9,6 +9,7 @@ Notable user-facing changes are documented here. This project follows Semantic V
 - Bounded ext4 depth-two extent-tree traversal with intermediate-index, leaf, and data-block provenance.
 - Cross-level extent-index range validation and repeated/cyclic tree-block rejection under shared metadata-entry bounds.
 - Bounded ext2/3 single-indirect-block mapping for active directories and regular files, including pointer-block and pointer-entry provenance.
+- FAT16 BPB/fixed-root validation, deleted short/LFN inventory, and cautious recursive recovery through single-cluster or exact EOC-terminated FAT chains.
 
 ## [1.1.0] - 2026-09-04
 
