@@ -4913,10 +4913,11 @@ class GenericTriageEngine:
             base = entry[1:8].decode("cp437", errors="replace").rstrip(" ")
             extension = entry[8:11].decode("cp437", errors="replace").rstrip(" ")
             short_name = f"?{base}" + (f".{extension}" if extension else "")
-            first_cluster = (
+            raw_cluster = (
                 int.from_bytes(entry[20:22], "little") << 16
                 | int.from_bytes(entry[26:28], "little")
             )
+            first_cluster = raw_cluster & 0x0FFFFFFF
             recovered: dict[str, object] = {
                 "entry_index": index,
                 "offset": entry_offsets[index],
@@ -4924,6 +4925,8 @@ class GenericTriageEngine:
                 "first_character_unknown": True,
                 "attributes": f"0x{attributes:02X}",
                 "first_cluster": first_cluster,
+                "cluster_field_raw": f"0x{raw_cluster:08X}",
+                "fat32_cluster_high_reserved": raw_cluster >> 28,
                 "size": int.from_bytes(entry[28:32], "little"),
                 "created": self._fat_datetime(
                     int.from_bytes(entry[16:18], "little"),

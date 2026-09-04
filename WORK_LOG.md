@@ -1,5 +1,18 @@
 # ForensicKit Work Log
 
+## 2026-09-04 23:42 KST
+
+### FAT32 deleted-root cluster-field validation
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/extraction.py`, `src/forensickit/profiles/disk.py`, `tests/test_triage.py`, and `tests/test_engine_pipeline.py`.
+- Deleted FAT32 root entries now preserve their exact raw 32-bit start-cluster field, masked 28-bit cluster number, and reserved high nibble, matching active and subdirectory parsing. The profile emits a dedicated cluster-field anomaly for nonzero high bits while keeping the entry as metadata.
+- Recursive FAT32 deleted recovery rejects any entry with a retained nonzero reserved high nibble; it never treats the masked low 28 bits alone as permission to copy content.
+- Expanded the FAT32 deleted Engine E2E with raw `0x10000005`: the candidate remains queryable with masked cluster 5 and an anomaly finding, but no `?ESERV.BIN` child is created even though cluster 5 contains otherwise recoverable bytes. Combined Engine/triage regression: 134 passed, 0 failed; compileall and `git diff --check` passed.
+
+### Next
+
+- Retain failed active and deleted LFN slot chains inside FAT12/16 subdirectories with their short-entry offsets and complete directory lineage, matching the FAT32 failure-provenance behavior.
+
 ## 2026-09-04 23:34 KST
 
 ### Deleted FAT32 subdirectory LFN reconstruction

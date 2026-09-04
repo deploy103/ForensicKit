@@ -1,10 +1,10 @@
 # ForensicKit Work Queue
 
-Last reviewed: 2026-09-04 23:34 KST
+Last reviewed: 2026-09-04 23:42 KST
 
 ## Post-v1.1 backlog
 
-- [ ] Mask and validate FAT32 deleted root-entry cluster fields consistently, retaining raw/reserved-high provenance and excluding malformed fields from recursive recovery.
+- [ ] Preserve invalid active/deleted FAT12/16 subdirectory LFN slot provenance instead of silently falling back to the short entry.
 
 ## v1.1.0 release gate
 
@@ -33,6 +33,7 @@ Last reviewed: 2026-09-04 23:34 KST
 - [x] Active FAT32 root/subdirectory regular-file inventory and exact EOC recovery using 28-bit cluster fields and the ExtFlags-selected FAT.
 - [x] Noncontiguous active FAT32 subdirectory LFN recursion with selected-FAT directory/file chain provenance and invalid-LFN fallback evidence.
 - [x] Deleted FAT32 subdirectory LFN reconstruction and recursive recovery with containing-directory and selected-FAT provenance.
+- [x] FAT32 deleted root raw/masked cluster fields, reserved-high anomaly finding, and malformed-entry recovery exclusion.
 - [x] Shared bounded ext inode mapper for direct blocks and depth-zero/depth-one extent trees.
 - [x] Depth-one extent-index/leaf/data provenance, repeated-leaf protection, and recursive Engine flag E2E.
 - [x] Bounded active ext subdirectory traversal and recursively recoverable regular-file children with inode/directory/block lineage.
