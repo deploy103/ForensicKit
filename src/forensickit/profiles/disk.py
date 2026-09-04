@@ -400,6 +400,49 @@ class DiskProfile(BaseProfile):
                 ),
                 evidence=[str(fat32_backup_fsinfo)[:2_000]], severity="low",
             ))
+        for fat_bits in (12, 16):
+            fat_copy_inventory = next(
+                (
+                    value for value in context.values(f"filesystem.fat{fat_bits}.fat_copies")
+                    if isinstance(value, dict)
+                ),
+                {},
+            )
+            declared_count = fat_copy_inventory.get("declared_count")
+            if not isinstance(declared_count, int) or declared_count < 2:
+                continue
+            if fat_copy_inventory.get("available"):
+                result.findings.append(self.finding(
+                    context,
+                    title=f"{declared_count} declared FAT{fat_bits} allocation-table copies inventoried",
+                    category=f"fat{fat_bits}_fat_copy_inventory", confidence=0.96,
+                    explanation=(
+                        f"Every BPB-declared FAT{fat_bits} table range was checked against declared-volume and supplied-image bounds, then each available copy was compared byte-for-byte with copy zero under an 8-MiB safety limit. "
+                        "Copy zero is only a comparison reference; no allocation table is selected as authoritative."
+                    ),
+                    evidence=[str(fat_copy_inventory)[:2_000]], severity="info",
+                ))
+            if (
+                not fat_copy_inventory.get("available")
+                or fat_copy_inventory.get("all_copies_match") is not True
+            ):
+                comparisons = fat_copy_inventory.get("comparisons")
+                mismatch = isinstance(comparisons, list) and any(
+                    isinstance(item, dict) and item.get("match") is False
+                    for item in comparisons
+                )
+                result.findings.append(self.finding(
+                    context,
+                    title=f"FAT{fat_bits} allocation-table copies are inconsistent or incomplete",
+                    category=f"fat{fat_bits}_fat_copy_anomaly",
+                    confidence=0.97 if mismatch else 0.91,
+                    explanation=(
+                        "At least one declared FAT copy is unavailable, comparison hit the explicit bound, or an exact byte difference was found. "
+                        "The first differing relative and absolute offsets are retained when present; no copy is trusted or used to repair another."
+                    ),
+                    evidence=[str(fat_copy_inventory)[:2_000]],
+                    severity="medium" if mismatch else "low",
+                ))
         fat16_deleted = next(
             (
                 value for value in context.values("filesystem.fat16.root.deleted_entries")
