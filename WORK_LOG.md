@@ -1,5 +1,13 @@
 # ForensicKit Work Log
 
+## 2026-09-04 21:16 KST
+
+### v1.1.0 publication
+
+- Created release commit `b9810d391b2e402f186ba12ac1f36fac9392afdb` (`release: ForensicKit v1.1.0`) and annotated tag `v1.1.0`; pushed both to `origin`.
+- Published the non-draft, non-prerelease GitHub release at `https://github.com/deploy103/ForensicKit/releases/tag/v1.1.0`.
+- Authoritative release inspection confirmed uploaded assets `forensickit-1.1.0-py3-none-any.whl` (264,363 bytes) and `SHA256SUMS` (101 bytes), both in `uploaded` state.
+
 ## 2026-09-04 20:55 KST
 
 ### ext4 depth-one extent-tree traversal and recursive recovery
