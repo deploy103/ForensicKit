@@ -2019,6 +2019,11 @@ def test_active_fat_root_directory_lfns_are_validated_before_inventory(tmp_path:
     valid_slot = lfn_slot("Valid Dir", valid_short)
     invalid_slot = lfn_slot("Broken Dir", invalid_short)
     invalid_slot[13] ^= 0xFF
+    nested_valid_short = b"NVALID~1   "
+    nested_invalid_short = b"NBROKE~1   "
+    nested_valid_slot = lfn_slot("Valid Nested", nested_valid_short)
+    nested_invalid_slot = lfn_slot("Broken Nest", nested_invalid_short)
+    nested_invalid_slot[13] ^= 0xFF
 
     def write_root_entries(image: bytearray, root_offset: int, clusters: tuple[int, int]) -> None:
         image[root_offset:root_offset + 32] = valid_slot
@@ -2032,12 +2037,22 @@ def test_active_fat_root_directory_lfns_are_validated_before_inventory(tmp_path:
         image[second_short_offset + 11] = 0x10
         image[second_short_offset + 26:second_short_offset + 28] = clusters[1].to_bytes(2, "little")
 
+    def write_nested_entry(
+        image: bytearray, directory_offset: int, short_name: bytes,
+        slot_bytes: bytes, child_cluster: int,
+    ) -> None:
+        image[directory_offset:directory_offset + 32] = slot_bytes
+        short_offset = directory_offset + 32
+        image[short_offset:short_offset + 11] = short_name
+        image[short_offset + 11] = 0x10
+        image[short_offset + 26:short_offset + 28] = child_cluster.to_bytes(2, "little")
+
     fixed_variants = (
         (12, 1, 100, b"FAT12   ", 2 * sector_size, 3),
         (16, 17, 4_119, b"FAT16   ", 18 * sector_size, 19),
     )
     for fat_bits, fat_size, total_sectors, label, root_offset, first_data_sector in fixed_variants:
-        image = bytearray((first_data_sector + 2) * sector_size)
+        image = bytearray((first_data_sector + 4) * sector_size)
         image[11:13] = sector_size.to_bytes(2, "little")
         image[13] = 1
         image[14:16] = (1).to_bytes(2, "little")
@@ -2050,7 +2065,7 @@ def test_active_fat_root_directory_lfns_are_validated_before_inventory(tmp_path:
         image[510:512] = b"\x55\xaa"
         if fat_bits == 12:
             image[sector_size:sector_size + 3] = b"\xf0\xff\xff"
-            for cluster in (2, 3):
+            for cluster in (2, 3, 4, 5):
                 offset = sector_size + cluster + cluster // 2
                 packed = int.from_bytes(image[offset:offset + 2], "little")
                 if cluster & 1:
@@ -2060,10 +2075,18 @@ def test_active_fat_root_directory_lfns_are_validated_before_inventory(tmp_path:
                 image[offset:offset + 2] = packed.to_bytes(2, "little")
         else:
             image[sector_size:sector_size + 4] = b"\xf8\xff\xff\xff"
-            for cluster in (2, 3):
+            for cluster in (2, 3, 4, 5):
                 offset = sector_size + cluster * 2
                 image[offset:offset + 2] = (0xFFFF).to_bytes(2, "little")
         write_root_entries(image, root_offset, (2, 3))
+        first_directory_offset = first_data_sector * sector_size
+        second_directory_offset = (first_data_sector + 1) * sector_size
+        write_nested_entry(
+            image, first_directory_offset, nested_valid_short, nested_valid_slot, 4,
+        )
+        write_nested_entry(
+            image, second_directory_offset, nested_invalid_short, nested_invalid_slot, 5,
+        )
         path = tmp_path / f"fat{fat_bits}-root-directory-lfns.raw"
         path.write_bytes(image)
         values = _values(GenericTriageEngine().analyze(_artifact(path), path))
@@ -2071,16 +2094,32 @@ def test_active_fat_root_directory_lfns_are_validated_before_inventory(tmp_path:
         assert inventory[0]["long_name"] == "Valid Dir"
         assert inventory[0]["lfn_slot_offsets"] == [root_offset]
         assert "long_name" not in inventory[1]
-        assert values[f"filesystem.fat{fat_bits}.root.unlinked_lfn_slots"] == [{
-            "short_entry_index": 3,
-            "short_entry_offset": root_offset + 96,
-            "slot_offsets": [root_offset + 64],
-            "reason": "active LFN checksum does not match the short entry",
-            "raw_hex": [invalid_slot.hex()],
-        }]
+        assert inventory[2]["long_name"] == "Valid Nested"
+        assert inventory[2]["lfn_slot_offsets"] == [first_directory_offset]
+        assert inventory[2]["parent_cluster_lineage"] == [2]
+        assert "long_name" not in inventory[3]
+        assert values[f"filesystem.fat{fat_bits}.root.unlinked_lfn_slots"] == [
+            {
+                "short_entry_index": 3,
+                "short_entry_offset": root_offset + 96,
+                "slot_offsets": [root_offset + 64],
+                "reason": "active LFN checksum does not match the short entry",
+                "raw_hex": [invalid_slot.hex()],
+            },
+            {
+                "directory_start_cluster": 3,
+                "directory_cluster_lineage": [3],
+                "directory_source_entry_offset": root_offset + 96,
+                "short_entry_index": 1,
+                "short_entry_offset": second_directory_offset + 32,
+                "slot_offsets": [second_directory_offset],
+                "reason": "active LFN checksum does not match the short entry",
+                "raw_hex": [nested_invalid_slot.hex()],
+            },
+        ]
 
     fat32_first_data_sector = 2
-    fat32 = bytearray((fat32_first_data_sector + 3) * sector_size)
+    fat32 = bytearray((fat32_first_data_sector + 5) * sector_size)
     fat32[11:13] = sector_size.to_bytes(2, "little")
     fat32[13] = 1
     fat32[14:16] = (1).to_bytes(2, "little")
@@ -2091,11 +2130,19 @@ def test_active_fat_root_directory_lfns_are_validated_before_inventory(tmp_path:
     fat32[82:90] = b"FAT32   "
     fat32[510:512] = b"\x55\xaa"
     fat32[sector_size:sector_size + 8] = b"\xf8\xff\xff\x0f\xff\xff\xff\x0f"
-    for cluster in (2, 3, 4):
+    for cluster in (2, 3, 4, 5, 6):
         offset = sector_size + cluster * 4
         fat32[offset:offset + 4] = (0x0FFFFFFF).to_bytes(4, "little")
     fat32_root_offset = fat32_first_data_sector * sector_size
     write_root_entries(fat32, fat32_root_offset, (3, 4))
+    fat32_first_directory_offset = (fat32_first_data_sector + 1) * sector_size
+    fat32_second_directory_offset = (fat32_first_data_sector + 2) * sector_size
+    write_nested_entry(
+        fat32, fat32_first_directory_offset, nested_valid_short, nested_valid_slot, 5,
+    )
+    write_nested_entry(
+        fat32, fat32_second_directory_offset, nested_invalid_short, nested_invalid_slot, 6,
+    )
     fat32_path = tmp_path / "fat32-root-directory-lfns.raw"
     fat32_path.write_bytes(fat32)
     fat32_values = _values(GenericTriageEngine().analyze(_artifact(fat32_path), fat32_path))
@@ -2103,13 +2150,29 @@ def test_active_fat_root_directory_lfns_are_validated_before_inventory(tmp_path:
     assert fat32_inventory[0]["long_name"] == "Valid Dir"
     assert fat32_inventory[0]["lfn_slot_offsets"] == [fat32_root_offset]
     assert "long_name" not in fat32_inventory[1]
-    assert fat32_values["filesystem.fat.unlinked_lfn_slots"] == [{
-        "short_entry_index": 3,
-        "short_entry_offset": fat32_root_offset + 96,
-        "slot_offsets": [fat32_root_offset + 64],
-        "reason": "active LFN checksum does not match the short entry",
-        "raw_hex": [invalid_slot.hex()],
-    }]
+    assert fat32_inventory[2]["long_name"] == "Valid Nested"
+    assert fat32_inventory[2]["lfn_slot_offsets"] == [fat32_first_directory_offset]
+    assert fat32_inventory[2]["parent_cluster_lineage"] == [3]
+    assert "long_name" not in fat32_inventory[3]
+    assert fat32_values["filesystem.fat.unlinked_lfn_slots"] == [
+        {
+            "short_entry_index": 3,
+            "short_entry_offset": fat32_root_offset + 96,
+            "slot_offsets": [fat32_root_offset + 64],
+            "reason": "active LFN checksum does not match the short entry",
+            "raw_hex": [invalid_slot.hex()],
+        },
+        {
+            "directory_start_cluster": 4,
+            "directory_cluster_lineage": [4],
+            "directory_source_entry_offset": fat32_root_offset + 96,
+            "short_entry_index": 1,
+            "short_entry_offset": fat32_second_directory_offset + 32,
+            "slot_offsets": [fat32_second_directory_offset],
+            "reason": "active LFN checksum does not match the short entry",
+            "raw_hex": [nested_invalid_slot.hex()],
+        },
+    ]
 
 
 def test_fat32_deleted_lfn_chain_requires_checksum_and_terminal_validation(tmp_path: Path) -> None:

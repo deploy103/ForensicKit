@@ -4345,6 +4345,43 @@ class GenericTriageEngine:
                                 pending_lfn.append((index, entry))
                             continue
                         if entry[0] != 0xE5:
+                            if pending_lfn and attributes & 0x08:
+                                if len(unlinked_lfn_slots) < 256:
+                                    unlinked_lfn_slots.append({
+                                        "directory_start_cluster": start,
+                                        "directory_cluster_lineage": lineage,
+                                        "directory_source_entry_offset": directory.get("source_entry_offset"),
+                                        "short_entry_index": index,
+                                        "short_entry_offset": offsets[index],
+                                        "slot_offsets": [offsets[slot_index] for slot_index, _ in pending_lfn],
+                                        "reason": "LFN slots are followed by an incompatible volume-label entry",
+                                        "raw_hex": [slot.hex() for _, slot in pending_lfn],
+                                    })
+                            elif pending_lfn and attributes & 0x10:
+                                directory_lfn, lfn_error = GenericTriageEngine._fat_active_lfn_candidate(
+                                    pending_lfn, entry, offsets,
+                                )
+                                if directory_lfn is not None:
+                                    directory_record = next(
+                                        (
+                                            item for item in queue
+                                            if item.get("source_entry_offset") == offsets[index]
+                                        ),
+                                        None,
+                                    )
+                                    if directory_record is not None:
+                                        directory_record.update(directory_lfn)
+                                elif len(unlinked_lfn_slots) < 256:
+                                    unlinked_lfn_slots.append({
+                                        "directory_start_cluster": start,
+                                        "directory_cluster_lineage": lineage,
+                                        "directory_source_entry_offset": directory.get("source_entry_offset"),
+                                        "short_entry_index": index,
+                                        "short_entry_offset": offsets[index],
+                                        "slot_offsets": [offsets[slot_index] for slot_index, _ in pending_lfn],
+                                        "reason": lfn_error,
+                                        "raw_hex": [slot.hex() for _, slot in pending_lfn],
+                                    })
                             if (
                                 not attributes & 0x18
                                 and int.from_bytes(entry[20:22], "little") == 0
@@ -5249,10 +5286,20 @@ class GenericTriageEngine:
                                         "raw_hex": [slot.hex() for _, slot in pending_lfn],
                                     })
                             elif pending_lfn and attributes & 0x10:
-                                _, lfn_error = GenericTriageEngine._fat_active_lfn_candidate(
+                                directory_lfn, lfn_error = GenericTriageEngine._fat_active_lfn_candidate(
                                     pending_lfn, entry, offsets,
                                 )
-                                if lfn_error is not None and len(unlinked_lfn_slots) < 256:
+                                if directory_lfn is not None:
+                                    directory_record = next(
+                                        (
+                                            item for item in queue
+                                            if item.get("source_entry_offset") == offsets[index]
+                                        ),
+                                        None,
+                                    )
+                                    if directory_record is not None:
+                                        directory_record.update(directory_lfn)
+                                elif len(unlinked_lfn_slots) < 256:
                                     unlinked_lfn_slots.append({
                                         "directory_start_cluster": start,
                                         "directory_cluster_lineage": lineage,
