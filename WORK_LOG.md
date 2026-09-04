@@ -1,5 +1,17 @@
 # ForensicKit Work Log
 
+## 2026-09-04 23:51 KST
+
+### FAT12/16 subdirectory LFN failure provenance
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/profiles/disk.py`, and `tests/test_triage.py`.
+- Invalid active/deleted LFN sequences and LFN slots not followed by a short entry inside exact-EOC FAT12/16 subdirectories now remain in the root-level unlinked-LFN observation. Each record keeps raw slot bytes, physical slot and short-entry offsets, the containing directory's source entry, start cluster, and complete cluster lineage; the independently valid short entry remains usable without trusting the long name.
+- Disk-profile findings now expose these bounded failure records separately for FAT12 and FAT16. Focused triage regression passed: 90 passed, 0 failed. The full direct synthetic suite passed: 296 passed, 0 failed; compileall and `git diff --check` passed.
+
+### Next
+
+- Surface existing FAT32 root/subdirectory unlinked-LFN observations as a dedicated cautious profile/report finding, and cover it through the Engine report path.
+
 ## 2026-09-04 23:42 KST
 
 ### FAT32 deleted-root cluster-field validation
