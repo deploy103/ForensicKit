@@ -651,6 +651,29 @@ class DiskProfile(BaseProfile):
                     ),
                     evidence=[str(fat_header_inventory)[:2_000]], severity="medium",
                 ))
+        for fat_bits in (12, 16, 32):
+            lost_chain_inventory = next(
+                (
+                    value for value in context.values(f"filesystem.fat{fat_bits}.lost_chains")
+                    if isinstance(value, dict)
+                ),
+                {},
+            )
+            candidate_clusters = lost_chain_inventory.get("unreferenced_allocated_cluster_count_in_scan")
+            if (
+                lost_chain_inventory.get("available") is True
+                and isinstance(candidate_clusters, int) and candidate_clusters > 0
+            ):
+                result.findings.append(self.finding(
+                    context,
+                    title=f"FAT{fat_bits} has {candidate_clusters} allocated cluster(s) without a sampled active-directory reference",
+                    category=f"fat{fat_bits}_lost_allocation_chain_candidate", confidence=0.82,
+                    explanation=(
+                        "The active FAT contains bounded chain components not reached from any start cluster found in validated active root/subdirectory entries. "
+                        "Exact FAT-entry and mapped data offsets are retained, but directory traversal and FAT scanning are bounded, so this is a lost-chain lead rather than proof of deletion, ownership, or safe recoverability."
+                    ),
+                    evidence=[str(lost_chain_inventory)[:4_000]], severity="low",
+                ))
         qcow_header = next((value for value in context.values("disk.qcow2.header") if isinstance(value, dict)), {})
         vhd_footer = next((value for value in context.values("disk.vhd.footer") if isinstance(value, dict)), {})
         virtual_disk = context.format_is("vhd", "qcow2") or bool(qcow_header.get("valid")) or bool(vhd_footer.get("signature"))

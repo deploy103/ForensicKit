@@ -1,5 +1,18 @@
 # ForensicKit Work Log
 
+## 2026-09-04 22:52 KST
+
+### FAT lost allocation-chain inventory
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/profiles/disk.py`, and `tests/test_triage.py`.
+- Active FAT12/16/32 tables are now decoded for at most 131,072 data clusters. Start clusters from validated active root and traversed subdirectory entries are walked under a separate 262,144-step limit; their reached allocation is excluded before candidate components are built.
+- The remaining bounded components retain start cluster, every exact packed/word/dword FAT offset and raw value, next cluster, mapped data offset/length/image availability, EOC/cross-link/out-of-scan/nonallocated/loop termination, scan/reference limits, and explicit `ownership_inferred=false` / `content_recovered=false` state. At most 64 chains of 64 clusters are rendered, while total candidate cluster counts and truncation remain explicit.
+- Added a FAT12 synthetic table containing an active cluster-5 file and independent `7 -> 8 -> EOC` allocation. The active file is excluded, the anonymous two-cluster candidate retains exact packed FAT and data offsets, and the profile emits only a cautious lost-chain lead. Focused triage regression: 89 passed, 0 failed; combined triage/Engine regression before the added fixture: 129 passed, 0 failed.
+
+### Next
+
+- Materialize only complete EOC-terminated lost chains whose every data segment is present, under artifact/count/byte limits, using anonymous logical names and exact chain lineage so recursive analysis can find embedded signatures/flags without claiming original ownership.
+
 ## 2026-09-04 22:42 KST
 
 ### FAT reserved-entry and media validation

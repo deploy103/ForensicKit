@@ -1,10 +1,10 @@
 # ForensicKit Work Queue
 
-Last reviewed: 2026-09-04 22:42 KST
+Last reviewed: 2026-09-04 22:52 KST
 
 ## Post-v1.1 backlog
 
-- [ ] Inventory bounded FAT12/16/32 lost allocation chains that are not referenced by any validated active directory entry, with no automatic ownership claim or unsafe recovery.
+- [ ] Promote only complete, image-bounded FAT lost-chain candidates to size-bounded anonymous child artifacts for recursive flag/signature analysis, preserving the ownership caveat and exact segment lineage.
 
 ## v1.1.0 release gate
 
@@ -27,6 +27,7 @@ Last reviewed: 2026-09-04 22:42 KST
 - [x] Bounded FAT12/16 duplicate FAT-copy inventory, exact first-divergence offsets, and unavailable-copy provenance without authoritative selection.
 - [x] FAT32 ExtFlags-aware duplicate FAT comparison and BPB-selected active-table traversal, with mirrored-vs-inactive divergence semantics.
 - [x] Per-copy FAT12/16/32 reserved-entry and BPB media validation with retained clean-shutdown/hard-error status.
+- [x] Bounded FAT12/16/32 active-reference exclusion and ownership-free lost allocation-chain inventory with exact FAT/data provenance.
 - [x] Shared bounded ext inode mapper for direct blocks and depth-zero/depth-one extent trees.
 - [x] Depth-one extent-index/leaf/data provenance, repeated-leaf protection, and recursive Engine flag E2E.
 - [x] Bounded active ext subdirectory traversal and recursively recoverable regular-file children with inode/directory/block lineage.
