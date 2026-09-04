@@ -4201,7 +4201,10 @@ class GenericTriageEngine:
         total_clusters = 0
         total_bytes = 0
 
-        def active_directories(data: bytes, offsets: list[int], parent_lineage: list[int]) -> None:
+        def active_directories(
+            data: bytes, offsets: list[int], parent_lineage: list[int],
+            ancestor_identities: list[dict[str, object]],
+        ) -> None:
             pending_directory_lfn: list[tuple[int, bytes]] = []
             for index in range(min(len(data) // 32, 2_048)):
                 entry = data[index * 32:(index + 1) * 32]
@@ -4242,10 +4245,20 @@ class GenericTriageEngine:
                         )
                         if directory_lfn is not None:
                             directory_record.update(directory_lfn)
+                    directory_record["directory_identity_lineage"] = [
+                        *ancestor_identities,
+                        {
+                            "short_name": short_name,
+                            "long_name": directory_record.get("long_name"),
+                            "source_entry_offset": offsets[index],
+                            "lfn_slot_offsets": directory_record.get("lfn_slot_offsets"),
+                            "start_cluster": start,
+                        },
+                    ][:32]
                     queue.append(directory_record)
                 pending_directory_lfn = []
 
-        active_directories(root_data, root_entry_offsets, [])
+        active_directories(root_data, root_entry_offsets, [], [])
         try:
             with path.open("rb") as stream:
                 while queue and len(inventory) < 32 and total_clusters < 64 and total_bytes < 8 * _MIB:
@@ -4340,7 +4353,11 @@ class GenericTriageEngine:
                         continue
                     directory_data = b"".join(chunks)
                     lineage = [int(item["cluster"]) for item in chain]
-                    active_directories(directory_data, offsets, lineage)
+                    directory_identities = directory.get("directory_identity_lineage")
+                    active_directories(
+                        directory_data, offsets, lineage,
+                        directory_identities if isinstance(directory_identities, list) else [],
+                    )
                     pending_lfn: list[tuple[int, bytes]] = []
                     for index in range(min(len(directory_data) // 32, 2_048)):
                         entry = directory_data[index * 32:(index + 1) * 32]
@@ -4418,6 +4435,7 @@ class GenericTriageEngine:
                                         "directory_short_name": directory.get("name"),
                                         "directory_long_name": directory.get("long_name"),
                                         "directory_lfn_slot_offsets": directory.get("lfn_slot_offsets"),
+                                        "directory_identity_lineage": directory.get("directory_identity_lineage"),
                                         "entry_index": index, "offset": offsets[index],
                                         "short_name": base + (f".{extension}" if extension else ""),
                                         "attributes": f"0x{attributes:02X}",
@@ -4455,6 +4473,7 @@ class GenericTriageEngine:
                             "directory_short_name": directory.get("name"),
                             "directory_long_name": directory.get("long_name"),
                             "directory_lfn_slot_offsets": directory.get("lfn_slot_offsets"),
+                            "directory_identity_lineage": directory.get("directory_identity_lineage"),
                             "entry_index": index, "offset": offsets[index],
                             "short_name": f"?{base}" + (f".{extension}" if extension else ""),
                             "first_character_unknown": True,
@@ -5182,7 +5201,10 @@ class GenericTriageEngine:
         unlinked_lfn_slots: list[dict[str, object]] = []
         total_clusters = 0
 
-        def active_directories(data: bytes, offsets: list[int], parent_lineage: list[int]) -> None:
+        def active_directories(
+            data: bytes, offsets: list[int], parent_lineage: list[int],
+            ancestor_identities: list[dict[str, object]],
+        ) -> None:
             pending_directory_lfn: list[tuple[int, bytes]] = []
             for index in range(min(len(data) // 32, 2_048)):
                 entry = data[index * 32:(index + 1) * 32]
@@ -5221,10 +5243,20 @@ class GenericTriageEngine:
                         )
                         if directory_lfn is not None:
                             directory_record.update(directory_lfn)
+                    directory_record["directory_identity_lineage"] = [
+                        *ancestor_identities,
+                        {
+                            "short_name": short_name,
+                            "long_name": directory_record.get("long_name"),
+                            "source_entry_offset": offsets[index],
+                            "lfn_slot_offsets": directory_record.get("lfn_slot_offsets"),
+                            "start_cluster": start,
+                        },
+                    ][:32]
                     queue.append(directory_record)
                 pending_directory_lfn = []
 
-        active_directories(root_data, root_entry_offsets, [])
+        active_directories(root_data, root_entry_offsets, [], [])
         try:
             with path.open("rb") as stream:
                 while queue and len(inventory) < 32 and total_clusters < 64:
@@ -5293,7 +5325,11 @@ class GenericTriageEngine:
                     inventory.append({
                         **directory, "cluster_chain": chain, "termination": termination,
                     })
-                    active_directories(directory_data, offsets, lineage)
+                    directory_identities = directory.get("directory_identity_lineage")
+                    active_directories(
+                        directory_data, offsets, lineage,
+                        directory_identities if isinstance(directory_identities, list) else [],
+                    )
                     pending_lfn: list[tuple[int, bytes]] = []
                     for index in range(min(len(directory_data) // 32, 2_048)):
                         entry = directory_data[index * 32:(index + 1) * 32]
@@ -5371,6 +5407,7 @@ class GenericTriageEngine:
                                         "directory_short_name": directory.get("name"),
                                         "directory_long_name": directory.get("long_name"),
                                         "directory_lfn_slot_offsets": directory.get("lfn_slot_offsets"),
+                                        "directory_identity_lineage": directory.get("directory_identity_lineage"),
                                         "entry_index": index, "offset": offsets[index],
                                         "short_name": base + (f".{extension}" if extension else ""),
                                         "attributes": f"0x{attributes:02X}",
@@ -5410,6 +5447,7 @@ class GenericTriageEngine:
                             "directory_short_name": directory.get("name"),
                             "directory_long_name": directory.get("long_name"),
                             "directory_lfn_slot_offsets": directory.get("lfn_slot_offsets"),
+                            "directory_identity_lineage": directory.get("directory_identity_lineage"),
                             "entry_index": index,
                             "offset": offsets[index],
                             "short_name": f"?{base}" + (f".{extension}" if extension else ""),

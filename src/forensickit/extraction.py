@@ -1567,6 +1567,7 @@ class ExtractionManager:
                     f"directory_short_name:{entry.get('directory_short_name')};"
                     f"directory_long_name:{entry.get('directory_long_name')};"
                     f"directory_lfn_slot_offsets:{entry.get('directory_lfn_slot_offsets')};"
+                    f"directory_identity_lineage:{entry.get('directory_identity_lineage')};"
                     f"raw_entry:{entry.get('raw_hex')};chain_validation:{chain_validation};"
                     "allocation_state:unknown_deleted_cluster_may_be_reused"
                 )
@@ -1764,6 +1765,7 @@ class ExtractionManager:
                     f"directory_short_name:{entry.get('directory_short_name')};"
                     f"directory_long_name:{entry.get('directory_long_name')};"
                     f"directory_lfn_slot_offsets:{entry.get('directory_lfn_slot_offsets')};"
+                    f"directory_identity_lineage:{entry.get('directory_identity_lineage')};"
                     f"raw_entry:{entry.get('raw_hex')};chain_validation:{chain_validation};"
                     "allocation_state:unknown_deleted_cluster_may_be_reused"
                 )
@@ -1956,6 +1958,7 @@ class ExtractionManager:
                     f"directory_short_name:{entry.get('directory_short_name')};"
                     f"directory_long_name:{entry.get('directory_long_name')};"
                     f"directory_lfn_slot_offsets:{entry.get('directory_lfn_slot_offsets')};"
+                    f"directory_identity_lineage:{entry.get('directory_identity_lineage')};"
                     f"chain_validation:{chain_validation};"
                     "allocation_state:unknown_deleted_cluster_may_be_reused"
                 )
@@ -2426,6 +2429,7 @@ class ExtractionManager:
                     f"directory_short_name:{entry.get('directory_short_name')};"
                     f"directory_long_name:{entry.get('directory_long_name')};"
                     f"directory_lfn_slot_offsets:{entry.get('directory_lfn_slot_offsets')};"
+                    f"directory_identity_lineage:{entry.get('directory_identity_lineage')};"
                     "chain_validation:exact_size_required_chain_eoc;allocation_state:active_directory_reference"
                 )
         if result.artifacts:
