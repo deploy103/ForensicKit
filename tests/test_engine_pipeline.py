@@ -1525,12 +1525,26 @@ def test_fat16_fixed_root_deleted_lfn_recovers_one_cluster_with_lineage(tmp_path
     image[multi_offset + 28:multi_offset + 32] = len(multi_payload).to_bytes(4, "little")
     image[sector_size + 6 * 2:sector_size + 6 * 2 + 2] = (8).to_bytes(2, "little")
     image[sector_size + 8 * 2:sector_size + 8 * 2 + 2] = (0xFFFF).to_bytes(2, "little")
+    active_directory_offset = multi_offset + 32
+    image[active_directory_offset:active_directory_offset + 11] = b"ACTIVE     "
+    image[active_directory_offset + 11] = 0x10
+    image[active_directory_offset + 26:active_directory_offset + 28] = (9).to_bytes(2, "little")
+    image[sector_size + 9 * 2:sector_size + 9 * 2 + 2] = (0xFFFF).to_bytes(2, "little")
     content_offset = (first_data_sector + 3) * sector_size
     image[content_offset:content_offset + len(payload)] = payload
     multi_first_offset = (first_data_sector + 4) * sector_size
     multi_second_offset = (first_data_sector + 6) * sector_size
     image[multi_first_offset:multi_first_offset + sector_size] = multi_payload[:sector_size]
     image[multi_second_offset:multi_second_offset + len(multi_payload) - sector_size] = multi_payload[sector_size:]
+    subdirectory_offset = (first_data_sector + 7) * sector_size
+    sub_entry = subdirectory_offset
+    image[sub_entry:sub_entry + 11] = b"\xe5UBFLAG TXT"
+    image[sub_entry + 11] = 0x20
+    image[sub_entry + 26:sub_entry + 28] = (10).to_bytes(2, "little")
+    sub_payload = b"CTF{fat16_subdirectory}"
+    image[sub_entry + 28:sub_entry + 32] = len(sub_payload).to_bytes(4, "little")
+    sub_content_offset = (first_data_sector + 8) * sector_size
+    image[sub_content_offset:sub_content_offset + len(sub_payload)] = sub_payload
     evidence = tmp_path / "fat16-deleted.raw"
     evidence.write_bytes(image)
 
@@ -1554,11 +1568,21 @@ def test_fat16_fixed_root_deleted_lfn_recovers_one_cluster_with_lineage(tmp_path
     assert deleted[0]["first_cluster"] == 5
     assert deleted[0]["fat16_cluster_high_reserved"] == 0
     assert deleted[1]["fat16_cluster_high_reserved"] == 1
+    sub_deleted = values["filesystem.fat16.root.subdirectory_deleted_entries"]
+    assert sub_deleted[0]["directory_start_cluster"] == 9
+    assert sub_deleted[0]["directory_cluster_lineage"] == [9]
+    assert sub_deleted[0]["directory_source_entry_offset"] == active_directory_offset
+    assert sub_deleted[0]["offset"] == subdirectory_offset
     child = next(item for item in result.artifacts if item.logical_name == long_name)
     multi_child = next(item for item in result.artifacts if item.logical_name == "?ULTI.BIN")
+    sub_child = next(item for item in result.artifacts if item.logical_name == "?UBFLAG.TXT")
     assert not any(item.logical_name == "?LIAS.BIN" for item in result.artifacts)
     assert any(
         item.value == "CTF{fat16_fixed_root}" and item.artifact_id == child.id
+        for item in result.flags
+    )
+    assert any(
+        item.value == "CTF{fat16_subdirectory}" and item.artifact_id == sub_child.id
         for item in result.flags
     )
     assert any(
@@ -1567,6 +1591,7 @@ def test_fat16_fixed_root_deleted_lfn_recovers_one_cluster_with_lineage(tmp_path
     )
     assert any(item.category == "fat16_deleted_directory_entry" for item in result.findings)
     assert any(item.category == "fat16_deleted_lfn_entry" for item in result.findings)
+    assert any(item.category == "fat16_subdirectory_deleted_entry" for item in result.findings)
     recovery = next(item for item in result.findings if item.category == "fat16_deleted_content_recovery")
     assert "builtin_fat16_deleted_extractor" in recovery.source
     assert f"entry_offset:{short_offset}" in recovery.supporting_evidence[0]
@@ -1576,6 +1601,11 @@ def test_fat16_fixed_root_deleted_lfn_recovers_one_cluster_with_lineage(tmp_path
     assert f"physical_offset:{multi_first_offset}" in multi_evidence
     assert f"'physical_offset': {multi_second_offset}" in multi_evidence
     assert "chain_validation:complete_fat16_chain_eoc" in multi_evidence
+    sub_evidence = next(item for item in recovery.supporting_evidence if sub_child.id in item)
+    assert f"entry_offset:{subdirectory_offset}" in sub_evidence
+    assert "directory_start_cluster:9" in sub_evidence
+    assert "directory_cluster_lineage:[9]" in sub_evidence
+    assert f"directory_source_entry_offset:{active_directory_offset}" in sub_evidence
 
     fat12_sized = bytearray(image)
     fat12_sized[19:21] = (100).to_bytes(2, "little")
@@ -1601,6 +1631,20 @@ def test_fat16_fixed_root_deleted_lfn_recovers_one_cluster_with_lineage(tmp_path
     )
     assert any(item.logical_name == long_name for item in incomplete_result.artifacts)
     assert not any(item.logical_name == "?ULTI.BIN" for item in incomplete_result.artifacts)
+
+    looping_directory = bytearray(image)
+    looping_directory[sector_size + 9 * 2:sector_size + 9 * 2 + 2] = (9).to_bytes(2, "little")
+    invalid_directory = tmp_path / "fat16-looping-directory.raw"
+    invalid_directory.write_bytes(looping_directory)
+    invalid_directory_result = AnalysisEngine().analyze(
+        invalid_directory, tmp_path / "fat16-directory-cases",
+        mode=AnalysisMode.AUTO, execute=False,
+    )
+    assert not any(item.logical_name == "?UBFLAG.TXT" for item in invalid_directory_result.artifacts)
+    assert any(
+        item.category == "fat16_subdirectory_chain_anomaly"
+        for item in invalid_directory_result.findings
+    )
 
 
 def test_recycle_bin_exact_supplied_content_pair_is_correlated(tmp_path: Path) -> None:

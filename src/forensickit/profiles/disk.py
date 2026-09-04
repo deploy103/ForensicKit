@@ -365,6 +365,44 @@ class DiskProfile(BaseProfile):
                     evidence=[str(item)[:2_000] for item in linked_fat16_lfn[:128]],
                     severity="info",
                 ))
+        fat16_subdirectory_deleted = next(
+            (
+                value for value in context.values("filesystem.fat16.root.subdirectory_deleted_entries")
+                if isinstance(value, list)
+            ),
+            [],
+        )
+        if fat16_subdirectory_deleted:
+            result.findings.append(self.finding(
+                context,
+                title=f"{len(fat16_subdirectory_deleted)} deleted FAT16 subdirectory entry candidate(s) recovered",
+                category="fat16_subdirectory_deleted_entry", confidence=0.89,
+                explanation=(
+                    "Deleted entries were read only from complete, exact-EOC FAT16 chains referenced by active directories. "
+                    "Each candidate retains its parent source entry, complete containing-directory cluster lineage, exact physical entry offset, and optional validated LFN chain."
+                ),
+                evidence=[str(item)[:2_000] for item in fat16_subdirectory_deleted[:128]],
+                severity="info",
+            ))
+        fat16_subdirectory_errors = next(
+            (
+                value for value in context.values("filesystem.fat16.root.subdirectory_errors")
+                if isinstance(value, list)
+            ),
+            [],
+        )
+        if fat16_subdirectory_errors:
+            result.findings.append(self.finding(
+                context,
+                title="FAT16 active-subdirectory traversal ended incompletely",
+                category="fat16_subdirectory_chain_anomaly", confidence=0.91,
+                explanation=(
+                    "A referenced directory exceeded shared resource bounds or encountered an invalid, truncated, looping, or shared cluster chain. "
+                    "Incomplete directory content was not used for deleted-entry recovery."
+                ),
+                evidence=[str(item)[:2_000] for item in fat16_subdirectory_errors[:128]],
+                severity="low",
+            ))
         qcow_header = next((value for value in context.values("disk.qcow2.header") if isinstance(value, dict)), {})
         vhd_footer = next((value for value in context.values("disk.vhd.footer") if isinstance(value, dict)), {})
         virtual_disk = context.format_is("vhd", "qcow2") or bool(qcow_header.get("valid")) or bool(vhd_footer.get("signature"))
