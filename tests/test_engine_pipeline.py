@@ -2268,6 +2268,16 @@ def test_fat32_noncontiguous_subdirectory_lfn_file_keeps_selected_fat_lineage(tm
         "reason": "active LFN checksum does not match the short entry",
         "raw_hex": [bytes(bad_lfn[second_directory_offset:second_directory_offset + 32]).hex()],
     }]
+    unlinked_finding = next(
+        item for item in bad_result.findings
+        if item.category == "fat32_unlinked_lfn_slots"
+    )
+    assert str(short_offset) in unlinked_finding.supporting_evidence[0]
+    assert "[5, 9]" in unlinked_finding.supporting_evidence[0]
+    assert "active LFN checksum does not match the short entry" in unlinked_finding.supporting_evidence[0]
+    report = Path(bad_result.case.workspace, "reports", "report.json").read_text(encoding="utf-8")
+    assert "fat32_unlinked_lfn_slots" in report
+    assert "active LFN checksum does not match the short entry" in report
 
 
 def test_recycle_bin_exact_supplied_content_pair_is_correlated(tmp_path: Path) -> None:
