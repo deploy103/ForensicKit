@@ -31,6 +31,7 @@ Notable user-facing changes are documented here. This project follows Semantic V
 - Active FAT12/16/32 root directory LFNs now undergo the same ordinal/checksum/UTF-16 validation as file LFNs; valid names enrich subdirectory inventory while failures remain unlinked evidence.
 - Nested active FAT12/16/32 directory LFNs now enrich their exact queued inventory records, while invalid chains retain the containing directory source and cluster lineage.
 - Nested active/deleted FAT12/16/32 file records and recursive recovery findings now retain their immediate containing directory's short name, validated LFN, LFN slot offsets, source entry, and cluster lineage without fabricating a full path.
+- Deeper FAT file records now carry a bounded ordered directory-identity lineage, with per-level short/LFN names, source offsets, LFN slots, and start clusters kept distinct from any inferred path string.
 
 ## [1.1.0] - 2026-09-04
 

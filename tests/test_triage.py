@@ -2047,12 +2047,18 @@ def test_active_fat_root_directory_lfns_are_validated_before_inventory(tmp_path:
         image[short_offset + 11] = 0x10
         image[short_offset + 26:short_offset + 28] = child_cluster.to_bytes(2, "little")
 
+    def write_deep_file(image: bytearray, directory_offset: int, file_cluster: int) -> None:
+        image[directory_offset:directory_offset + 11] = b"DEEP    TXT"
+        image[directory_offset + 11] = 0x20
+        image[directory_offset + 26:directory_offset + 28] = file_cluster.to_bytes(2, "little")
+        image[directory_offset + 28:directory_offset + 32] = (1).to_bytes(4, "little")
+
     fixed_variants = (
         (12, 1, 100, b"FAT12   ", 2 * sector_size, 3),
         (16, 17, 4_119, b"FAT16   ", 18 * sector_size, 19),
     )
     for fat_bits, fat_size, total_sectors, label, root_offset, first_data_sector in fixed_variants:
-        image = bytearray((first_data_sector + 4) * sector_size)
+        image = bytearray((first_data_sector + 5) * sector_size)
         image[11:13] = sector_size.to_bytes(2, "little")
         image[13] = 1
         image[14:16] = (1).to_bytes(2, "little")
@@ -2065,7 +2071,7 @@ def test_active_fat_root_directory_lfns_are_validated_before_inventory(tmp_path:
         image[510:512] = b"\x55\xaa"
         if fat_bits == 12:
             image[sector_size:sector_size + 3] = b"\xf0\xff\xff"
-            for cluster in (2, 3, 4, 5):
+            for cluster in (2, 3, 4, 5, 6):
                 offset = sector_size + cluster + cluster // 2
                 packed = int.from_bytes(image[offset:offset + 2], "little")
                 if cluster & 1:
@@ -2075,7 +2081,7 @@ def test_active_fat_root_directory_lfns_are_validated_before_inventory(tmp_path:
                 image[offset:offset + 2] = packed.to_bytes(2, "little")
         else:
             image[sector_size:sector_size + 4] = b"\xf8\xff\xff\xff"
-            for cluster in (2, 3, 4, 5):
+            for cluster in (2, 3, 4, 5, 6):
                 offset = sector_size + cluster * 2
                 image[offset:offset + 2] = (0xFFFF).to_bytes(2, "little")
         write_root_entries(image, root_offset, (2, 3))
@@ -2087,6 +2093,8 @@ def test_active_fat_root_directory_lfns_are_validated_before_inventory(tmp_path:
         write_nested_entry(
             image, second_directory_offset, nested_invalid_short, nested_invalid_slot, 5,
         )
+        deep_directory_offset = (first_data_sector + 2) * sector_size
+        write_deep_file(image, deep_directory_offset, 6)
         path = tmp_path / f"fat{fat_bits}-root-directory-lfns.raw"
         path.write_bytes(image)
         values = _values(GenericTriageEngine().analyze(_artifact(path), path))
@@ -2098,6 +2106,20 @@ def test_active_fat_root_directory_lfns_are_validated_before_inventory(tmp_path:
         assert inventory[2]["lfn_slot_offsets"] == [first_directory_offset]
         assert inventory[2]["parent_cluster_lineage"] == [2]
         assert "long_name" not in inventory[3]
+        active_files = values[f"filesystem.fat{fat_bits}.root.recoverable_regular_files"]
+        deep_file = next(item for item in active_files if item["short_name"] == "DEEP.TXT")
+        assert deep_file["directory_identity_lineage"] == [
+            {
+                "short_name": "VALIDD~1", "long_name": "Valid Dir",
+                "source_entry_offset": root_offset + 32,
+                "lfn_slot_offsets": [root_offset], "start_cluster": 2,
+            },
+            {
+                "short_name": "NVALID~1", "long_name": "Valid Nested",
+                "source_entry_offset": first_directory_offset + 32,
+                "lfn_slot_offsets": [first_directory_offset], "start_cluster": 4,
+            },
+        ]
         assert values[f"filesystem.fat{fat_bits}.root.unlinked_lfn_slots"] == [
             {
                 "short_entry_index": 3,
@@ -2119,7 +2141,7 @@ def test_active_fat_root_directory_lfns_are_validated_before_inventory(tmp_path:
         ]
 
     fat32_first_data_sector = 2
-    fat32 = bytearray((fat32_first_data_sector + 5) * sector_size)
+    fat32 = bytearray((fat32_first_data_sector + 6) * sector_size)
     fat32[11:13] = sector_size.to_bytes(2, "little")
     fat32[13] = 1
     fat32[14:16] = (1).to_bytes(2, "little")
@@ -2130,7 +2152,7 @@ def test_active_fat_root_directory_lfns_are_validated_before_inventory(tmp_path:
     fat32[82:90] = b"FAT32   "
     fat32[510:512] = b"\x55\xaa"
     fat32[sector_size:sector_size + 8] = b"\xf8\xff\xff\x0f\xff\xff\xff\x0f"
-    for cluster in (2, 3, 4, 5, 6):
+    for cluster in (2, 3, 4, 5, 6, 7):
         offset = sector_size + cluster * 4
         fat32[offset:offset + 4] = (0x0FFFFFFF).to_bytes(4, "little")
     fat32_root_offset = fat32_first_data_sector * sector_size
@@ -2143,6 +2165,8 @@ def test_active_fat_root_directory_lfns_are_validated_before_inventory(tmp_path:
     write_nested_entry(
         fat32, fat32_second_directory_offset, nested_invalid_short, nested_invalid_slot, 6,
     )
+    fat32_deep_directory_offset = (fat32_first_data_sector + 3) * sector_size
+    write_deep_file(fat32, fat32_deep_directory_offset, 7)
     fat32_path = tmp_path / "fat32-root-directory-lfns.raw"
     fat32_path.write_bytes(fat32)
     fat32_values = _values(GenericTriageEngine().analyze(_artifact(fat32_path), fat32_path))
@@ -2154,6 +2178,20 @@ def test_active_fat_root_directory_lfns_are_validated_before_inventory(tmp_path:
     assert fat32_inventory[2]["lfn_slot_offsets"] == [fat32_first_directory_offset]
     assert fat32_inventory[2]["parent_cluster_lineage"] == [3]
     assert "long_name" not in fat32_inventory[3]
+    fat32_active_files = fat32_values["filesystem.fat.root.recoverable_regular_files"]
+    fat32_deep_file = next(item for item in fat32_active_files if item["short_name"] == "DEEP.TXT")
+    assert fat32_deep_file["directory_identity_lineage"] == [
+        {
+            "short_name": "VALIDD~1", "long_name": "Valid Dir",
+            "source_entry_offset": fat32_root_offset + 32,
+            "lfn_slot_offsets": [fat32_root_offset], "start_cluster": 3,
+        },
+        {
+            "short_name": "NVALID~1", "long_name": "Valid Nested",
+            "source_entry_offset": fat32_first_directory_offset + 32,
+            "lfn_slot_offsets": [fat32_first_directory_offset], "start_cluster": 5,
+        },
+    ]
     assert fat32_values["filesystem.fat.unlinked_lfn_slots"] == [
         {
             "short_entry_index": 3,
@@ -2318,6 +2356,11 @@ def test_fat32_active_subdirectory_is_bounded_but_deleted_directory_is_not_trave
     assert values["filesystem.fat.subdirectory_inventory"] == [{
         "name": "ACTIVE", "start_cluster": 5, "source_entry_offset": 1024,
         "parent_cluster_lineage": [],
+        "directory_identity_lineage": [{
+            "short_name": "ACTIVE", "long_name": None,
+            "source_entry_offset": 1024, "lfn_slot_offsets": None,
+            "start_cluster": 5,
+        }],
         "cluster_chain": [{
             "cluster": 5, "offset": 2560, "length": 512,
             "fat_entry_offset": 532, "fat_entry_raw": "ffffff0f",
@@ -2329,7 +2372,13 @@ def test_fat32_active_subdirectory_is_bounded_but_deleted_directory_is_not_trave
         "directory_start_cluster": 5, "directory_cluster_lineage": [5],
         "directory_source_entry_offset": 1024,
         "directory_short_name": "ACTIVE", "directory_long_name": None,
-        "directory_lfn_slot_offsets": None, "entry_index": 0,
+        "directory_lfn_slot_offsets": None,
+        "directory_identity_lineage": [{
+            "short_name": "ACTIVE", "long_name": None,
+            "source_entry_offset": 1024, "lfn_slot_offsets": None,
+            "start_cluster": 5,
+        }],
+        "entry_index": 0,
         "offset": 2560, "short_name": "?HILD.TXT", "first_character_unknown": True,
         "attributes": "0x20", "first_cluster": 8,
         "cluster_field_raw": "0x00000008", "fat32_cluster_high_reserved": 0,

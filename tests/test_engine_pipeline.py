@@ -1772,6 +1772,11 @@ def test_fat12_fixed_root_recovers_single_and_exact_packed_multicluster_chain(tm
     assert sub_deleted[0]["directory_short_name"] == "ACTIVE"
     assert sub_deleted[0]["directory_long_name"] == directory_long_name
     assert sub_deleted[0]["directory_lfn_slot_offsets"] == [directory_lfn_offset]
+    assert sub_deleted[0]["directory_identity_lineage"] == [{
+        "short_name": "ACTIVE", "long_name": directory_long_name,
+        "source_entry_offset": active_directory_offset,
+        "lfn_slot_offsets": [directory_lfn_offset], "start_cluster": 7,
+    }]
     assert sub_deleted[0]["offset"] == subdirectory_offset
     child = next(item for item in result.artifacts if item.logical_name == "?LAG.TXT")
     multi_child = next(item for item in result.artifacts if item.logical_name == "?ULTI.BIN")
@@ -1809,6 +1814,7 @@ def test_fat12_fixed_root_recovers_single_and_exact_packed_multicluster_chain(tm
     assert "directory_short_name:ACTIVE" in sub_evidence
     assert f"directory_long_name:{directory_long_name}" in sub_evidence
     assert f"directory_lfn_slot_offsets:[{directory_lfn_offset}]" in sub_evidence
+    assert "directory_identity_lineage:[{'short_name': 'ACTIVE', 'long_name': 'Evidence Dir'" in sub_evidence
 
     fat16_sized = bytearray(image)
     fat16_sized[19:21] = (5000).to_bytes(2, "little")
@@ -2235,6 +2241,11 @@ def test_fat32_noncontiguous_subdirectory_lfn_file_keeps_selected_fat_lineage(tm
     assert inventory == [{
         "name": "ACTIVE", "start_cluster": 5, "source_entry_offset": root_offset,
         "parent_cluster_lineage": [],
+        "directory_identity_lineage": [{
+            "short_name": "ACTIVE", "long_name": None,
+            "source_entry_offset": root_offset, "lfn_slot_offsets": None,
+            "start_cluster": 5,
+        }],
         "cluster_chain": [
             {
                 "cluster": 5, "offset": first_directory_offset, "length": sector_size,

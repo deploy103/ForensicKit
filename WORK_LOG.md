@@ -1,5 +1,17 @@
 # ForensicKit Work Log
 
+## 2026-09-05 01:28 KST
+
+### Bounded FAT ancestor directory identity lineage
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/extraction.py`, `tests/test_triage.py`, and `tests/test_engine_pipeline.py`.
+- FAT12/16/32 traversal queue records now carry up to 32 ordered validated directory identities. Each level retains its short name, optional validated LFN, source-entry offset, LFN-slot offsets, and starting cluster; nested active/deleted file records and all FAT recovery findings inherit the list without joining it into a speculative path.
+- Expanded the three-variant depth-two fixture with `DEEP.TXT`, proving two ordered directory identities survive into its record. The FAT12 Engine E2E also asserts the depth-one identity list through recursive deleted recovery evidence. Combined triage/Engine regression passed: 137 passed, 0 failed. The full direct synthetic suite passed: 298 passed, 0 failed; compileall and `git diff --check` passed.
+
+### Next
+
+- Make identity-lineage truncation explicit if a future/deep traversal reaches the 32-level cap, rather than silently slicing provenance.
+
 ## 2026-09-05 00:34 KST
 
 ### FAT nested-file containing-directory identity
