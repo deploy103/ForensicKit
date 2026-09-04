@@ -1433,6 +1433,83 @@ def test_fat32_root_deleted_short_entry_keeps_unknown_name_and_offset(tmp_path: 
     assert "?LAG.TXT" in finding.supporting_evidence[0]
 
 
+def test_fat32_fsinfo_and_backup_sectors_keep_signature_hint_and_divergence_provenance(tmp_path: Path) -> None:
+    sector_size = 512
+    reserved = 8
+    fat_size = 600
+    total_sectors = 70_000
+    first_data_sector = reserved + fat_size
+    image = bytearray((first_data_sector + 2) * sector_size)
+    image[11:13] = sector_size.to_bytes(2, "little")
+    image[13] = 1
+    image[14:16] = reserved.to_bytes(2, "little")
+    image[16] = 1
+    image[32:36] = total_sectors.to_bytes(4, "little")
+    image[36:40] = fat_size.to_bytes(4, "little")
+    image[44:48] = (2).to_bytes(4, "little")
+    image[48:50] = (1).to_bytes(2, "little")
+    image[50:52] = (6).to_bytes(2, "little")
+    image[82:90] = b"FAT32   "
+    image[510:512] = b"\x55\xaa"
+    image[reserved * sector_size + 8:reserved * sector_size + 12] = (0x0FFFFFFF).to_bytes(4, "little")
+
+    def fsinfo(sector: int, free_count: int, next_free: int) -> None:
+        offset = sector * sector_size
+        image[offset:offset + 4] = b"RRaA"
+        image[offset + 484:offset + 488] = b"rrAa"
+        image[offset + 488:offset + 492] = free_count.to_bytes(4, "little")
+        image[offset + 492:offset + 496] = next_free.to_bytes(4, "little")
+        image[offset + 508:offset + 512] = b"\x00\x00\x55\xaa"
+
+    fsinfo(1, 100, 5)
+    image[6 * sector_size:7 * sector_size] = image[:sector_size]
+    image[6 * sector_size + 67] ^= 0x5A
+    fsinfo(7, 101, 5)
+    evidence = tmp_path / "fat32-metadata.raw"
+    evidence.write_bytes(image)
+
+    observations = GenericTriageEngine().analyze(_artifact(evidence), evidence)
+    values = _values(observations)
+
+    assert values["filesystem.fat32.cluster_count"] == total_sectors - first_data_sector
+    assert values["filesystem.fat32.fat_entry_capacity"] == fat_size * sector_size // 4
+    primary = values["filesystem.fat32.fsinfo"]
+    assert primary["available"] is True and primary["valid"] is True
+    assert primary["offset"] == sector_size
+    assert primary["free_cluster_count"] == 100
+    assert primary["free_cluster_count_in_range"] is True
+    assert primary["next_free_cluster"] == 5
+    assert primary["next_free_cluster_in_range"] is True
+    backup_boot = values["filesystem.fat32.backup_boot"]
+    assert backup_boot["available"] is True
+    assert backup_boot["signature_valid"] is True
+    assert backup_boot["fat32_label_valid"] is True
+    assert backup_boot["primary_match"] is False
+    assert backup_boot["first_difference_offset"] == 67
+    backup_fsinfo = values["filesystem.fat32.backup_fsinfo"]
+    assert backup_fsinfo["available"] is True and backup_fsinfo["valid"] is True
+    assert backup_fsinfo["offset"] == 7 * sector_size
+    assert backup_fsinfo["primary_match"] is False
+    assert backup_fsinfo["first_difference_offset"] == 488
+    profile = ProfileEngine().evaluate(_artifact(evidence), observations)
+    categories = {item.category for item in profile.findings}
+    assert "fat32_fsinfo_inventory" in categories
+    assert "fat32_backup_boot_mismatch" in categories
+    assert "fat32_backup_fsinfo_mismatch" in categories
+
+    invalid_hints = bytearray(image)
+    invalid_hints[sector_size + 488:sector_size + 492] = (70_000).to_bytes(4, "little")
+    invalid_hints[sector_size + 492:sector_size + 496] = (1).to_bytes(4, "little")
+    invalid = tmp_path / "fat32-invalid-fsinfo.raw"
+    invalid.write_bytes(invalid_hints)
+    invalid_observations = GenericTriageEngine().analyze(_artifact(invalid), invalid)
+    invalid_values = _values(invalid_observations)
+    assert invalid_values["filesystem.fat32.fsinfo"]["free_cluster_count_in_range"] is False
+    assert invalid_values["filesystem.fat32.fsinfo"]["next_free_cluster_in_range"] is False
+    invalid_profile = ProfileEngine().evaluate(_artifact(invalid), invalid_observations)
+    assert any(item.category == "fat32_fsinfo_anomaly" for item in invalid_profile.findings)
+
+
 def test_fat32_deleted_lfn_chain_requires_checksum_and_terminal_validation(tmp_path: Path) -> None:
     image = bytearray(4096)
     image[11:13] = (512).to_bytes(2, "little")

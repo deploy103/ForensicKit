@@ -2079,6 +2079,11 @@ class GenericTriageEngine:
                 self._observation(artifact, "filesystem.fat.volume_label", (header[71:82] if fat32 else header[43:54]).decode("ascii", errors="replace").strip()),
             ))
             if fat32:
+                observations.extend(self._inspect_fat32_metadata_sectors(
+                    artifact, path, size, header, bytes_per_sector,
+                    sectors_per_cluster, int.from_bytes(header[14:16], "little"),
+                    header[16], int.from_bytes(header[36:40], "little"),
+                ))
                 observations.extend(self._inspect_fat32_root_directory(
                     artifact, path, size, header, bytes_per_sector,
                     sectors_per_cluster, int.from_bytes(header[14:16], "little"),
@@ -3979,6 +3984,161 @@ class GenericTriageEngine:
         if queue:
             errors.append(f"{variant} subdirectory traversal reached the 32-directory/64-cluster/8-MiB bound")
         return deleted, inventory, errors
+
+    def _inspect_fat32_metadata_sectors(
+        self,
+        artifact: Artifact,
+        path: Path,
+        image_size: int,
+        header: bytes,
+        bytes_per_sector: int,
+        sectors_per_cluster: int,
+        reserved_sectors: int,
+        fat_count: int,
+        fat_size: int,
+    ) -> list[Observation]:
+        """Validate FAT32 FSInfo and backup metadata without selecting a preferred copy."""
+        prefix = "filesystem.fat32"
+        total_sectors = (
+            int.from_bytes(header[19:21], "little")
+            or int.from_bytes(header[32:36], "little")
+        )
+        first_data_sector = reserved_sectors + fat_count * fat_size
+        data_sectors = total_sectors - first_data_sector
+        cluster_count = data_sectors // sectors_per_cluster if sectors_per_cluster else 0
+        fat_entry_capacity = fat_size * bytes_per_sector // 4 if bytes_per_sector else 0
+        geometry_valid = (
+            bytes_per_sector in {512, 1024, 2048, 4096}
+            and sectors_per_cluster > 0
+            and sectors_per_cluster & (sectors_per_cluster - 1) == 0
+            and reserved_sectors > 0 and 1 <= fat_count <= 4 and fat_size > 0
+            and total_sectors > first_data_sector and cluster_count >= 65_525
+            and fat_entry_capacity >= cluster_count + 2
+        )
+        fsinfo_sector = int.from_bytes(header[48:50], "little") if len(header) >= 52 else 0
+        backup_boot_sector = int.from_bytes(header[50:52], "little") if len(header) >= 52 else 0
+
+        def fsinfo_record(data: bytes, sector: int, offset: int) -> dict[str, object]:
+            free_raw = int.from_bytes(data[488:492], "little") if len(data) >= 512 else 0
+            next_raw = int.from_bytes(data[492:496], "little") if len(data) >= 512 else 0
+            free_count = None if free_raw == 0xFFFFFFFF else free_raw
+            next_free = None if next_raw == 0xFFFFFFFF else next_raw
+            lead = len(data) >= 512 and data[0:4] == b"RRaA"
+            structure = len(data) >= 512 and data[484:488] == b"rrAa"
+            trail = len(data) >= 512 and data[508:512] == b"\x00\x00\x55\xaa"
+            return {
+                "sector": sector, "offset": offset,
+                "lead_signature_valid": lead,
+                "structure_signature_valid": structure,
+                "trail_signature_valid": trail,
+                "valid": lead and structure and trail,
+                "free_cluster_count_raw": f"0x{free_raw:08X}",
+                "free_cluster_count": free_count,
+                "free_cluster_count_in_range": None if free_count is None else free_count <= cluster_count,
+                "next_free_cluster_raw": f"0x{next_raw:08X}",
+                "next_free_cluster": next_free,
+                "next_free_cluster_in_range": (
+                    None if next_free is None else 2 <= next_free < cluster_count + 2
+                ),
+            }
+
+        fsinfo: dict[str, object] = {
+            "available": False, "sector": fsinfo_sector,
+            "reason": "invalid FAT32 geometry or FSInfo sector outside reserved region",
+        }
+        backup_boot: dict[str, object] = {
+            "available": False, "sector": backup_boot_sector,
+            "reason": "invalid FAT32 geometry or backup boot sector outside reserved region",
+        }
+        backup_fsinfo: dict[str, object] = {
+            "available": False,
+            "sector": backup_boot_sector + fsinfo_sector,
+            "reason": "backup FSInfo sector outside reserved region",
+        }
+        try:
+            with path.open("rb") as stream:
+                if geometry_valid and 0 < fsinfo_sector < reserved_sectors:
+                    offset = fsinfo_sector * bytes_per_sector
+                    if offset + bytes_per_sector <= image_size:
+                        stream.seek(offset)
+                        data = stream.read(bytes_per_sector)
+                        if len(data) == bytes_per_sector:
+                            fsinfo = {"available": True, **fsinfo_record(data, fsinfo_sector, offset)}
+                        else:
+                            fsinfo["reason"] = "truncated FSInfo sector"
+                    else:
+                        fsinfo["reason"] = "FSInfo sector outside supplied image"
+                if geometry_valid and 0 < backup_boot_sector < reserved_sectors:
+                    offset = backup_boot_sector * bytes_per_sector
+                    if offset + bytes_per_sector <= image_size:
+                        stream.seek(0)
+                        primary = stream.read(bytes_per_sector)
+                        stream.seek(offset)
+                        data = stream.read(bytes_per_sector)
+                        if len(data) == bytes_per_sector:
+                            match = len(primary) == bytes_per_sector and primary == data
+                            difference = None
+                            if len(primary) == bytes_per_sector and not match:
+                                difference = next(
+                                    (index for index in range(bytes_per_sector) if primary[index] != data[index]),
+                                    None,
+                                )
+                            backup_boot = {
+                                "available": True, "sector": backup_boot_sector,
+                                "offset": offset,
+                                "signature_valid": data[510:512] == b"\x55\xaa",
+                                "fat32_label_valid": data[82:90].startswith(b"FAT"),
+                                "primary_match": match if len(primary) == bytes_per_sector else None,
+                                "first_difference_offset": difference,
+                            }
+                        else:
+                            backup_boot["reason"] = "truncated backup boot sector"
+                    else:
+                        backup_boot["reason"] = "backup boot sector outside supplied image"
+                backup_fsinfo_sector = backup_boot_sector + fsinfo_sector
+                if (
+                    geometry_valid and 0 < fsinfo_sector < reserved_sectors
+                    and 0 < backup_boot_sector < reserved_sectors
+                    and backup_fsinfo_sector < reserved_sectors
+                ):
+                    offset = backup_fsinfo_sector * bytes_per_sector
+                    if offset + bytes_per_sector <= image_size:
+                        stream.seek(offset)
+                        data = stream.read(bytes_per_sector)
+                        if len(data) == bytes_per_sector:
+                            backup_fsinfo = {
+                                "available": True,
+                                **fsinfo_record(data, backup_fsinfo_sector, offset),
+                            }
+                            if fsinfo.get("available"):
+                                primary_offset = fsinfo_sector * bytes_per_sector
+                                stream.seek(primary_offset)
+                                primary_data = stream.read(bytes_per_sector)
+                                match = len(primary_data) == bytes_per_sector and primary_data == data
+                                difference = None
+                                if len(primary_data) == bytes_per_sector and not match:
+                                    difference = next(
+                                        (index for index in range(bytes_per_sector) if primary_data[index] != data[index]),
+                                        None,
+                                    )
+                                backup_fsinfo["primary_match"] = match
+                                backup_fsinfo["first_difference_offset"] = difference
+                        else:
+                            backup_fsinfo["reason"] = "truncated backup FSInfo sector"
+                    else:
+                        backup_fsinfo["reason"] = "backup FSInfo sector outside supplied image"
+        except OSError as exc:
+            error = str(exc)[:2_000]
+            fsinfo.setdefault("error", error)
+            backup_boot.setdefault("error", error)
+            backup_fsinfo.setdefault("error", error)
+        return [
+            self._observation(artifact, f"{prefix}.cluster_count", cluster_count),
+            self._observation(artifact, f"{prefix}.fat_entry_capacity", fat_entry_capacity),
+            self._observation(artifact, f"{prefix}.fsinfo", fsinfo),
+            self._observation(artifact, f"{prefix}.backup_boot", backup_boot),
+            self._observation(artifact, f"{prefix}.backup_fsinfo", backup_fsinfo),
+        ]
 
     def _inspect_fat32_root_directory(
         self,

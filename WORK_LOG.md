@@ -1,5 +1,19 @@
 # ForensicKit Work Log
 
+## 2026-09-04 22:19 KST
+
+### FAT32 FSInfo and backup metadata validation
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/profiles/disk.py`, and `tests/test_triage.py`.
+- FAT32 metadata parsing now requires a BPB-derived FAT32 cluster count, sufficient 32-bit FAT capacity, and FSInfo/backup sector references wholly inside the reserved region and supplied image. The primary FSInfo lead/structure/trail signatures and free-count/next-free hints are validated and range-checked without treating hints as authoritative allocation state.
+- The BPB-referenced backup boot sector is read independently and compared byte-for-byte with a newly read full primary sector; signature/label status, exact offset, match state, and first differing byte are retained. The conventional backup FSInfo sector at `backup boot + FSInfo` is independently parsed and compared likewise, without selecting a preferred copy.
+- Added a 70,000-sector synthetic geometry with an image-bounded metadata prefix. It proves valid primary/backup signatures, a boot difference at byte 67, an FSInfo free-count difference at byte 488, valid hint bounds, and profile findings; an out-of-range free count/next-free pair produces a separate anomaly.
+- Verified `python -m compileall -q src tests scripts`, all 86 focused triage regressions, and the full direct synthetic suite: 288 passed, 0 failed. `git diff --check` also passed.
+
+### Next
+
+- Compare FAT12/16 duplicate FAT copies under declared table/image bounds and retain exact divergence provenance without treating either as authoritative.
+
 ## 2026-09-04 22:13 KST
 
 ### Active FAT12 subdirectory traversal

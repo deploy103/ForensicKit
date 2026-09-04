@@ -13,6 +13,7 @@ Notable user-facing changes are documented here. This project follows Semantic V
 - Bounded active FAT16 subdirectory traversal with complete-chain gating and deleted-child directory lineage.
 - Strict FAT12 fixed-root classification, deleted-entry inventory, and recursive recovery through direct or correctly packed exact-EOC chains.
 - Bounded active FAT12 subdirectory traversal with packed-chain provenance, shared-cluster protection, and deleted-child recursion.
+- FAT32 FSInfo, backup boot, and backup FSInfo validation with range-checked hints and exact divergence offsets.
 
 ## [1.1.0] - 2026-09-04
 

@@ -1,10 +1,10 @@
 # ForensicKit Work Queue
 
-Last reviewed: 2026-09-04 22:13 KST
+Last reviewed: 2026-09-04 22:19 KST
 
 ## Post-v1.1 backlog
 
-- [ ] Validate FAT32 FSInfo and backup boot sectors with exact signature, bounds, free-count/next-free, and divergence provenance.
+- [ ] Validate FAT12/16 duplicate FAT copies and retain exact first-divergence offsets without selecting an authoritative table.
 
 ## v1.1.0 release gate
 
@@ -23,6 +23,7 @@ Last reviewed: 2026-09-04 22:13 KST
 - [x] Active FAT16 subdirectory exact-chain traversal and deleted-child recursive recovery with directory lineage.
 - [x] FAT12 fixed-root inventory and direct/exact packed-chain deleted-file recursion.
 - [x] Active FAT12 subdirectory packed-chain traversal and deleted-child recursive recovery with directory lineage.
+- [x] FAT32 FSInfo/backup boot/backup FSInfo signatures, hint ranges, and exact divergence provenance.
 - [x] Shared bounded ext inode mapper for direct blocks and depth-zero/depth-one extent trees.
 - [x] Depth-one extent-index/leaf/data provenance, repeated-leaf protection, and recursive Engine flag E2E.
 - [x] Bounded active ext subdirectory traversal and recursively recoverable regular-file children with inode/directory/block lineage.
