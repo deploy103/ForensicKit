@@ -1618,6 +1618,99 @@ def test_fat12_and_fat16_duplicate_tables_preserve_match_divergence_and_truncati
     assert any(item.category == "fat16_fat_copy_anomaly" for item in truncated_profile.findings)
 
 
+def test_fat_bpb_relationship_validation_is_variant_specific_and_image_length_neutral(tmp_path: Path) -> None:
+    sector_size = 512
+    fixtures: list[tuple[int, bytearray]] = []
+
+    fat12 = bytearray(4 * sector_size)
+    fat12[:3] = b"\xeb\x3c\x90"
+    fat12[11:13] = sector_size.to_bytes(2, "little")
+    fat12[13] = 1
+    fat12[14:16] = (1).to_bytes(2, "little")
+    fat12[16] = 1
+    fat12[17:19] = (16).to_bytes(2, "little")
+    fat12[19:21] = (100).to_bytes(2, "little")
+    fat12[21] = 0xF0
+    fat12[22:24] = (1).to_bytes(2, "little")
+    fat12[54:62] = b"FAT12   "
+    fat12[510:512] = b"\x55\xaa"
+    fat12[sector_size:sector_size + 3] = b"\xf0\xff\xff"
+    fixtures.append((12, fat12))
+
+    fat16_size = 17
+    fat16 = bytearray(20 * sector_size)
+    fat16[:3] = b"\xeb\x3c\x90"
+    fat16[11:13] = sector_size.to_bytes(2, "little")
+    fat16[13] = 1
+    fat16[14:16] = (1).to_bytes(2, "little")
+    fat16[16] = 1
+    fat16[17:19] = (16).to_bytes(2, "little")
+    fat16[19:21] = (4_119).to_bytes(2, "little")
+    fat16[21] = 0xF8
+    fat16[22:24] = fat16_size.to_bytes(2, "little")
+    fat16[54:62] = b"FAT16   "
+    fat16[510:512] = b"\x55\xaa"
+    fat16[sector_size:sector_size + 4] = b"\xf8\xff\xff\xff"
+    fixtures.append((16, fat16))
+
+    fat32_size = 600
+    first_data_sector = 1 + fat32_size
+    fat32 = bytearray((first_data_sector + 1) * sector_size)
+    fat32[:3] = b"\xeb\x58\x90"
+    fat32[11:13] = sector_size.to_bytes(2, "little")
+    fat32[13] = 1
+    fat32[14:16] = (1).to_bytes(2, "little")
+    fat32[16] = 1
+    fat32[21] = 0xF8
+    fat32[32:36] = (70_000).to_bytes(4, "little")
+    fat32[36:40] = fat32_size.to_bytes(4, "little")
+    fat32[44:48] = (2).to_bytes(4, "little")
+    fat32[82:90] = b"FAT32   "
+    fat32[510:512] = b"\x55\xaa"
+    fat32[sector_size:sector_size + 8] = b"\xf8\xff\xff\x0f\xff\xff\xff\x0f"
+    fat32[sector_size + 8:sector_size + 12] = (0x0FFFFFFF).to_bytes(4, "little")
+    fixtures.append((32, fat32))
+
+    for fat_bits, image in fixtures:
+        path = tmp_path / f"fat{fat_bits}-valid-bpb.raw"
+        path.write_bytes(image)
+        artifact = _artifact(path)
+        observations = GenericTriageEngine().analyze(artifact, path)
+        validation = _values(observations)["filesystem.fat.bpb_validation"]
+        assert validation["fat_bits"] == fat_bits
+        assert validation["valid"] is True
+        assert validation["failed_checks"] == []
+        assert validation["declared_volume_within_supplied_image"] is False
+        profile = ProfileEngine().evaluate(artifact, observations)
+        assert not any(item.category == "fat_bpb_structure_anomaly" for item in profile.findings)
+
+    malformed = bytearray(fat32)
+    malformed[:3] = b"\xeb\x01\x00"
+    malformed[17:19] = (16).to_bytes(2, "little")
+    malformed[19:21] = (10).to_bytes(2, "little")
+    malformed[22:24] = (1).to_bytes(2, "little")
+    malformed[42:44] = (1).to_bytes(2, "little")
+    malformed[52] = 1
+    malformed_path = tmp_path / "fat32-invalid-bpb.raw"
+    malformed_path.write_bytes(malformed)
+    malformed_artifact = _artifact(malformed_path)
+    malformed_observations = GenericTriageEngine().analyze(malformed_artifact, malformed_path)
+    malformed_validation = _values(malformed_observations)["filesystem.fat.bpb_validation"]
+    assert malformed_validation["valid"] is False
+    assert {
+        "jump_instruction_valid", "total_sector_fields_valid", "fat_size_fields_valid",
+        "root_entry_count_valid", "cluster_count_matches_variant",
+        "fat32_fs_version_valid", "fat32_reserved_bpb_bytes_zero",
+    } <= set(malformed_validation["failed_checks"])
+    malformed_profile = ProfileEngine().evaluate(malformed_artifact, malformed_observations)
+    finding = next(
+        item for item in malformed_profile.findings
+        if item.category == "fat_bpb_structure_anomaly"
+    )
+    assert "jump_instruction_valid" in finding.supporting_evidence[0]
+    assert "fat32_reserved_bpb_bytes_zero" in finding.supporting_evidence[0]
+
+
 def test_fat32_extflags_control_copy_consistency_and_active_chain_traversal(tmp_path: Path) -> None:
     sector_size = 512
     reserved = 1

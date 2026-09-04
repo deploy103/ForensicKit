@@ -2078,6 +2078,19 @@ class GenericTriageEngine:
                 self._observation(artifact, "filesystem.fat.size_sectors", int.from_bytes(header[36:40], "little") if fat32 else fat_size_16),
                 self._observation(artifact, "filesystem.fat.volume_label", (header[71:82] if fat32 else header[43:54]).decode("ascii", errors="replace").strip()),
             ))
+            fat_bits = 32 if fat32 else 16 if fat16 else 12 if fat12 else 0
+            if fat_bits:
+                fat_boot_sector = header
+                if size >= 512 and len(fat_boot_sector) < 512:
+                    try:
+                        with path.open("rb") as stream:
+                            fat_boot_sector = stream.read(512)
+                    except OSError:
+                        pass
+                observations.append(self._observation(
+                    artifact, "filesystem.fat.bpb_validation",
+                    self._fat_bpb_validation(fat_boot_sector, size, fat_bits),
+                ))
             if fat32:
                 observations.extend(self._inspect_fat_duplicate_tables(
                     artifact, path, size, header, bytes_per_sector,
@@ -2134,6 +2147,115 @@ class GenericTriageEngine:
                 artifact, path, size, ext_superblock,
             ))
         return observations
+
+    @staticmethod
+    def _fat_bpb_validation(header: bytes, image_size: int, fat_bits: int) -> dict[str, object]:
+        """Validate format-specific FAT BPB relationships without reading evidence content."""
+        bytes_per_sector = int.from_bytes(header[11:13], "little")
+        sectors_per_cluster = header[13] if len(header) > 13 else 0
+        reserved_sectors = int.from_bytes(header[14:16], "little")
+        fat_count = header[16] if len(header) > 16 else 0
+        root_entries = int.from_bytes(header[17:19], "little")
+        total_sectors_16 = int.from_bytes(header[19:21], "little")
+        media_descriptor = header[21] if len(header) > 21 else 0
+        fat_size_16 = int.from_bytes(header[22:24], "little")
+        total_sectors_32 = int.from_bytes(header[32:36], "little")
+        fat_size_32 = int.from_bytes(header[36:40], "little")
+        total_sectors = total_sectors_16 or total_sectors_32
+        fat_size = fat_size_32 if fat_bits == 32 else fat_size_16
+        root_sectors = (
+            (root_entries * 32 + bytes_per_sector - 1) // bytes_per_sector
+            if bytes_per_sector else 0
+        )
+        first_data_sector = reserved_sectors + fat_count * fat_size + root_sectors
+        data_sectors = total_sectors - first_data_sector
+        cluster_count = data_sectors // sectors_per_cluster if sectors_per_cluster and data_sectors > 0 else 0
+
+        jump_opcode = header[0] if header else 0
+        jump_target: int | None = None
+        jump_encoding = "unknown"
+        jump_valid = False
+        if jump_opcode == 0xEB and len(header) >= 3:
+            jump_encoding = "short"
+            jump_target = 2 + int.from_bytes(header[1:2], "little", signed=True)
+            jump_valid = header[2] == 0x90 and 3 <= jump_target < 510
+        elif jump_opcode == 0xE9 and len(header) >= 3:
+            jump_encoding = "near"
+            jump_target = 3 + int.from_bytes(header[1:3], "little", signed=True)
+            jump_valid = 3 <= jump_target < 510
+
+        total_fields_valid = (
+            total_sectors > 0
+            and not (total_sectors_16 and total_sectors_32)
+            and (fat_bits != 32 or total_sectors_16 == 0)
+        )
+        root_bytes_aligned = (
+            bytes_per_sector > 0 and root_entries * 32 % bytes_per_sector == 0
+        )
+        if fat_bits == 32:
+            fat_size_fields_valid = fat_size_16 == 0 and fat_size_32 > 0
+            root_entry_count_valid = root_entries == 0
+            cluster_class_valid = cluster_count >= 65_525
+            fs_version_valid = int.from_bytes(header[42:44], "little") == 0
+            reserved_bpb_bytes_zero = header[52:64] == b"\x00" * 12
+        else:
+            fat_size_fields_valid = fat_size_16 > 0
+            root_entry_count_valid = root_entries > 0 and root_bytes_aligned
+            cluster_class_valid = (
+                0 < cluster_count < 4_085
+                if fat_bits == 12 else 4_085 <= cluster_count < 65_525
+            )
+            fs_version_valid = True
+            reserved_bpb_bytes_zero = True
+        checks = {
+            "jump_instruction_valid": jump_valid,
+            "end_marker_valid": header[510:512] == b"\x55\xaa",
+            "bytes_per_sector_valid": bytes_per_sector in {512, 1024, 2048, 4096},
+            "sectors_per_cluster_valid": (
+                0 < sectors_per_cluster <= 128
+                and sectors_per_cluster & (sectors_per_cluster - 1) == 0
+            ),
+            "reserved_sector_count_valid": reserved_sectors > 0,
+            "fat_count_valid": 1 <= fat_count <= 4,
+            "media_descriptor_valid": media_descriptor == 0xF0 or 0xF8 <= media_descriptor <= 0xFF,
+            "total_sector_fields_valid": total_fields_valid,
+            "fat_size_fields_valid": fat_size_fields_valid,
+            "root_entry_count_valid": root_entry_count_valid,
+            "data_region_nonempty": total_sectors > first_data_sector,
+            "cluster_count_matches_variant": cluster_class_valid,
+            "fat32_fs_version_valid": fs_version_valid,
+            "fat32_reserved_bpb_bytes_zero": reserved_bpb_bytes_zero,
+        }
+        declared_volume_bytes = (
+            total_sectors * bytes_per_sector if total_sectors and bytes_per_sector else 0
+        )
+        return {
+            "available": len(header) >= 512,
+            "fat_bits": fat_bits,
+            "valid": all(checks.values()),
+            "failed_checks": [name for name, valid in checks.items() if not valid],
+            "checks": checks,
+            "jump_opcode": f"0x{jump_opcode:02X}",
+            "jump_encoding": jump_encoding,
+            "jump_target_offset": jump_target,
+            "bytes_per_sector": bytes_per_sector,
+            "sectors_per_cluster": sectors_per_cluster,
+            "reserved_sector_count": reserved_sectors,
+            "fat_count": fat_count,
+            "root_entry_count": root_entries,
+            "root_directory_bytes_aligned": root_bytes_aligned if fat_bits != 32 else None,
+            "total_sectors_16": total_sectors_16,
+            "total_sectors_32": total_sectors_32,
+            "selected_total_sectors": total_sectors,
+            "fat_size_16": fat_size_16,
+            "fat_size_32": fat_size_32 if fat_bits == 32 else None,
+            "selected_fat_size_sectors": fat_size,
+            "first_data_sector": first_data_sector,
+            "data_sectors": data_sectors,
+            "cluster_count": cluster_count,
+            "declared_volume_bytes": declared_volume_bytes,
+            "declared_volume_within_supplied_image": declared_volume_bytes <= image_size,
+        }
 
     def _inspect_ext_root_directory(
         self, artifact: Artifact, path: Path, image_size: int, superblock: bytes

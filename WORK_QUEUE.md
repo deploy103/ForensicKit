@@ -1,10 +1,10 @@
 # ForensicKit Work Queue
 
-Last reviewed: 2026-09-05 01:28 KST
+Last reviewed: 2026-09-05 01:42 KST
 
 ## Post-v1.1 backlog
 
-- [ ] Add explicit truncation provenance when a FAT directory identity chain reaches the 32-level bound.
+- [ ] Identify FAT12/16/32 from validated BPB cluster-count geometry when the textual type label is absent or ambiguous, while retaining label/structure disagreement provenance.
 
 ## v1.1.0 release gate
 
@@ -42,6 +42,8 @@ Last reviewed: 2026-09-05 01:28 KST
 - [x] Nested active FAT12/16/32 directory LFN inventory enrichment and invalid-chain provenance.
 - [x] Immediate containing-directory short/LFN identity in nested FAT file records and recursive recovery findings.
 - [x] Bounded ordered ancestor directory identity lineage for nested FAT records and recovery findings.
+- [x] Audited FAT identity-lineage bounds: no emitted record can silently exceed 32 identities because native traversal itself stops after 32 processed directories.
+- [x] Variant-specific FAT12/16/32 BPB relationship validation with raw-derived checks and a dedicated structural-anomaly finding.
 - [x] Shared bounded ext inode mapper for direct blocks and depth-zero/depth-one extent trees.
 - [x] Depth-one extent-index/leaf/data provenance, repeated-leaf protection, and recursive Engine flag E2E.
 - [x] Bounded active ext subdirectory traversal and recursively recoverable regular-file children with inode/directory/block lineage.

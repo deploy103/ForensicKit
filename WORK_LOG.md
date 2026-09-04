@@ -1,5 +1,18 @@
 # ForensicKit Work Log
 
+## 2026-09-05 01:42 KST
+
+### Variant-specific FAT BPB relationship validation
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/profiles/disk.py`, and `tests/test_triage.py`.
+- FAT12/16/32-labelled volume boot sectors now receive a bounded 512-byte BPB audit covering the encoded jump and target, `55 AA` marker, sector/cluster geometry, reserved/FAT/media fields, mutually exclusive total-sector fields, variant-specific FAT-size and root-directory relationships, nonempty data region, cluster-count class, and FAT32 FS version/reserved bytes. Every derived field and failed check remains in `filesystem.fat.bpb_validation`; malformed structures produce a dedicated `fat_bpb_structure_anomaly` finding.
+- Declared volume length is retained separately from structure validity, so a short supplied image does not turn an otherwise internally consistent BPB into a false structural verdict. Valid FAT12/16/32 and malformed FAT32 focused regression passed: 93 passed, 0 failed. The full direct synthetic suite passed: 299 passed, 0 failed; compileall and `git diff --check` passed.
+- Audited the preceding directory-identity lineage cap: native traversal processes at most 32 directories, so an emitted file/recovery record cannot reach a silently sliced 33rd identity. The unreachable follow-on queue state needs no fabricated truncation flag.
+
+### Next
+
+- Derive a bounded FAT variant candidate from BPB cluster-count geometry when a textual type label is absent or ambiguous, preserving any label/structure disagreement rather than trusting either source silently.
+
 ## 2026-09-05 01:28 KST
 
 ### Bounded FAT ancestor directory identity lineage
