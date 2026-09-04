@@ -2224,6 +2224,161 @@ class ExtractionManager:
             ))
         return result
 
+    def extract_fat_lost_chains(self, artifact: Artifact) -> ExtractionResult:
+        """Materialize only complete image-bounded anonymous FAT lost chains."""
+        result = ExtractionResult()
+        values = {
+            observation.key: observation.value
+            for observation in self.workspace.database.observations(artifact.id)
+        }
+        variant = values.get("filesystem.fat.variant")
+        fat_bits = 12 if variant == "fat12" else 16 if variant == "fat16" else 32 if variant == "fat32" else 0
+        inventory = values.get(f"filesystem.fat{fat_bits}.lost_chains") if fat_bits else None
+        if not isinstance(inventory, dict) or inventory.get("available") is not True:
+            return result
+        chains = inventory.get("chains")
+        bytes_per_sector = values.get("filesystem.fat.bytes_per_sector")
+        sectors_per_cluster = values.get("filesystem.fat.sectors_per_cluster")
+        if (
+            not isinstance(chains, list) or not chains
+            or not isinstance(bytes_per_sector, int) or bytes_per_sector not in {512, 1024, 2048, 4096}
+            or not isinstance(sectors_per_cluster, int) or sectors_per_cluster <= 0
+            or sectors_per_cluster & (sectors_per_cluster - 1)
+        ):
+            return result
+        cluster_size = bytes_per_sector * sectors_per_cluster
+        if not 0 < cluster_size <= 2 * 1024 * 1024:
+            return result
+        deleted_starts: set[int] = set()
+        for key in (
+            "filesystem.fat.deleted_short_entries",
+            "filesystem.fat.subdirectory_deleted_entries",
+            f"filesystem.fat{fat_bits}.root.deleted_entries",
+            f"filesystem.fat{fat_bits}.root.subdirectory_deleted_entries",
+        ):
+            entries = values.get(key)
+            if not isinstance(entries, list):
+                continue
+            deleted_starts.update(
+                entry["first_cluster"] for entry in entries
+                if isinstance(entry, dict) and isinstance(entry.get("first_cluster"), int)
+            )
+        source = self.workspace.resolve_stored_path(artifact.path)
+        target_root = self.workspace.path(
+            "extracted", artifact.id, f"builtin_fat{fat_bits}_lost_chains",
+        )
+        evidence: list[str] = []
+        skipped_deleted_starts: list[int] = []
+        total_candidate_bytes = 0
+        try:
+            source_stream = source.open("rb")
+        except OSError as exc:
+            result.errors.append(f"FAT{fat_bits} lost-chain source open failed: {exc}")
+            return result
+        with source_stream:
+            for chain_index, candidate in enumerate(chains[:32]):
+                if not isinstance(candidate, dict) or candidate.get("complete_eoc_chain") is not True:
+                    continue
+                start_cluster = candidate.get("start_cluster")
+                segments = candidate.get("cluster_chain")
+                if not isinstance(start_cluster, int) or start_cluster in deleted_starts:
+                    if isinstance(start_cluster, int) and start_cluster in deleted_starts:
+                        skipped_deleted_starts.append(start_cluster)
+                    continue
+                if not isinstance(segments, list) or not 1 <= len(segments) <= 64:
+                    continue
+                normalized: list[dict[str, object]] = []
+                valid = True
+                for segment_index, segment in enumerate(segments):
+                    if not isinstance(segment, dict):
+                        valid = False
+                        break
+                    cluster = segment.get("cluster")
+                    data_offset = segment.get("data_offset")
+                    data_length = segment.get("data_length")
+                    next_cluster = segment.get("next_cluster")
+                    if (
+                        not isinstance(cluster, int) or cluster < 2
+                        or not isinstance(data_offset, int) or data_offset < 0
+                        or data_length != cluster_size
+                        or data_offset + cluster_size > artifact.size
+                        or segment.get("data_within_supplied_image") is not True
+                        or not isinstance(next_cluster, int)
+                        or any(item.get("cluster") == cluster for item in normalized)
+                    ):
+                        valid = False
+                        break
+                    if segment_index + 1 < len(segments):
+                        following = segments[segment_index + 1]
+                        if not isinstance(following, dict) or following.get("cluster") != next_cluster:
+                            valid = False
+                            break
+                    normalized.append(dict(segment))
+                eoc_minimum = 0xFF8 if fat_bits == 12 else 0xFFF8 if fat_bits == 16 else 0x0FFFFFF8
+                if (
+                    not valid or len(normalized) != len(segments)
+                    or normalized[0].get("cluster") != start_cluster
+                    or not isinstance(normalized[-1].get("next_cluster"), int)
+                    or int(normalized[-1]["next_cluster"]) < eoc_minimum
+                ):
+                    continue
+                size = len(normalized) * cluster_size
+                if size > 8 * 1024 * 1024 or total_candidate_bytes + size > 8 * 1024 * 1024:
+                    result.errors.append(
+                        f"skipped FAT{fat_bits} lost chain {start_cluster}: 8-MiB lost-chain extraction bound"
+                    )
+                    continue
+                reason = self.can_register(artifact, size)
+                if reason:
+                    result.errors.append(f"skipped FAT{fat_bits} lost chain {start_cluster}: {reason}")
+                    continue
+                logical_name = f"FAT{fat_bits}_LOST_CHAIN_{start_cluster:08d}.bin"
+                output = target_root / f"chain_{chain_index:04d}_cluster_{start_cluster:08d}.bin"
+                output.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    with output.open("xb") as writer:
+                        for segment in normalized:
+                            source_stream.seek(int(segment["data_offset"]))
+                            payload = source_stream.read(cluster_size)
+                            if len(payload) != cluster_size:
+                                raise RuntimeError("mapped lost-chain cluster is truncated")
+                            writer.write(payload)
+                except (OSError, RuntimeError) as exc:
+                    output.unlink(missing_ok=True)
+                    result.errors.append(f"failed FAT{fat_bits} lost chain {start_cluster}: {exc}")
+                    continue
+                child = self.register_file(output, artifact, logical_name)
+                if child is None:
+                    result.errors.append(
+                        f"skipped FAT{fat_bits} lost chain {start_cluster}: duplicate or extraction limit"
+                    )
+                    continue
+                result.artifacts.append(child)
+                result.extracted_bytes += child.size
+                total_candidate_bytes += child.size
+                evidence.append(
+                    f"child:{child.id};variant:FAT{fat_bits};start_cluster:{start_cluster};"
+                    f"size:{child.size};cluster_chain:{normalized};termination:eoc;"
+                    "logical_size:unknown_full_clusters_include_final_cluster_slack;"
+                    "directory_ownership:not_inferred;source_scope:bounded_validated_active_entries"
+                )
+        if result.artifacts:
+            result.findings.append(Finding(
+                artifact_id=artifact.id,
+                title=f"Materialized {len(result.artifacts)} anonymous FAT{fat_bits} lost-chain candidate(s)",
+                category=f"fat{fat_bits}_lost_chain_recovery", severity="info", confidence=0.64,
+                explanation=(
+                    "Only EOC-terminated candidates with every recorded full cluster inside the immutable image were copied under artifact/count and an additional 8-MiB total bound. "
+                    "No filename or logical length is known, so each anonymous child includes the entire final cluster (possibly slack) and remains a recursive forensic lead rather than proof of deletion or ownership."
+                ),
+                source=f"builtin_fat{fat_bits}_lost_chain_extractor",
+                supporting_evidence=[
+                    *evidence[:128],
+                    f"skipped_candidate_starts_with_deleted_entry_metadata:{sorted(set(skipped_deleted_starts))[:128]}",
+                ],
+            ))
+        return result
+
     @staticmethod
     def _write_zeros(writer, length: int) -> None:
         """Write an already-budgeted logical zero range without a large allocation."""
@@ -2243,15 +2398,20 @@ class ExtractionManager:
         ntfs_result.extracted_bytes += ntfs_nonresident.extracted_bytes
         if ntfs_result.artifacts or ntfs_result.errors:
             return ntfs_result
-        fat_result = self.extract_fat32_deleted_single_cluster(artifact)
-        if fat_result.artifacts or fat_result.errors:
-            return fat_result
-        fat16_result = self.extract_fat16_deleted_files(artifact)
-        if fat16_result.artifacts or fat16_result.errors:
-            return fat16_result
-        fat12_result = self.extract_fat12_deleted_files(artifact)
-        if fat12_result.artifacts or fat12_result.errors:
-            return fat12_result
+        fat_results = (
+            self.extract_fat32_deleted_single_cluster(artifact),
+            self.extract_fat16_deleted_files(artifact),
+            self.extract_fat12_deleted_files(artifact),
+            self.extract_fat_lost_chains(artifact),
+        )
+        combined_fat_result = ExtractionResult()
+        for fat_result in fat_results:
+            combined_fat_result.artifacts.extend(fat_result.artifacts)
+            combined_fat_result.findings.extend(fat_result.findings)
+            combined_fat_result.errors.extend(fat_result.errors)
+            combined_fat_result.extracted_bytes += fat_result.extracted_bytes
+        if combined_fat_result.artifacts or combined_fat_result.errors:
+            return combined_fat_result
         exfat_result = self.extract_exfat_deleted_contiguous(artifact)
         if exfat_result.artifacts or exfat_result.errors:
             return exfat_result

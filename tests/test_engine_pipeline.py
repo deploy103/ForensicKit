@@ -1809,6 +1809,76 @@ def test_fat12_fixed_root_recovers_single_and_exact_packed_multicluster_chain(tm
     )
 
 
+def test_fat12_complete_lost_chain_becomes_anonymous_recursive_flag_artifact(tmp_path: Path) -> None:
+    sector_size = 512
+    first_data_sector = 3
+    image = bytearray(12 * sector_size)
+    image[11:13] = sector_size.to_bytes(2, "little")
+    image[13] = 1
+    image[14:16] = (1).to_bytes(2, "little")
+    image[16] = 1
+    image[17:19] = (16).to_bytes(2, "little")
+    image[19:21] = (100).to_bytes(2, "little")
+    image[21] = 0xF0
+    image[22:24] = (1).to_bytes(2, "little")
+    image[54:62] = b"FAT12   "
+    image[510:512] = b"\x55\xaa"
+    image[sector_size:sector_size + 3] = b"\xf0\xff\xff"
+
+    def set_fat12(cluster: int, value: int) -> None:
+        offset = sector_size + cluster + cluster // 2
+        packed = int.from_bytes(image[offset:offset + 2], "little")
+        if cluster & 1:
+            packed = (packed & 0x000F) | ((value & 0x0FFF) << 4)
+        else:
+            packed = (packed & 0xF000) | (value & 0x0FFF)
+        image[offset:offset + 2] = packed.to_bytes(2, "little")
+
+    set_fat12(5, 0xFFF)
+    set_fat12(7, 8)
+    set_fat12(8, 0xFFF)
+    root_offset = 2 * sector_size
+    image[root_offset:root_offset + 11] = b"ACTIVE  TXT"
+    image[root_offset + 11] = 0x20
+    image[root_offset + 26:root_offset + 28] = (5).to_bytes(2, "little")
+    image[root_offset + 28:root_offset + 32] = (20).to_bytes(4, "little")
+    lost_payload = b"L" * sector_size + b"CTF{fat12_lost_chain_recursive}"
+    first_lost_offset = (first_data_sector + 5) * sector_size
+    second_lost_offset = (first_data_sector + 6) * sector_size
+    image[first_lost_offset:first_lost_offset + sector_size] = lost_payload[:sector_size]
+    image[second_lost_offset:second_lost_offset + len(lost_payload) - sector_size] = lost_payload[sector_size:]
+    evidence = tmp_path / "fat12-lost-chain.raw"
+    evidence.write_bytes(image)
+
+    result = AnalysisEngine().analyze(
+        evidence, tmp_path / "fat12-lost-cases", mode=AnalysisMode.AUTO, execute=False,
+    )
+
+    child = next(
+        item for item in result.artifacts
+        if item.logical_name == "FAT12_LOST_CHAIN_00000007.bin"
+    )
+    assert child.parent_id == result.root_artifact.id
+    assert child.depth == 1
+    assert child.size == 2 * sector_size
+    assert any(
+        item.value == "CTF{fat12_lost_chain_recursive}" and item.artifact_id == child.id
+        for item in result.flags
+    )
+    finding = next(
+        item for item in result.findings if item.category == "fat12_lost_chain_recovery"
+    )
+    assert finding.source == "builtin_fat12_lost_chain_extractor"
+    assert f"child:{child.id}" in finding.supporting_evidence[0]
+    assert "start_cluster:7" in finding.supporting_evidence[0]
+    assert f"'data_offset': {first_lost_offset}" in finding.supporting_evidence[0]
+    assert f"'data_offset': {second_lost_offset}" in finding.supporting_evidence[0]
+    assert "logical_size:unknown_full_clusters_include_final_cluster_slack" in finding.supporting_evidence[0]
+    report = Path(result.case.workspace, "reports", "report.json").read_text(encoding="utf-8")
+    assert "FAT12_LOST_CHAIN_00000007.bin" in report
+    assert "CTF{fat12_lost_chain_recursive}" in report
+
+
 def test_recycle_bin_exact_supplied_content_pair_is_correlated(tmp_path: Path) -> None:
     bundle = tmp_path / "recycle"
     bundle.mkdir()
