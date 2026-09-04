@@ -27,6 +27,7 @@ Notable user-facing changes are documented here. This project follows Semantic V
 - Failed active and deleted FAT12/16 LFN sequences inside validated subdirectories now retain exact slot/short-entry offsets, raw bytes, and complete containing-directory cluster lineage instead of being silently discarded.
 - FAT32 unlinked-LFN provenance now produces a dedicated cautious profile finding and persists its exact directory/slot failure evidence in JSON and Markdown reports.
 - FAT32 subdirectory LFN slots orphaned by an end marker or followed by an incompatible volume-label entry now remain visible with raw bytes and complete containing-directory provenance.
+- Active LFN slots orphaned by a root-directory end marker are now retained consistently across FAT12/16/32 with exact absolute slot offsets and raw bytes.
 
 ## [1.1.0] - 2026-09-04
 
