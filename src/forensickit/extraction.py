@@ -1662,8 +1662,8 @@ class ExtractionManager:
                 title=f"Recovered {len(result.artifacts)} bounded active ext file(s)",
                 category="ext_root_file_recovery", severity="info", confidence=0.96,
                 explanation=(
-                    "Validated active root/subdirectory entries resolved to allocated regular-file inodes with complete initialized depth-zero/depth-one extent-tree or direct-block mappings. "
-                    "Only image-bounded declared bytes were registered as recursive children; index/leaf/data offsets are preserved while sparse, deeper-tree, indirect, deleted, and incomplete mappings are excluded."
+                    "Validated active root/subdirectory entries resolved to allocated regular-file inodes with complete initialized depth-zero/one/two extent-tree or direct/single-indirect mappings. "
+                    "Only image-bounded declared bytes were registered as recursive children; intermediate-index/leaf/indirect-pointer/data offsets are preserved while sparse, deeper-tree, double-indirect, deleted, and incomplete mappings are excluded."
                 ),
                 source="builtin_ext_root_extractor", supporting_evidence=evidence[:128],
             ))

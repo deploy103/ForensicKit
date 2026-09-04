@@ -1,6 +1,10 @@
 # ForensicKit Work Queue
 
-Last reviewed: 2026-09-04 21:16 KST
+Last reviewed: 2026-09-04 21:41 KST
+
+## Post-v1.1 backlog
+
+- [ ] Add bounded FAT16 fixed-root directory inventory and cautious deleted single-cluster regular-file recovery with LFN provenance.
 
 ## v1.1.0 release gate
 
@@ -13,6 +17,8 @@ Last reviewed: 2026-09-04 21:16 KST
 
 ## Completed this session
 
+- [x] Bounded ext4 depth-two extent-tree traversal, intermediate-index provenance, range validation, cycle protection, and recursive Engine E2E.
+- [x] Bounded ext2/3 single-indirect directory/file mapping, pointer provenance, alias protection, and recursive Engine E2E.
 - [x] Shared bounded ext inode mapper for direct blocks and depth-zero/depth-one extent trees.
 - [x] Depth-one extent-index/leaf/data provenance, repeated-leaf protection, and recursive Engine flag E2E.
 - [x] Bounded active ext subdirectory traversal and recursively recoverable regular-file children with inode/directory/block lineage.

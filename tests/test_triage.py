@@ -2172,10 +2172,10 @@ def test_ext4_depth_one_extent_tree_maps_root_and_regular_file_with_leaf_provena
     assert values["filesystem.ext.root.mapping_mode"] == "ext4_depth1_extent_tree"
     assert values["filesystem.ext.root.block_segments"][0]["physical_offset"] == 7 * 1024
     root_mapping = values["filesystem.ext.root.mapping"]
-    assert root_mapping[0] == {
-        "kind": "extent_index", "logical_block": 0, "leaf_block": 6,
-        "index_entry_offset": root_inode + 52,
-    }
+    assert root_mapping[0]["kind"] == "extent_index"
+    assert root_mapping[0]["logical_block"] == 0
+    assert root_mapping[0]["leaf_block"] == 6
+    assert root_mapping[0]["index_entry_offset"] == root_inode + 52
     assert root_mapping[1]["leaf_offset"] == 6 * 1024
     assert root_mapping[2]["leaf_entry_offset"] == 6 * 1024 + 12
     recovered = values["filesystem.ext.root.recoverable_regular_files"][0]
@@ -2190,10 +2190,12 @@ def test_ext4_depth_one_extent_tree_maps_root_and_regular_file_with_leaf_provena
         "logical_offset": 0, "physical_block": 9, "physical_offset": 9 * 1024,
         "length": 1024, "extent_leaf_block": 8,
         "extent_leaf_offset": 8 * 1024, "extent_entry_offset": 8 * 1024 + 12,
+        "extent_tree_depth": 1,
     }, {
         "logical_offset": 1024, "physical_block": 11, "physical_offset": 11 * 1024,
         "length": len(payload) - 1024, "extent_leaf_block": 10,
         "extent_leaf_offset": 10 * 1024, "extent_entry_offset": 10 * 1024 + 12,
+        "extent_tree_depth": 1,
     }]
     result = AnalysisEngine().analyze(
         evidence, tmp_path / "cases", mode=AnalysisMode.AUTO, execute=False,
@@ -2217,7 +2219,205 @@ def test_ext4_depth_one_extent_tree_maps_root_and_regular_file_with_leaf_provena
     invalid.write_bytes(repeated_leaf)
     invalid_values = _values(GenericTriageEngine().analyze(_artifact(invalid), invalid))
     assert invalid_values["filesystem.ext.root.available"] is False
-    assert "repeated depth-one extent index" in invalid_values["filesystem.ext.root.error"]
+    assert "repeated extent-tree index" in invalid_values["filesystem.ext.root.error"]
+
+
+def test_ext4_depth_two_extent_tree_maps_child_and_rejects_index_cycle(tmp_path: Path) -> None:
+    image = bytearray(16 * 1024)
+    superblock = 1024
+    image[superblock:superblock + 4] = (16).to_bytes(4, "little")
+    image[superblock + 4:superblock + 8] = (16).to_bytes(4, "little")
+    image[superblock + 20:superblock + 24] = (1).to_bytes(4, "little")
+    image[superblock + 32:superblock + 36] = (16).to_bytes(4, "little")
+    image[superblock + 40:superblock + 44] = (16).to_bytes(4, "little")
+    image[superblock + 56:superblock + 58] = b"\x53\xef"
+    image[superblock + 76:superblock + 80] = (1).to_bytes(4, "little")
+    image[superblock + 88:superblock + 90] = (128).to_bytes(2, "little")
+    image[superblock + 96:superblock + 100] = (0x42).to_bytes(4, "little")
+    image[2048 + 8:2048 + 12] = (3).to_bytes(4, "little")
+
+    def header(offset: int, depth: int) -> None:
+        image[offset:offset + 2] = (0xF30A).to_bytes(2, "little")
+        image[offset + 2:offset + 4] = (1).to_bytes(2, "little")
+        image[offset + 4:offset + 6] = (4 if offset % 1024 else 84).to_bytes(2, "little")
+        image[offset + 6:offset + 8] = depth.to_bytes(2, "little")
+
+    def index(offset: int, logical: int, child: int) -> None:
+        image[offset:offset + 12] = b"\x00" * 12
+        image[offset:offset + 4] = logical.to_bytes(4, "little")
+        image[offset + 4:offset + 8] = child.to_bytes(4, "little")
+
+    def leaf_extent(offset: int, logical: int, physical: int) -> None:
+        image[offset:offset + 12] = b"\x00" * 12
+        image[offset:offset + 4] = logical.to_bytes(4, "little")
+        image[offset + 4:offset + 6] = (1).to_bytes(2, "little")
+        image[offset + 8:offset + 12] = physical.to_bytes(4, "little")
+
+    root_inode = 3 * 1024 + 128
+    image[root_inode:root_inode + 2] = (0x41ED).to_bytes(2, "little")
+    image[root_inode + 4:root_inode + 8] = (1024).to_bytes(4, "little")
+    image[root_inode + 26:root_inode + 28] = (2).to_bytes(2, "little")
+    image[root_inode + 32:root_inode + 36] = (0x00080000).to_bytes(4, "little")
+    header(root_inode + 40, 2)
+    index(root_inode + 52, 0, 6)
+    header(6 * 1024, 1)
+    index(6 * 1024 + 12, 0, 7)
+    header(7 * 1024, 0)
+    leaf_extent(7 * 1024 + 12, 0, 8)
+
+    directory = 8 * 1024
+    for offset, inode_number, record_length, name, file_type in (
+        (0, 2, 12, b".", 2),
+        (12, 2, 12, b"..", 2),
+        (24, 12, 1000, b"deep.txt", 1),
+    ):
+        image[directory + offset:directory + offset + 4] = inode_number.to_bytes(4, "little")
+        image[directory + offset + 4:directory + offset + 6] = record_length.to_bytes(2, "little")
+        image[directory + offset + 6:directory + offset + 8] = bytes([len(name), file_type])
+        image[directory + offset + 8:directory + offset + 8 + len(name)] = name
+
+    payload = b"CTF{ext4_depth_two_tree}"
+    file_inode = 3 * 1024 + 11 * 128
+    image[file_inode:file_inode + 2] = (0x81A4).to_bytes(2, "little")
+    image[file_inode + 4:file_inode + 8] = len(payload).to_bytes(4, "little")
+    image[file_inode + 26:file_inode + 28] = (1).to_bytes(2, "little")
+    image[file_inode + 32:file_inode + 36] = (0x00080000).to_bytes(4, "little")
+    header(file_inode + 40, 2)
+    index(file_inode + 52, 0, 9)
+    header(9 * 1024, 1)
+    index(9 * 1024 + 12, 0, 10)
+    header(10 * 1024, 0)
+    leaf_extent(10 * 1024 + 12, 0, 11)
+    image[11 * 1024:11 * 1024 + len(payload)] = payload
+
+    evidence = tmp_path / "ext4-depth-two.raw"
+    evidence.write_bytes(image)
+    values = _values(GenericTriageEngine().analyze(_artifact(evidence), evidence))
+
+    assert values["filesystem.ext.root.mapping_mode"] == "ext4_depth2_extent_tree"
+    assert values["filesystem.ext.root.block_segments"][0]["physical_offset"] == directory
+    root_provenance = values["filesystem.ext.root.mapping"]
+    assert [item["kind"] for item in root_provenance] == [
+        "extent_index", "extent_index_node", "extent_index", "extent_leaf", "extent",
+    ]
+    assert root_provenance[0]["index_entry_offset"] == root_inode + 52
+    assert root_provenance[1]["index_node_offset"] == 6 * 1024
+    assert root_provenance[2]["index_entry_offset"] == 6 * 1024 + 12
+    assert root_provenance[3]["leaf_offset"] == 7 * 1024
+    recovered = values["filesystem.ext.root.recoverable_regular_files"][0]
+    assert recovered["name"] == "deep.txt"
+    assert recovered["mapping_mode"] == "ext4_depth2_extent_tree"
+    assert recovered["data_segments"][0]["extent_tree_depth"] == 2
+    assert recovered["data_segments"][0]["extent_leaf_offset"] == 10 * 1024
+
+    result = AnalysisEngine().analyze(
+        evidence, tmp_path / "depth-two-cases", mode=AnalysisMode.AUTO, execute=False,
+    )
+    child = next(item for item in result.artifacts if item.logical_name == "deep.txt")
+    assert any(
+        item.value == "CTF{ext4_depth_two_tree}" and item.artifact_id == child.id
+        for item in result.flags
+    )
+
+    cyclic = bytearray(image)
+    cyclic[6 * 1024 + 16:6 * 1024 + 20] = (6).to_bytes(4, "little")
+    invalid = tmp_path / "ext4-depth-two-cycle.raw"
+    invalid.write_bytes(cyclic)
+    invalid_values = _values(GenericTriageEngine().analyze(_artifact(invalid), invalid))
+    assert invalid_values["filesystem.ext.root.available"] is False
+    assert "repeated extent-tree index" in invalid_values["filesystem.ext.root.error"]
+
+
+def test_ext2_single_indirect_maps_directory_and_file_with_pointer_provenance(tmp_path: Path) -> None:
+    block_size = 1024
+    image = bytearray(64 * block_size)
+    superblock = 1024
+    image[superblock:superblock + 4] = (16).to_bytes(4, "little")
+    image[superblock + 4:superblock + 8] = (64).to_bytes(4, "little")
+    image[superblock + 20:superblock + 24] = (1).to_bytes(4, "little")
+    image[superblock + 32:superblock + 36] = (64).to_bytes(4, "little")
+    image[superblock + 40:superblock + 44] = (16).to_bytes(4, "little")
+    image[superblock + 56:superblock + 58] = b"\x53\xef"
+    image[superblock + 76:superblock + 80] = (1).to_bytes(4, "little")
+    image[superblock + 88:superblock + 90] = (128).to_bytes(2, "little")
+    image[superblock + 96:superblock + 100] = (0x02).to_bytes(4, "little")
+    image[2048 + 8:2048 + 12] = (3).to_bytes(4, "little")
+
+    root_inode = 3 * block_size + 128
+    image[root_inode:root_inode + 2] = (0x41ED).to_bytes(2, "little")
+    image[root_inode + 4:root_inode + 8] = (13 * block_size).to_bytes(4, "little")
+    image[root_inode + 26:root_inode + 28] = (2).to_bytes(2, "little")
+    for pointer, physical in enumerate(range(8, 20)):
+        image[root_inode + 40 + pointer * 4:root_inode + 44 + pointer * 4] = physical.to_bytes(4, "little")
+    image[root_inode + 88:root_inode + 92] = (20).to_bytes(4, "little")
+    image[20 * block_size:20 * block_size + 4] = (21).to_bytes(4, "little")
+
+    directory = 8 * block_size
+    for offset, inode_number, record_length, name, file_type in (
+        (0, 2, 12, b".", 2),
+        (12, 2, 12, b"..", 2),
+        (24, 12, 1000, b"indirect.bin", 1),
+    ):
+        image[directory + offset:directory + offset + 4] = inode_number.to_bytes(4, "little")
+        image[directory + offset + 4:directory + offset + 6] = record_length.to_bytes(2, "little")
+        image[directory + offset + 6:directory + offset + 8] = bytes([len(name), file_type])
+        image[directory + offset + 8:directory + offset + 8 + len(name)] = name
+    for physical in [*range(9, 20), 21]:
+        offset = physical * block_size
+        image[offset + 4:offset + 6] = block_size.to_bytes(2, "little")
+
+    payload = b"A" * (12 * block_size) + b"CTF{ext_single_indirect}"
+    file_inode = 3 * block_size + 11 * 128
+    image[file_inode:file_inode + 2] = (0x81A4).to_bytes(2, "little")
+    image[file_inode + 4:file_inode + 8] = len(payload).to_bytes(4, "little")
+    image[file_inode + 26:file_inode + 28] = (1).to_bytes(2, "little")
+    for pointer, physical in enumerate(range(22, 34)):
+        image[file_inode + 40 + pointer * 4:file_inode + 44 + pointer * 4] = physical.to_bytes(4, "little")
+        image[physical * block_size:(physical + 1) * block_size] = payload[
+            pointer * block_size:(pointer + 1) * block_size
+        ]
+    image[file_inode + 88:file_inode + 92] = (34).to_bytes(4, "little")
+    image[34 * block_size:34 * block_size + 4] = (35).to_bytes(4, "little")
+    image[35 * block_size:35 * block_size + len(payload) - 12 * block_size] = payload[12 * block_size:]
+
+    evidence = tmp_path / "ext2-single-indirect.raw"
+    evidence.write_bytes(image)
+    values = _values(GenericTriageEngine().analyze(_artifact(evidence), evidence))
+
+    assert values["filesystem.ext.root.mapping_mode"] == "ext2_3_direct_single_indirect"
+    root_mapping = values["filesystem.ext.root.mapping"]
+    root_indirect = next(item for item in root_mapping if item.get("kind") == "single_indirect_block")
+    assert root_indirect["physical_offset"] == 20 * block_size
+    assert root_indirect["inode_pointer_offset"] == root_inode + 88
+    root_pointer = next(item for item in root_mapping if item.get("kind") == "indirect_data_pointer")
+    assert root_pointer["pointer_offset"] == 20 * block_size
+    assert root_pointer["physical_block"] == 21
+    recovered = values["filesystem.ext.root.recoverable_regular_files"][0]
+    assert recovered["name"] == "indirect.bin"
+    assert recovered["mapping_mode"] == "ext2_3_direct_single_indirect"
+    assert recovered["data_segments"][-1] == {
+        "logical_offset": 12 * block_size, "physical_block": 35,
+        "physical_offset": 35 * block_size, "length": len(payload) - 12 * block_size,
+        "indirect_block": 34, "indirect_block_offset": 34 * block_size,
+        "indirect_pointer_offset": 34 * block_size,
+    }
+
+    result = AnalysisEngine().analyze(
+        evidence, tmp_path / "indirect-cases", mode=AnalysisMode.AUTO, execute=False,
+    )
+    child = next(item for item in result.artifacts if item.logical_name == "indirect.bin")
+    assert any(
+        item.value == "CTF{ext_single_indirect}" and item.artifact_id == child.id
+        for item in result.flags
+    )
+
+    aliased = bytearray(image)
+    aliased[20 * block_size:20 * block_size + 4] = (8).to_bytes(4, "little")
+    invalid = tmp_path / "ext2-indirect-alias.raw"
+    invalid.write_bytes(aliased)
+    invalid_values = _values(GenericTriageEngine().analyze(_artifact(invalid), invalid))
+    assert invalid_values["filesystem.ext.root.available"] is False
+    assert "repeated, aliased" in invalid_values["filesystem.ext.root.error"]
 
 
 def test_ntfs_i30_index_root_inventory_is_bounded_and_keeps_entry_provenance() -> None:

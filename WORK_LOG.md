@@ -1,5 +1,34 @@
 # ForensicKit Work Log
 
+## 2026-09-04 21:41 KST
+
+### ext2/3 single-indirect directory and file mapping
+
+- Changed `src/forensickit/triage.py` and `tests/test_triage.py`, then updated disk-profile/recovery wording and capability/limitation records.
+- Active directories and regular files may now use all 12 direct pointers plus one bounded single-indirect pointer block. The mapper validates pointer capacity, filesystem/image bounds, complete declared coverage, unique data blocks, and metadata/data non-aliasing before any bytes are parsed or recovered.
+- Mapping provenance retains the inode's indirect-pointer offset, pointer-block physical block/byte offset, required pointer count/capacity, every pointer index/byte offset, and the resulting logical/physical data segment.
+- Added one image that maps both a 13-block root directory and a 13-block regular file, recursively recovers `CTF{ext_single_indirect}`, and rejects an indirect pointer that aliases an already accepted direct data block.
+- Verified `python -m compileall -q src tests scripts` and focused triage regressions (**85 passed, 0 failed**).
+- Full post-release direct regression passed (**285 passed, 0 failed**); `git diff --check` remained clean.
+
+### Next
+
+- Add bounded FAT16 fixed-root directory inventory and cautious deleted single-cluster regular-file recovery with LFN provenance.
+
+## 2026-09-04 21:38 KST
+
+### Bounded ext4 depth-two extent-tree traversal
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/extraction.py`, `src/forensickit/profiles/disk.py`, and `tests/test_triage.py` after the v1.1.0 tag.
+- Generalized the shared ext mapper to traverse at most two external index levels. Every child header must decrease depth exactly once; index keys stay inside their parent's logical range; tree blocks are image-bounded and globally unique per inode; total index/leaf entries remain under the existing 64-block recovery bound.
+- Observations and recovery findings now retain root and intermediate index-entry offsets, parent index linkage, index-block headers, leaf headers/entries, and final data offsets. Initialized data extents cannot alias any tree block or another physical data interval.
+- Added a full depth-two root-directory and regular-file fixture plus recursive Engine recovery of `CTF{ext4_depth_two_tree}`. A self-referencing intermediate index is rejected before any directory bytes are trusted.
+- Verified `python -m compileall -q src tests scripts` and focused triage regressions (**84 passed, 0 failed**).
+
+### Next
+
+- Add bounded ext2/3 single-indirect-block mapping with exact pointer-block provenance and data/metadata alias rejection.
+
 ## 2026-09-04 21:16 KST
 
 ### v1.1.0 publication

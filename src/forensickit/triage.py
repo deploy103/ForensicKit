@@ -2508,7 +2508,7 @@ class GenericTriageEngine:
             mode = "ext4_depth0_extents" if depth == 0 else f"ext4_depth{depth}_extent_tree"
             if (
                 int.from_bytes(root[0:2], "little") != 0xF30A
-                or depth not in {0, 1} or not 1 <= count <= maximum or maximum > 4
+                or depth not in {0, 1, 2} or not 1 <= count <= maximum or maximum > 4
             ):
                 return [], mode, "invalid or unsupported extent root", []
             extent_sources: list[tuple[bytes, int, int | None, int | None]] = []
@@ -2516,52 +2516,89 @@ class GenericTriageEngine:
             if depth == 0:
                 extent_sources.append((root, inode_offset + 40, None, None))
             else:
-                indices: list[tuple[int, int, int]] = []
-                previous_index_logical = -1
-                for index_number in range(count):
-                    relative_offset = 12 + index_number * 12
-                    logical_start = int.from_bytes(root[relative_offset:relative_offset + 4], "little")
-                    leaf_block = (
-                        int.from_bytes(root[relative_offset + 8:relative_offset + 10], "little") << 32
-                        | int.from_bytes(root[relative_offset + 4:relative_offset + 8], "little")
-                    )
-                    index_offset = inode_offset + 40 + relative_offset
-                    if (
-                        logical_start <= previous_index_logical or leaf_block <= 0
-                        or leaf_block >= blocks_count or leaf_block in extent_tree_blocks
-                        or leaf_block * block_size + block_size > image_size
-                    ):
-                        return [], mode, "invalid, unsorted, or repeated depth-one extent index", []
-                    extent_tree_blocks.add(leaf_block)
-                    indices.append((logical_start, leaf_block, index_offset))
-                    mapping_provenance.append({
-                        "kind": "extent_index", "logical_block": logical_start,
-                        "leaf_block": leaf_block, "index_entry_offset": index_offset,
-                    })
-                    previous_index_logical = logical_start
-                for index_number, (logical_start, leaf_block, index_offset) in enumerate(indices):
-                    leaf_offset = leaf_block * block_size
-                    stream.seek(leaf_offset)
-                    leaf = stream.read(block_size)
-                    if len(leaf) != block_size:
-                        return [], mode, "truncated depth-one extent leaf", mapping_provenance
-                    leaf_count = int.from_bytes(leaf[2:4], "little")
-                    leaf_maximum = int.from_bytes(leaf[4:6], "little")
-                    leaf_depth = int.from_bytes(leaf[6:8], "little")
-                    leaf_capacity = (block_size - 12) // 12
-                    if (
-                        int.from_bytes(leaf[0:2], "little") != 0xF30A or leaf_depth != 0
-                        or not 1 <= leaf_count <= leaf_maximum or leaf_maximum > leaf_capacity
-                    ):
-                        return [], mode, "invalid depth-one extent leaf header", mapping_provenance
-                    upper_logical = indices[index_number + 1][0] if index_number + 1 < len(indices) else None
-                    mapping_provenance.append({
-                        "kind": "extent_leaf", "index_logical_block": logical_start,
-                        "leaf_block": leaf_block, "leaf_offset": leaf_offset,
-                        "entry_count": leaf_count, "maximum": leaf_maximum,
-                        "index_entry_offset": index_offset,
-                    })
-                    extent_sources.append((leaf, leaf_offset, logical_start, upper_logical))
+                index_queue: list[
+                    tuple[bytes, int, int, int | None, int | None, int | None]
+                ] = [(root, inode_offset + 40, depth, None, None, None)]
+                total_index_entries = 0
+                while index_queue:
+                    node, node_offset, node_depth, lower_bound, upper_bound, parent_entry_offset = index_queue.pop(0)
+                    node_count = int.from_bytes(node[2:4], "little")
+                    total_index_entries += node_count
+                    if total_index_entries > block_limit:
+                        return [], mode, "extent index entry count exceeds configured block bound", mapping_provenance
+                    indices: list[tuple[int, int, int]] = []
+                    previous_index_logical = -1
+                    for index_number in range(node_count):
+                        relative_offset = 12 + index_number * 12
+                        logical_start = int.from_bytes(node[relative_offset:relative_offset + 4], "little")
+                        child_block = (
+                            int.from_bytes(node[relative_offset + 8:relative_offset + 10], "little") << 32
+                            | int.from_bytes(node[relative_offset + 4:relative_offset + 8], "little")
+                        )
+                        index_offset = node_offset + relative_offset
+                        if (
+                            logical_start <= previous_index_logical
+                            or (lower_bound is not None and logical_start < lower_bound)
+                            or (upper_bound is not None and logical_start >= upper_bound)
+                            or child_block <= 0 or child_block >= blocks_count
+                            or child_block in extent_tree_blocks
+                            or child_block * block_size + block_size > image_size
+                        ):
+                            return [], mode, "invalid, unsorted, out-of-range, or repeated extent-tree index", mapping_provenance
+                        extent_tree_blocks.add(child_block)
+                        indices.append((logical_start, child_block, index_offset))
+                        index_evidence: dict[str, object] = {
+                            "kind": "extent_index", "logical_block": logical_start,
+                            "child_block": child_block, "child_depth": node_depth - 1,
+                            "index_node_depth": node_depth, "index_node_offset": node_offset,
+                            "index_entry_offset": index_offset,
+                        }
+                        if parent_entry_offset is not None:
+                            index_evidence["parent_index_entry_offset"] = parent_entry_offset
+                        if node_depth == 1:
+                            index_evidence["leaf_block"] = child_block
+                        mapping_provenance.append(index_evidence)
+                        previous_index_logical = logical_start
+                    for index_number, (logical_start, child_block, index_offset) in enumerate(indices):
+                        child_upper = (
+                            indices[index_number + 1][0]
+                            if index_number + 1 < len(indices) else upper_bound
+                        )
+                        child_offset = child_block * block_size
+                        stream.seek(child_offset)
+                        child = stream.read(block_size)
+                        if len(child) != block_size:
+                            return [], mode, "truncated extent-tree child block", mapping_provenance
+                        child_count = int.from_bytes(child[2:4], "little")
+                        child_maximum = int.from_bytes(child[4:6], "little")
+                        child_depth = int.from_bytes(child[6:8], "little")
+                        child_capacity = (block_size - 12) // 12
+                        if (
+                            int.from_bytes(child[0:2], "little") != 0xF30A
+                            or child_depth != node_depth - 1
+                            or not 1 <= child_count <= child_maximum
+                            or child_maximum > child_capacity
+                        ):
+                            return [], mode, "invalid extent-tree child header", mapping_provenance
+                        if child_depth == 0:
+                            mapping_provenance.append({
+                                "kind": "extent_leaf", "index_logical_block": logical_start,
+                                "leaf_block": child_block, "leaf_offset": child_offset,
+                                "entry_count": child_count, "maximum": child_maximum,
+                                "index_entry_offset": index_offset,
+                            })
+                            extent_sources.append((child, child_offset, logical_start, child_upper))
+                        else:
+                            mapping_provenance.append({
+                                "kind": "extent_index_node", "index_logical_block": logical_start,
+                                "index_block": child_block, "index_node_offset": child_offset,
+                                "tree_depth": child_depth, "entry_count": child_count,
+                                "maximum": child_maximum, "parent_index_entry_offset": index_offset,
+                            })
+                            index_queue.append((
+                                child, child_offset, child_depth, logical_start,
+                                child_upper, index_offset,
+                            ))
             if sum(int.from_bytes(node[2:4], "little") for node, *_ in extent_sources) > block_limit:
                 return [], mode, "extent entry count exceeds configured block bound", mapping_provenance
             previous_end = 0
@@ -2614,26 +2651,78 @@ class GenericTriageEngine:
                         logical = logical_start + part
                         if logical < required:
                             logical_blocks[logical] = physical_start + part
-                            if depth == 1:
+                            if depth >= 1:
                                 block_provenance[logical] = {
                                     "extent_leaf_block": node_offset // block_size,
                                     "extent_leaf_offset": node_offset,
                                     "extent_entry_offset": entry_offset,
+                                    "extent_tree_depth": depth,
                                 }
                     previous_end = logical_start + length
         else:
-            if required > 12:
-                return [], mode, "indirect block pointers are unsupported", []
-            for logical in range(required):
+            direct_count = min(required, 12)
+            seen_data_blocks: set[int] = set()
+            for logical in range(direct_count):
                 physical = int.from_bytes(inode[40 + logical * 4:44 + logical * 4], "little")
-                if physical <= 0 or physical >= blocks_count:
+                if (
+                    physical <= 0 or physical >= blocks_count or physical in seen_data_blocks
+                    or physical * block_size + block_size > image_size
+                ):
                     return [], mode, "missing or invalid direct block pointer", mapping_provenance
                 logical_blocks[logical] = physical
+                seen_data_blocks.add(physical)
                 mapping_provenance.append({
                     "logical_block": logical, "block_count": 1,
                     "physical_block": physical, "uninitialized": False,
                     "inode_byte_offset": inode_offset + 40 + logical * 4,
                 })
+            if required > 12:
+                indirect_count = required - 12
+                indirect_capacity = block_size // 4
+                indirect_block = int.from_bytes(inode[88:92], "little")
+                indirect_offset = indirect_block * block_size
+                if (
+                    not 1 <= indirect_count <= indirect_capacity
+                    or indirect_block <= 0 or indirect_block >= blocks_count
+                    or indirect_block in seen_data_blocks
+                    or indirect_offset + block_size > image_size
+                ):
+                    return [], mode, "missing, aliased, or invalid single-indirect block", mapping_provenance
+                stream.seek(indirect_offset)
+                indirect = stream.read(block_size)
+                if len(indirect) != block_size:
+                    return [], mode, "truncated single-indirect block", mapping_provenance
+                mode = "ext2_3_direct_single_indirect"
+                mapping_provenance.append({
+                    "kind": "single_indirect_block", "logical_block": 12,
+                    "physical_block": indirect_block, "physical_offset": indirect_offset,
+                    "inode_pointer_offset": inode_offset + 88,
+                    "pointer_count": indirect_count, "pointer_capacity": indirect_capacity,
+                })
+                for pointer_index in range(indirect_count):
+                    pointer_offset = indirect_offset + pointer_index * 4
+                    physical = int.from_bytes(
+                        indirect[pointer_index * 4:pointer_index * 4 + 4], "little"
+                    )
+                    logical = 12 + pointer_index
+                    if (
+                        physical <= 0 or physical >= blocks_count
+                        or physical == indirect_block or physical in seen_data_blocks
+                        or physical * block_size + block_size > image_size
+                    ):
+                        return [], mode, "missing, repeated, aliased, or invalid single-indirect data pointer", mapping_provenance
+                    logical_blocks[logical] = physical
+                    seen_data_blocks.add(physical)
+                    block_provenance[logical] = {
+                        "indirect_block": indirect_block,
+                        "indirect_block_offset": indirect_offset,
+                        "indirect_pointer_offset": pointer_offset,
+                    }
+                    mapping_provenance.append({
+                        "kind": "indirect_data_pointer", "logical_block": logical,
+                        "physical_block": physical, "pointer_index": pointer_index,
+                        "pointer_offset": pointer_offset, "indirect_block": indirect_block,
+                    })
         if set(logical_blocks) != set(range(required)):
             return [], mode, "sparse, missing, or incomplete logical mapping", mapping_provenance
         segments: list[dict[str, int]] = []

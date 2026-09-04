@@ -2,6 +2,14 @@
 
 Notable user-facing changes are documented here. This project follows Semantic Versioning.
 
+## [Unreleased]
+
+### Added
+
+- Bounded ext4 depth-two extent-tree traversal with intermediate-index, leaf, and data-block provenance.
+- Cross-level extent-index range validation and repeated/cyclic tree-block rejection under shared metadata-entry bounds.
+- Bounded ext2/3 single-indirect-block mapping for active directories and regular files, including pointer-block and pointer-entry provenance.
+
 ## [1.1.0] - 2026-09-04
 
 ### Added
