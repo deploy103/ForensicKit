@@ -36,6 +36,7 @@ Notable user-facing changes are documented here. This project follows Semantic V
 - FAT volumes with missing or misleading informational type labels are now classified by fully validated BPB cluster-count geometry and FAT entry capacity; label fields, raw offsets, the selected basis, and any disagreement remain explicit provenance.
 - Primary MBR entries now drive bounded exact-offset FAT/NTFS/exFAT boot-sector validation, including independent partition-type, embedded start-LBA, and declared-size comparisons with anomaly findings and no mounting.
 - CRC-validated GPT entries now receive the same exact-offset boot checks with GUID/name provenance; the declared backup header/table is independently CRC-checked and compared without selecting or repairing a copy.
+- Extended MBR partitions now receive bounded EBR-chain traversal with distinct current-EBR logical offsets and extended-base link offsets, cycle/bounds isolation, and exact-offset logical FAT/NTFS/exFAT boot validation.
 
 ## [1.1.0] - 2026-09-04
 
