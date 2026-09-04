@@ -735,12 +735,15 @@ class DiskProfile(BaseProfile):
                     evidence=[str(item)[:2_000] for item in active_fat_files[:256]],
                     severity="info",
                 ))
-        for fat_bits in (12, 16):
+        for fat_bits, unlinked_lfn_key in (
+            (12, "filesystem.fat12.root.unlinked_lfn_slots"),
+            (16, "filesystem.fat16.root.unlinked_lfn_slots"),
+            (32, "filesystem.fat.unlinked_lfn_slots"),
+        ):
             unlinked_lfn_slots = next(
                 (
-                    value for value in context.values(
-                        f"filesystem.fat{fat_bits}.root.unlinked_lfn_slots"
-                    ) if isinstance(value, list)
+                    value for value in context.values(unlinked_lfn_key)
+                    if isinstance(value, list)
                 ),
                 [],
             )

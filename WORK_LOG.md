@@ -1,5 +1,17 @@
 # ForensicKit Work Log
 
+## 2026-09-04 23:58 KST
+
+### FAT32 unlinked-LFN report finding
+
+- Changed `src/forensickit/profiles/disk.py` and `tests/test_engine_pipeline.py`.
+- Existing bounded FAT32 root/subdirectory unlinked-LFN observations now produce a dedicated `fat32_unlinked_lfn_slots` finding instead of remaining observation-only. The finding retains the exact raw slot, slot/short-entry offsets, failure reason, directory source entry, and noncontiguous directory cluster lineage already emitted by triage.
+- Expanded the ExtFlags-selected noncontiguous subdirectory Engine E2E to require the finding and its checksum-failure provenance in `report.json`. Engine regression passed: 45 passed, 0 failed. The full direct synthetic suite passed: 296 passed, 0 failed; compileall and `git diff --check` passed.
+
+### Next
+
+- Preserve FAT32 subdirectory LFN sequences that end without a short entry or precede an incompatible short entry, retaining their containing-directory lineage without treating the name as valid.
+
 ## 2026-09-04 23:51 KST
 
 ### FAT12/16 subdirectory LFN failure provenance

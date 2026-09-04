@@ -25,6 +25,7 @@ Notable user-facing changes are documented here. This project follows Semantic V
 - Deleted FAT32 LFN chains inside validated active subdirectories now use the same missing-short-byte checksum reconstruction and carry directory/FAT provenance into recursive recovery.
 - Deleted FAT32 root cluster fields now preserve raw/masked values and reserved-high bits; malformed entries remain visible but cannot become recursive children.
 - Failed active and deleted FAT12/16 LFN sequences inside validated subdirectories now retain exact slot/short-entry offsets, raw bytes, and complete containing-directory cluster lineage instead of being silently discarded.
+- FAT32 unlinked-LFN provenance now produces a dedicated cautious profile finding and persists its exact directory/slot failure evidence in JSON and Markdown reports.
 
 ## [1.1.0] - 2026-09-04
 

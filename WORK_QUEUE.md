@@ -1,10 +1,10 @@
 # ForensicKit Work Queue
 
-Last reviewed: 2026-09-04 23:51 KST
+Last reviewed: 2026-09-04 23:58 KST
 
 ## Post-v1.1 backlog
 
-- [ ] Surface FAT32 root/subdirectory unlinked-LFN provenance as a dedicated profile/report finding, matching FAT12/16.
+- [ ] Preserve FAT32 subdirectory LFN slots that reach an end marker or an incompatible short entry, rather than silently dropping their provenance.
 
 ## v1.1.0 release gate
 
@@ -35,6 +35,7 @@ Last reviewed: 2026-09-04 23:51 KST
 - [x] Deleted FAT32 subdirectory LFN reconstruction and recursive recovery with containing-directory and selected-FAT provenance.
 - [x] FAT32 deleted root raw/masked cluster fields, reserved-high anomaly finding, and malformed-entry recovery exclusion.
 - [x] Invalid active/deleted FAT12/16 subdirectory LFN slot provenance with exact short-entry offsets and directory lineage.
+- [x] Dedicated FAT32 unlinked-LFN profile finding and Engine/report provenance regression.
 - [x] Shared bounded ext inode mapper for direct blocks and depth-zero/depth-one extent trees.
 - [x] Depth-one extent-index/leaf/data provenance, repeated-leaf protection, and recursive Engine flag E2E.
 - [x] Bounded active ext subdirectory traversal and recursively recoverable regular-file children with inode/directory/block lineage.
