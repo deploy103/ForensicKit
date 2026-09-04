@@ -4817,6 +4817,7 @@ class GenericTriageEngine:
         (
             subdirectory_entries, subdirectory_inventory, subdirectory_errors,
             active_cluster_starts, subdirectory_active_files,
+            subdirectory_unlinked_lfn_slots,
         ) = self._fat32_subdirectory_deleted_entries(
             path, image_size, data, entry_offsets, bytes_per_sector, sectors_per_cluster,
             first_data_sector, fat_offset, fat_end,
@@ -4973,7 +4974,10 @@ class GenericTriageEngine:
             self._observation(artifact, "filesystem.fat.subdirectory_inventory", subdirectory_inventory),
             self._observation(artifact, "filesystem.fat.subdirectory_errors", subdirectory_errors),
             self._observation(artifact, "filesystem.fat32.lost_chains", lost_chains),
-            self._observation(artifact, "filesystem.fat.unlinked_lfn_slots", unlinked_lfn_slots),
+            self._observation(
+                artifact, "filesystem.fat.unlinked_lfn_slots",
+                [*unlinked_lfn_slots, *subdirectory_unlinked_lfn_slots][:512],
+            ),
             self._observation(artifact, "filesystem.fat.deleted_short_entries_truncated", len(deleted_entries) >= 256),
         ]
 
@@ -4990,7 +4994,7 @@ class GenericTriageEngine:
         fat_end: int,
     ) -> tuple[
         list[dict[str, object]], list[dict[str, object]], list[str], set[int],
-        list[dict[str, object]],
+        list[dict[str, object]], list[dict[str, object]],
     ]:
         """Traverse active FAT32 directory chains and inventory deleted children."""
         cluster_size = bytes_per_sector * sectors_per_cluster
@@ -5002,6 +5006,7 @@ class GenericTriageEngine:
         visited_clusters: set[int] = set()
         active_cluster_starts: set[int] = set()
         active_regular_files: list[dict[str, object]] = []
+        unlinked_lfn_slots: list[dict[str, object]] = []
         total_clusters = 0
 
         def active_directories(data: bytes, offsets: list[int], parent_lineage: list[int]) -> None:
@@ -5072,7 +5077,17 @@ class GenericTriageEngine:
                             errors.append(f"subdirectory cluster {start}: FAT entry outside bounds")
                             break
                         stream.seek(fat_entry_offset)
-                        next_cluster = int.from_bytes(stream.read(4), "little") & 0x0FFFFFFF
+                        raw_next = stream.read(4)
+                        if len(raw_next) != 4:
+                            termination = "truncated_fat"
+                            errors.append(f"subdirectory cluster {start}: truncated FAT entry")
+                            break
+                        next_cluster = int.from_bytes(raw_next, "little") & 0x0FFFFFFF
+                        chain[-1].update({
+                            "fat_entry_offset": fat_entry_offset,
+                            "fat_entry_raw": raw_next.hex(),
+                            "next_cluster": next_cluster,
+                        })
                         if next_cluster >= 0x0FFFFFF8:
                             termination = "eoc"
                             break
@@ -5122,11 +5137,22 @@ class GenericTriageEngine:
                                         "size": file_size, "raw_hex": entry.hex(),
                                     }
                                     if pending_lfn:
-                                        lfn, _ = GenericTriageEngine._fat_active_lfn_candidate(
+                                        lfn, lfn_error = GenericTriageEngine._fat_active_lfn_candidate(
                                             pending_lfn, entry, offsets,
                                         )
                                         if lfn is not None:
                                             active_file.update(lfn)
+                                        elif len(unlinked_lfn_slots) < 256:
+                                            unlinked_lfn_slots.append({
+                                                "directory_start_cluster": start,
+                                                "directory_cluster_lineage": lineage,
+                                                "directory_source_entry_offset": directory.get("source_entry_offset"),
+                                                "short_entry_index": index,
+                                                "short_entry_offset": offsets[index],
+                                                "slot_offsets": [offsets[slot_index] for slot_index, _ in pending_lfn],
+                                                "reason": lfn_error,
+                                                "raw_hex": [slot.hex() for _, slot in pending_lfn],
+                                            })
                                     active_regular_files.append(active_file)
                             pending_lfn = []
                             continue
@@ -5150,13 +5176,16 @@ class GenericTriageEngine:
                         if len(deleted) >= 512:
                             return (
                                 deleted, inventory, errors, active_cluster_starts,
-                                active_regular_files,
+                                active_regular_files, unlinked_lfn_slots,
                             )
         except OSError as exc:
             errors.append(str(exc)[:2_000])
         if queue:
             errors.append("subdirectory traversal reached the 32-directory/64-cluster bound")
-        return deleted, inventory, errors, active_cluster_starts, active_regular_files
+        return (
+            deleted, inventory, errors, active_cluster_starts,
+            active_regular_files, unlinked_lfn_slots,
+        )
 
     @staticmethod
     def _fat_short_name_checksum(short_name: bytes) -> int:

@@ -2062,6 +2062,143 @@ def test_fat32_active_file_recovery_uses_extflags_selected_fat(tmp_path: Path) -
     assert "chain_validation:exact_size_required_chain_eoc" in finding.supporting_evidence[0]
 
 
+def test_fat32_noncontiguous_subdirectory_lfn_file_keeps_selected_fat_lineage(tmp_path: Path) -> None:
+    sector_size = 512
+    reserved = 1
+    fat_size = 600
+    first_data_sector = reserved + 2 * fat_size
+    image = bytearray((first_data_sector + 8) * sector_size)
+    image[11:13] = sector_size.to_bytes(2, "little")
+    image[13] = 1
+    image[14:16] = reserved.to_bytes(2, "little")
+    image[16] = 2
+    image[21] = 0xF8
+    image[32:36] = (70_000).to_bytes(4, "little")
+    image[36:40] = fat_size.to_bytes(4, "little")
+    image[40:42] = (0x0081).to_bytes(2, "little")
+    image[44:48] = (2).to_bytes(4, "little")
+    image[82:90] = b"FAT32   "
+    image[510:512] = b"\x55\xaa"
+    fat0_offset = reserved * sector_size
+    fat1_offset = (reserved + fat_size) * sector_size
+    for offset in (fat0_offset, fat1_offset):
+        image[offset:offset + 8] = b"\xf8\xff\xff\x0f\xff\xff\xff\x0f"
+    image[fat0_offset + 2 * 4:fat0_offset + 2 * 4 + 4] = (0x0FFFFFFF).to_bytes(4, "little")
+    for cluster, next_cluster in ((2, 0x0FFFFFFF), (5, 9), (9, 0x0FFFFFFF), (7, 0x0FFFFFFF)):
+        offset = fat1_offset + cluster * 4
+        image[offset:offset + 4] = next_cluster.to_bytes(4, "little")
+    root_offset = first_data_sector * sector_size
+    image[root_offset:root_offset + 11] = b"ACTIVE     "
+    image[root_offset + 11] = 0x10
+    image[root_offset + 26:root_offset + 28] = (5).to_bytes(2, "little")
+    first_directory_offset = (first_data_sector + 3) * sector_size
+    for index in range(sector_size // 32):
+        offset = first_directory_offset + index * 32
+        image[offset:offset + 11] = b"FILLER  TXT"
+        image[offset + 11] = 0x20
+    second_directory_offset = (first_data_sector + 7) * sector_size
+    short_name = b"NESTED~1TXT"
+    long_name = "Nested.txt"
+    checksum = GenericTriageEngine._fat_short_name_checksum(short_name)
+    encoded_name = long_name.encode("utf-16le")
+    units = [
+        int.from_bytes(encoded_name[offset:offset + 2], "little")
+        for offset in range(0, len(encoded_name), 2)
+    ]
+    units.extend([0, *([0xFFFF] * (12 - len(units)))])
+    slot = bytearray(32)
+    slot[0] = 0x41
+    slot[11] = 0x0F
+    slot[13] = checksum
+    encoded_slot = b"".join(value.to_bytes(2, "little") for value in units)
+    slot[1:11] = encoded_slot[:10]
+    slot[14:26] = encoded_slot[10:22]
+    slot[28:32] = encoded_slot[22:26]
+    image[second_directory_offset:second_directory_offset + 32] = slot
+    short_offset = second_directory_offset + 32
+    image[short_offset:short_offset + 11] = short_name
+    image[short_offset + 11] = 0x20
+    image[short_offset + 26:short_offset + 28] = (7).to_bytes(2, "little")
+    payload = b"CTF{fat32_subdirectory_lfn_active}"
+    image[short_offset + 28:short_offset + 32] = len(payload).to_bytes(4, "little")
+    content_offset = (first_data_sector + 5) * sector_size
+    image[content_offset:content_offset + len(payload)] = payload
+    evidence = tmp_path / "fat32-subdirectory-active-lfn.raw"
+    evidence.write_bytes(image)
+
+    result = AnalysisEngine().analyze(
+        evidence, tmp_path / "fat32-subdirectory-active-cases",
+        mode=AnalysisMode.AUTO, execute=False,
+    )
+
+    child = next(item for item in result.artifacts if item.logical_name == long_name)
+    assert child.parent_id == result.root_artifact.id and child.size == len(payload)
+    assert any(
+        item.value == "CTF{fat32_subdirectory_lfn_active}" and item.artifact_id == child.id
+        for item in result.flags
+    )
+    inventory = next(
+        observation.value for observation in result.observations
+        if observation.artifact_id == result.root_artifact.id
+        and observation.key == "filesystem.fat.subdirectory_inventory"
+    )
+    assert inventory == [{
+        "name": "ACTIVE", "start_cluster": 5, "source_entry_offset": root_offset,
+        "parent_cluster_lineage": [],
+        "cluster_chain": [
+            {
+                "cluster": 5, "offset": first_directory_offset, "length": sector_size,
+                "fat_entry_offset": fat1_offset + 5 * 4,
+                "fat_entry_raw": (9).to_bytes(4, "little").hex(), "next_cluster": 9,
+            },
+            {
+                "cluster": 9, "offset": second_directory_offset, "length": sector_size,
+                "fat_entry_offset": fat1_offset + 9 * 4,
+                "fat_entry_raw": (0x0FFFFFFF).to_bytes(4, "little").hex(),
+                "next_cluster": 0x0FFFFFFF,
+            },
+        ],
+        "termination": "eoc",
+    }]
+    finding = next(
+        item for item in result.findings if item.category == "fat32_active_file_recovery"
+    )
+    active_evidence = next(item for item in finding.supporting_evidence if f"child:{child.id}" in item)
+    assert f"entry_offset:{short_offset}" in active_evidence
+    assert f"lfn_slot_offsets:[{second_directory_offset}]" in active_evidence
+    assert "directory_start_cluster:5" in active_evidence
+    assert "directory_cluster_lineage:[5, 9]" in active_evidence
+    assert f"directory_source_entry_offset:{root_offset}" in active_evidence
+    assert f"'fat_entry_offset': {fat1_offset + 7 * 4}" in active_evidence
+    assert f"'physical_offset': {content_offset}" in active_evidence
+
+    bad_lfn = bytearray(image)
+    bad_lfn[second_directory_offset + 13] ^= 0xFF
+    bad_lfn_path = tmp_path / "fat32-subdirectory-bad-active-lfn.raw"
+    bad_lfn_path.write_bytes(bad_lfn)
+    bad_result = AnalysisEngine().analyze(
+        bad_lfn_path, tmp_path / "fat32-subdirectory-bad-lfn-cases",
+        mode=AnalysisMode.AUTO, execute=False,
+    )
+    assert not any(item.logical_name == long_name for item in bad_result.artifacts)
+    assert any(item.logical_name == "NESTED~1.TXT" for item in bad_result.artifacts)
+    unlinked = next(
+        observation.value for observation in bad_result.observations
+        if observation.artifact_id == bad_result.root_artifact.id
+        and observation.key == "filesystem.fat.unlinked_lfn_slots"
+    )
+    assert unlinked == [{
+        "directory_start_cluster": 5,
+        "directory_cluster_lineage": [5, 9],
+        "directory_source_entry_offset": root_offset,
+        "short_entry_index": 17,
+        "short_entry_offset": short_offset,
+        "slot_offsets": [second_directory_offset],
+        "reason": "active LFN checksum does not match the short entry",
+        "raw_hex": [bytes(bad_lfn[second_directory_offset:second_directory_offset + 32]).hex()],
+    }]
+
+
 def test_recycle_bin_exact_supplied_content_pair_is_correlated(tmp_path: Path) -> None:
     bundle = tmp_path / "recycle"
     bundle.mkdir()
