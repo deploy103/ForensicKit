@@ -16,6 +16,7 @@ Notable user-facing changes are documented here. This project follows Semantic V
 - FAT32 FSInfo, backup boot, and backup FSInfo validation with range-checked hints and exact divergence offsets.
 - Bounded FAT12/16 duplicate allocation-table comparison with exact relative/absolute first-divergence and truncated-copy provenance, without authoritative-copy selection.
 - FAT32 duplicate FAT comparison now honors BPB ExtFlags mirroring and active-table selection, including active-copy chain traversal and non-verdict inactive-copy divergence.
+- Per-copy FAT12/16/32 reserved-entry validation now cross-checks the BPB media descriptor and preserves FAT16/32 clean-shutdown and hard-error status bits.
 
 ## [1.1.0] - 2026-09-04
 

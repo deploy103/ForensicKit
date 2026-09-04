@@ -1,10 +1,10 @@
 # ForensicKit Work Queue
 
-Last reviewed: 2026-09-04 22:34 KST
+Last reviewed: 2026-09-04 22:42 KST
 
 ## Post-v1.1 backlog
 
-- [ ] Validate FAT12/16/32 reserved allocation-table entries against BPB media descriptors and retain per-copy structural provenance without using them to repair a table.
+- [ ] Inventory bounded FAT12/16/32 lost allocation chains that are not referenced by any validated active directory entry, with no automatic ownership claim or unsafe recovery.
 
 ## v1.1.0 release gate
 
@@ -26,6 +26,7 @@ Last reviewed: 2026-09-04 22:34 KST
 - [x] FAT32 FSInfo/backup boot/backup FSInfo signatures, hint ranges, and exact divergence provenance.
 - [x] Bounded FAT12/16 duplicate FAT-copy inventory, exact first-divergence offsets, and unavailable-copy provenance without authoritative selection.
 - [x] FAT32 ExtFlags-aware duplicate FAT comparison and BPB-selected active-table traversal, with mirrored-vs-inactive divergence semantics.
+- [x] Per-copy FAT12/16/32 reserved-entry and BPB media validation with retained clean-shutdown/hard-error status.
 - [x] Shared bounded ext inode mapper for direct blocks and depth-zero/depth-one extent trees.
 - [x] Depth-one extent-index/leaf/data provenance, repeated-leaf protection, and recursive Engine flag E2E.
 - [x] Bounded active ext subdirectory traversal and recursively recoverable regular-file children with inode/directory/block lineage.

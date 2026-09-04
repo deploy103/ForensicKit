@@ -1,5 +1,18 @@
 # ForensicKit Work Log
 
+## 2026-09-04 22:42 KST
+
+### FAT reserved-entry and media validation
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/profiles/disk.py`, and `tests/test_triage.py`.
+- Every available declared FAT12/16/32 copy now has independently decoded cluster-zero/cluster-one reserved entries with exact table offsets and raw bytes. Cluster zero is cross-checked against the BPB media descriptor and format-specific high reserved pattern; cluster one is checked using the EOC/reserved payload bits.
+- FAT16 and FAT32 clean-shutdown and hard-error flags are exposed separately from structural validity, so a legitimately dirty/error-marked volume is not mislabeled solely because status bits are clear. FAT32 upper reserved nibbles are retained without being interpreted as allocation state.
+- Added/expanded synthetic assertions for FAT12 packed `F0 FF FF`, a structurally valid dirty/error-marked FAT16 `FFF8/3FFF` header, valid FAT32 `0FFFFFF8/0FFFFFFF` headers, and an independently malformed inactive FAT32 header. The latter emits a reserved-entry anomaly but does not turn expected non-mirrored divergence into a copy-consistency verdict. Focused direct regression: 88 passed, 0 failed.
+
+### Next
+
+- Derive a bounded active-directory referenced-cluster set and inventory allocation-table chains that have no validated directory owner, retaining exact FAT/data offsets and refusing automatic ownership/recovery claims.
+
 ## 2026-09-04 22:34 KST
 
 ### FAT32 ExtFlags and duplicate allocation tables

@@ -3685,10 +3685,13 @@ class GenericTriageEngine:
             and fat_entry_capacity >= cluster_count + 2
         )
         comparison_limit = 8 * _MIB
+        media_descriptor = header[21] if len(header) > 21 else 0
         inventory: dict[str, object] = {
             "available": geometry_valid and fat_count >= 2,
             "variant": variant,
             "declared_count": fat_count,
+            "media_descriptor": f"0x{media_descriptor:02X}",
+            "media_descriptor_valid": media_descriptor == 0xF0 or 0xF8 <= media_descriptor <= 0xFF,
             "fat_size_bytes": fat_size_bytes,
             "cluster_count": cluster_count,
             "fat_entry_capacity": fat_entry_capacity,
@@ -3741,6 +3744,81 @@ class GenericTriageEngine:
                 copy_record["reason"] = "declared FAT range exceeds supplied image"
             copies.append(copy_record)
         inventory["copies"] = copies
+        reserved_width = 3 if fat_bits == 12 else 4 if fat_bits == 16 else 8
+        try:
+            with path.open("rb") as stream:
+                for copy_record in copies:
+                    if copy_record["available"] is not True:
+                        continue
+                    stream.seek(int(copy_record["offset"]))
+                    reserved = stream.read(reserved_width)
+                    if len(reserved) != reserved_width:
+                        copy_record["reserved_entries"] = {
+                            "available": False,
+                            "reason": "truncated reserved-entry read",
+                            "bytes_read": len(reserved),
+                        }
+                        continue
+                    if fat_bits == 12:
+                        entry0 = reserved[0] | ((reserved[1] & 0x0F) << 8)
+                        entry1 = (reserved[1] >> 4) | (reserved[2] << 4)
+                        reserved_entries: dict[str, object] = {
+                            "available": True,
+                            "raw_hex": reserved.hex(),
+                            "entry0_offset": copy_record["offset"],
+                            "entry1_packed_offset": int(copy_record["offset"]) + 1,
+                            "entry0": f"0x{entry0:03X}",
+                            "entry1": f"0x{entry1:03X}",
+                            "entry0_media_matches": entry0 & 0xFF == media_descriptor,
+                            "entry0_reserved_bits_valid": entry0 & 0xF00 == 0xF00,
+                            "entry1_eoc_valid": entry1 >= 0xFF8,
+                        }
+                    elif fat_bits == 16:
+                        entry0 = int.from_bytes(reserved[0:2], "little")
+                        entry1 = int.from_bytes(reserved[2:4], "little")
+                        reserved_entries = {
+                            "available": True,
+                            "raw_hex": reserved.hex(),
+                            "entry0_offset": copy_record["offset"],
+                            "entry1_offset": int(copy_record["offset"]) + 2,
+                            "entry0": f"0x{entry0:04X}",
+                            "entry1": f"0x{entry1:04X}",
+                            "entry0_media_matches": entry0 & 0xFF == media_descriptor,
+                            "entry0_reserved_bits_valid": entry0 & 0xFF00 == 0xFF00,
+                            "entry1_eoc_valid": entry1 & 0x3FFF >= 0x3FF8,
+                            "entry1_clean_shutdown": bool(entry1 & 0x8000),
+                            "entry1_no_io_errors": bool(entry1 & 0x4000),
+                        }
+                    else:
+                        raw_entry0 = int.from_bytes(reserved[0:4], "little")
+                        raw_entry1 = int.from_bytes(reserved[4:8], "little")
+                        entry0 = raw_entry0 & 0x0FFFFFFF
+                        entry1 = raw_entry1 & 0x0FFFFFFF
+                        reserved_entries = {
+                            "available": True,
+                            "raw_hex": reserved.hex(),
+                            "entry0_offset": copy_record["offset"],
+                            "entry1_offset": int(copy_record["offset"]) + 4,
+                            "entry0_raw": f"0x{raw_entry0:08X}",
+                            "entry1_raw": f"0x{raw_entry1:08X}",
+                            "entry0_masked": f"0x{entry0:08X}",
+                            "entry1_masked": f"0x{entry1:08X}",
+                            "entry0_reserved_high_nibble": raw_entry0 >> 28,
+                            "entry1_reserved_high_nibble": raw_entry1 >> 28,
+                            "entry0_media_matches": entry0 & 0xFF == media_descriptor,
+                            "entry0_reserved_bits_valid": entry0 & 0x0FFFFF00 == 0x0FFFFF00,
+                            "entry1_eoc_valid": entry1 & 0x03FFFFFF >= 0x03FFFFF8,
+                            "entry1_clean_shutdown": bool(entry1 & 0x08000000),
+                            "entry1_no_io_errors": bool(entry1 & 0x04000000),
+                        }
+                    reserved_entries["valid"] = (
+                        reserved_entries["entry0_media_matches"] is True
+                        and reserved_entries["entry0_reserved_bits_valid"] is True
+                        and reserved_entries["entry1_eoc_valid"] is True
+                    )
+                    copy_record["reserved_entries"] = reserved_entries
+        except OSError as exc:
+            inventory["reserved_entry_error"] = str(exc)[:2_000]
         if fat_bits == 32:
             active_copy_index = inventory["active_copy_index"]
             inventory["active_copy_available"] = (
