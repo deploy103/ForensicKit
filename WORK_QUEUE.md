@@ -1,10 +1,10 @@
 # ForensicKit Work Queue
 
-Last reviewed: 2026-09-05 01:52 KST
+Last reviewed: 2026-09-05 02:04 KST
 
 ## Post-v1.1 backlog
 
-- [ ] Add partition-offset-aware filesystem boot validation for bounded MBR partition entries without mounting or implicitly extracting evidence.
+- [ ] Extend offset-aware filesystem boot validation to bounded GPT partition entries while preserving GUID/type and primary/backup-table provenance.
 
 ## v1.1.0 release gate
 
@@ -45,6 +45,7 @@ Last reviewed: 2026-09-05 01:52 KST
 - [x] Audited FAT identity-lineage bounds: no emitted record can silently exceed 32 identities because native traversal itself stops after 32 processed directories.
 - [x] Variant-specific FAT12/16/32 BPB relationship validation with raw-derived checks and a dedicated structural-anomaly finding.
 - [x] BPB cluster-count FAT12/16/32 identification without a type label, including FAT-capacity gating and exact label/structure disagreement provenance.
+- [x] Exact-offset FAT/NTFS/exFAT boot validation for bounded primary MBR partitions with type-code and embedded-geometry mismatch findings.
 - [x] Shared bounded ext inode mapper for direct blocks and depth-zero/depth-one extent trees.
 - [x] Depth-one extent-index/leaf/data provenance, repeated-leaf protection, and recursive Engine flag E2E.
 - [x] Bounded active ext subdirectory traversal and recursively recoverable regular-file children with inode/directory/block lineage.

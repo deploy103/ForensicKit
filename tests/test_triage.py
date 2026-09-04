@@ -1813,6 +1813,142 @@ def test_fat_variant_is_derived_without_a_label_and_label_conflicts_are_preserve
     assert false_values["filesystem.fat_signature"] is False
 
 
+def test_mbr_partition_boot_filesystems_are_offset_validated_without_trusting_type_codes(tmp_path: Path) -> None:
+    sector_size = 512
+    image = bytearray(11 * sector_size)
+    first_entry = 446
+    image[first_entry + 4] = 0x06
+    image[first_entry + 8:first_entry + 12] = (1).to_bytes(4, "little")
+    image[first_entry + 12:first_entry + 16] = (4).to_bytes(4, "little")
+    second_entry = first_entry + 16
+    image[second_entry + 4] = 0x07
+    image[second_entry + 8:second_entry + 12] = (5).to_bytes(4, "little")
+    image[second_entry + 12:second_entry + 16] = (5).to_bytes(4, "little")
+    third_entry = second_entry + 16
+    image[third_entry + 4] = 0x07
+    image[third_entry + 8:third_entry + 12] = (10).to_bytes(4, "little")
+    image[third_entry + 12:third_entry + 16] = (100).to_bytes(4, "little")
+    image[510:512] = b"\x55\xaa"
+
+    fat = sector_size
+    image[fat:fat + 3] = b"\xeb\x3c\x90"
+    image[fat + 11:fat + 13] = sector_size.to_bytes(2, "little")
+    image[fat + 13] = 1
+    image[fat + 14:fat + 16] = (1).to_bytes(2, "little")
+    image[fat + 16] = 1
+    image[fat + 17:fat + 19] = (16).to_bytes(2, "little")
+    image[fat + 19:fat + 21] = (100).to_bytes(2, "little")
+    image[fat + 21] = 0xF8
+    image[fat + 22:fat + 24] = (1).to_bytes(2, "little")
+    image[fat + 28:fat + 32] = (1).to_bytes(4, "little")
+    image[fat + 510:fat + 512] = b"\x55\xaa"
+
+    ntfs = 5 * sector_size
+    image[ntfs:ntfs + 3] = b"\xeb\x52\x90"
+    image[ntfs + 3:ntfs + 11] = b"NTFS    "
+    image[ntfs + 11:ntfs + 13] = sector_size.to_bytes(2, "little")
+    image[ntfs + 13] = 1
+    image[ntfs + 21] = 0xF8
+    image[ntfs + 28:ntfs + 32] = (5).to_bytes(4, "little")
+    image[ntfs + 40:ntfs + 48] = (5).to_bytes(8, "little")
+    image[ntfs + 48:ntfs + 56] = (1).to_bytes(8, "little")
+    image[ntfs + 56:ntfs + 64] = (2).to_bytes(8, "little")
+    image[ntfs + 64] = 0xF6
+    image[ntfs + 68] = 0xF6
+    image[ntfs + 510:ntfs + 512] = b"\x55\xaa"
+
+    exfat = 10 * sector_size
+    image[exfat:exfat + 3] = b"\xeb\x76\x90"
+    image[exfat + 3:exfat + 11] = b"EXFAT   "
+    image[exfat + 64:exfat + 72] = (10).to_bytes(8, "little")
+    image[exfat + 72:exfat + 80] = (100).to_bytes(8, "little")
+    image[exfat + 80:exfat + 84] = (24).to_bytes(4, "little")
+    image[exfat + 84:exfat + 88] = (1).to_bytes(4, "little")
+    image[exfat + 88:exfat + 92] = (25).to_bytes(4, "little")
+    image[exfat + 92:exfat + 96] = (75).to_bytes(4, "little")
+    image[exfat + 96:exfat + 100] = (2).to_bytes(4, "little")
+    image[exfat + 104:exfat + 106] = (0x0100).to_bytes(2, "little")
+    image[exfat + 108] = 9
+    image[exfat + 109] = 0
+    image[exfat + 110] = 1
+    image[exfat + 112] = 0
+    image[exfat + 510:exfat + 512] = b"\x55\xaa"
+
+    evidence = tmp_path / "mbr-partition-filesystems.raw"
+    evidence.write_bytes(image)
+    artifact = _artifact(evidence)
+    observations = GenericTriageEngine().analyze(artifact, evidence)
+    values = _values(observations)
+    partitions = values["disk.mbr.partition_filesystems"]
+    assert len(partitions) == 3
+    assert partitions[0]["partition_offset"] == sector_size
+    assert partitions[0]["boot_sector_offset"] == sector_size
+    assert partitions[0]["filesystem_candidate"] == "fat12"
+    assert partitions[0]["detected_filesystem"] == "fat12"
+    assert partitions[0]["detection_basis"] == "fat_bpb_cluster_count"
+    assert partitions[0]["expected_filesystems_from_type_code"] == ["fat16"]
+    assert partitions[0]["partition_type_matches_detected"] is False
+    assert partitions[0]["validation"]["valid"] is True
+    assert partitions[0]["validation"]["declared_volume_within_partition"] is False
+    assert partitions[0]["boot_declared_start_lba"] == 1
+    assert partitions[0]["boot_declared_start_lba_field_offset"] == fat + 28
+    assert partitions[0]["boot_declared_start_lba_matches_mbr"] is True
+    assert partitions[0]["boot_declared_volume_field_offset"] == fat + 19
+    assert partitions[0]["boot_declared_volume_field_width"] == 2
+    assert partitions[0]["boot_declared_volume_matches_partition"] is False
+    assert partitions[1]["partition_offset"] == ntfs
+    assert partitions[1]["filesystem_candidate"] == "ntfs"
+    assert partitions[1]["detected_filesystem"] == "ntfs"
+    assert partitions[1]["expected_filesystems_from_type_code"] == ["ntfs", "exfat"]
+    assert partitions[1]["partition_type_matches_detected"] is True
+    assert partitions[1]["validation"]["failed_checks"] == []
+    assert partitions[1]["boot_declared_start_lba"] == 5
+    assert partitions[1]["boot_declared_volume_field_offset"] == ntfs + 40
+    assert partitions[1]["boot_declared_volume_matches_partition"] is True
+    assert partitions[2]["partition_offset"] == exfat
+    assert partitions[2]["filesystem_candidate"] == "exfat"
+    assert partitions[2]["detected_filesystem"] == "exfat"
+    assert partitions[2]["partition_type_matches_detected"] is True
+    assert partitions[2]["validation"]["failed_checks"] == []
+    assert partitions[2]["boot_declared_start_lba_field_offset"] == exfat + 64
+    assert partitions[2]["boot_declared_volume_field_offset"] == exfat + 72
+    assert partitions[2]["boot_declared_volume_matches_partition"] is True
+
+    profile = ProfileEngine().evaluate(artifact, observations)
+    inventory = next(
+        item for item in profile.findings
+        if item.category == "mbr_partition_filesystem_inventory"
+    )
+    mismatch = next(
+        item for item in profile.findings
+        if item.category == "partition_type_filesystem_mismatch"
+    )
+    geometry_mismatch = next(
+        item for item in profile.findings
+        if item.category == "partition_boot_geometry_mismatch"
+    )
+    assert "'partition_offset': 512" in inventory.supporting_evidence[0]
+    assert "'expected_filesystems_from_type_code': ['fat16']" in mismatch.supporting_evidence[0]
+    assert "'boot_declared_volume_matches_partition': False" in geometry_mismatch.supporting_evidence[0]
+
+    malformed = bytearray(image)
+    malformed[ntfs + 510:ntfs + 512] = b"\x00\x00"
+    malformed_path = tmp_path / "mbr-malformed-ntfs-partition.raw"
+    malformed_path.write_bytes(malformed)
+    malformed_artifact = _artifact(malformed_path)
+    malformed_observations = GenericTriageEngine().analyze(malformed_artifact, malformed_path)
+    malformed_partitions = _values(malformed_observations)["disk.mbr.partition_filesystems"]
+    assert malformed_partitions[1]["filesystem_candidate"] == "ntfs"
+    assert malformed_partitions[1]["detected_filesystem"] is None
+    assert "end_marker_valid" in malformed_partitions[1]["validation"]["failed_checks"]
+    malformed_profile = ProfileEngine().evaluate(malformed_artifact, malformed_observations)
+    boot_anomaly = next(
+        item for item in malformed_profile.findings
+        if item.category == "partition_filesystem_boot_anomaly"
+    )
+    assert "'boot_sector_offset': 2560" in boot_anomaly.supporting_evidence[0]
+
+
 def test_fat32_extflags_control_copy_consistency_and_active_chain_traversal(tmp_path: Path) -> None:
     sector_size = 512
     reserved = 1

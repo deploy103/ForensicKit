@@ -747,6 +747,9 @@ class GenericTriageEngine:
         mbr_partitions = self._mbr_partitions(sector, size) if boot_signature else []
         mbr = bool(mbr_partitions)
         gpt_details, gpt_partitions = self._gpt_partitions(path, size, gpt_header) if gpt else ({"valid": False}, [])
+        partition_filesystems = self._inspect_mbr_partition_filesystems(
+            path, size, mbr_partitions,
+        )
         return [
             self._observation(artifact, "disk.mbr_signature", mbr),
             self._observation(artifact, "disk.boot_signature", boot_signature),
@@ -754,6 +757,7 @@ class GenericTriageEngine:
             self._observation(artifact, "signature.partition_table", mbr or gpt),
             self._observation(artifact, "disk.mbr.partition_count", len(mbr_partitions)),
             self._observation(artifact, "disk.mbr.partitions", mbr_partitions),
+            self._observation(artifact, "disk.mbr.partition_filesystems", partition_filesystems),
             self._observation(artifact, "disk.gpt.header", gpt_details),
             self._observation(artifact, "disk.gpt.partition_count", len(gpt_partitions)),
             self._observation(artifact, "disk.gpt.partitions", gpt_partitions),
@@ -878,6 +882,305 @@ class GenericTriageEngine:
                 "within_image": bool(sector_count and end_lba < sectors),
             })
         return partitions
+
+    def _inspect_mbr_partition_filesystems(
+        self,
+        path: Path,
+        image_size: int,
+        partitions: list[dict[str, object]],
+    ) -> list[dict[str, object]]:
+        """Validate filesystem boot sectors at exact primary-MBR LBA offsets."""
+        expected_by_type = {
+            "0x01": ["fat12"],
+            "0x04": ["fat16"],
+            "0x06": ["fat16"],
+            "0x0b": ["fat32"],
+            "0x0c": ["fat32"],
+            "0x0e": ["fat16"],
+            "0x07": ["ntfs", "exfat"],
+        }
+        results: list[dict[str, object]] = []
+        for partition in partitions[:4]:
+            start_lba = int(partition.get("start_lba", 0))
+            sector_count = int(partition.get("sector_count", 0))
+            partition_offset = start_lba * 512
+            declared_bytes = sector_count * 512
+            available_bytes = (
+                min(declared_bytes, image_size - partition_offset)
+                if declared_bytes > 0 and 0 <= partition_offset < image_size else 0
+            )
+            type_code = str(partition.get("type_code", ""))
+            expected = expected_by_type.get(type_code, [])
+            record: dict[str, object] = {
+                "slot": partition.get("slot"),
+                "partition_type_code": type_code,
+                "partition_type": partition.get("type"),
+                "start_lba": start_lba,
+                "sector_count": sector_count,
+                "partition_offset": partition_offset,
+                "declared_partition_bytes": declared_bytes,
+                "available_partition_bytes": available_bytes,
+                "partition_within_supplied_image": partition.get("within_image"),
+                "boot_sector_offset": partition_offset,
+                "boot_sector_available": available_bytes >= 512,
+                "expected_filesystems_from_type_code": expected,
+                "filesystem_candidate": None,
+                "detected_filesystem": None,
+                "detection_basis": None,
+                "validation": None,
+                "partition_type_matches_detected": None,
+                "boot_declared_start_lba": None,
+                "boot_declared_start_lba_field_offset": None,
+                "boot_declared_start_lba_matches_mbr": None,
+                "boot_declared_volume_bytes": None,
+                "boot_declared_volume_field_offset": None,
+                "boot_declared_volume_field_width": None,
+                "boot_declared_volume_matches_partition": None,
+            }
+            if available_bytes < 512:
+                record["error"] = "partition boot sector is outside supplied image bounds"
+                results.append(record)
+                continue
+            try:
+                with path.open("rb") as stream:
+                    stream.seek(partition_offset)
+                    boot_sector = stream.read(512)
+            except OSError as exc:
+                record["error"] = str(exc)[:2_000]
+                results.append(record)
+                continue
+            if len(boot_sector) != 512:
+                record["error"] = "partition boot sector could not be read completely"
+                results.append(record)
+                continue
+
+            detected: str | None = None
+            if boot_sector[3:11] == b"NTFS    ":
+                record["filesystem_candidate"] = "ntfs"
+                record["detection_basis"] = "ntfs_oem_identifier_and_bpb"
+                validation = self._ntfs_partition_boot_validation(
+                    boot_sector, declared_bytes,
+                )
+                record["validation"] = validation
+                if validation["valid"] is True:
+                    detected = "ntfs"
+            elif boot_sector[3:11] == b"EXFAT   ":
+                record["filesystem_candidate"] = "exfat"
+                record["detection_basis"] = "exfat_name_and_boot_geometry"
+                validation = self._exfat_partition_boot_validation(
+                    boot_sector, declared_bytes,
+                )
+                record["validation"] = validation
+                if validation["valid"] is True:
+                    detected = "exfat"
+            else:
+                fat_bits = self._fat_bpb_cluster_count_variant(boot_sector)
+                label_records = self._fat_type_label_records(boot_sector)
+                explicit_label_bits = {
+                    int(item["explicit_fat_bits"])
+                    for item in label_records
+                    if isinstance(item.get("explicit_fat_bits"), int)
+                }
+                label_bits = (
+                    next(iter(explicit_label_bits))
+                    if len(explicit_label_bits) == 1 else 0
+                )
+                candidate_bits = fat_bits or label_bits
+                if candidate_bits:
+                    record["filesystem_candidate"] = f"fat{candidate_bits}"
+                    record["detection_basis"] = "fat_bpb_cluster_count"
+                    validation = self._fat_bpb_validation(
+                        boot_sector, declared_bytes, candidate_bits,
+                    )
+                    validation["declared_volume_within_partition"] = validation.pop(
+                        "declared_volume_within_supplied_image"
+                    )
+                    validation["type_label_records"] = [
+                        {**item, "image_offset": partition_offset + int(item["offset"])}
+                        for item in label_records
+                    ]
+                    record["validation"] = validation
+                    if validation["valid"] is True and fat_bits == candidate_bits:
+                        detected = f"fat{candidate_bits}"
+            if record["filesystem_candidate"] is not None:
+                start_field_offset = 64 if record["filesystem_candidate"] == "exfat" else 28
+                start_field_width = 8 if record["filesystem_candidate"] == "exfat" else 4
+                declared_start_lba = int.from_bytes(
+                    boot_sector[start_field_offset:start_field_offset + start_field_width],
+                    "little",
+                )
+                record["boot_declared_start_lba"] = declared_start_lba
+                record["boot_declared_start_lba_field_offset"] = (
+                    partition_offset + start_field_offset
+                )
+                record["boot_declared_start_lba_matches_mbr"] = (
+                    declared_start_lba == start_lba
+                )
+                validation = record.get("validation")
+                if isinstance(validation, dict):
+                    declared_volume_bytes = validation.get("declared_volume_bytes")
+                    if isinstance(declared_volume_bytes, int):
+                        record["boot_declared_volume_bytes"] = declared_volume_bytes
+                        if record["filesystem_candidate"] == "exfat":
+                            volume_field_offset, volume_field_width = 72, 8
+                        elif record["filesystem_candidate"] == "ntfs":
+                            volume_field_offset, volume_field_width = 40, 8
+                        elif int.from_bytes(boot_sector[19:21], "little"):
+                            volume_field_offset, volume_field_width = 19, 2
+                        else:
+                            volume_field_offset, volume_field_width = 32, 4
+                        record["boot_declared_volume_field_offset"] = (
+                            partition_offset + volume_field_offset
+                        )
+                        record["boot_declared_volume_field_width"] = volume_field_width
+                        record["boot_declared_volume_matches_partition"] = (
+                            declared_volume_bytes == declared_bytes
+                        )
+            record["detected_filesystem"] = detected
+            if detected is not None and expected:
+                record["partition_type_matches_detected"] = detected in expected
+            results.append(record)
+        return results
+
+    @staticmethod
+    def _ntfs_partition_boot_validation(
+        boot_sector: bytes, partition_bytes: int,
+    ) -> dict[str, object]:
+        bytes_per_sector = int.from_bytes(boot_sector[11:13], "little")
+        sectors_per_cluster = boot_sector[13]
+        total_sectors = int.from_bytes(boot_sector[40:48], "little")
+        cluster_count = total_sectors // sectors_per_cluster if sectors_per_cluster else 0
+        mft_lcn = int.from_bytes(boot_sector[48:56], "little")
+        mft_mirror_lcn = int.from_bytes(boot_sector[56:64], "little")
+        cluster_size = bytes_per_sector * sectors_per_cluster
+
+        def record_size(raw: int) -> int:
+            signed = raw - 256 if raw >= 128 else raw
+            if signed < 0:
+                return 1 << -signed if -signed < 31 else 0
+            return signed * cluster_size
+
+        file_record_size = record_size(boot_sector[64])
+        index_record_size = record_size(boot_sector[68])
+        jump_target = (
+            2 + int.from_bytes(boot_sector[1:2], "little", signed=True)
+            if boot_sector[0] == 0xEB else None
+        )
+        checks = {
+            "oem_identifier_valid": boot_sector[3:11] == b"NTFS    ",
+            "jump_instruction_valid": (
+                boot_sector[0] == 0xEB and boot_sector[2] == 0x90
+                and jump_target is not None and 3 <= jump_target < 510
+            ),
+            "end_marker_valid": boot_sector[510:512] == b"\x55\xaa",
+            "bytes_per_sector_valid": bytes_per_sector in {512, 1024, 2048, 4096},
+            "sectors_per_cluster_valid": (
+                0 < sectors_per_cluster <= 128
+                and sectors_per_cluster & (sectors_per_cluster - 1) == 0
+            ),
+            "reserved_bpb_fields_valid": (
+                boot_sector[14:16] == b"\x00\x00"
+                and boot_sector[16:21] == b"\x00" * 5
+                and boot_sector[21] == 0xF8
+                and boot_sector[22:24] == b"\x00\x00"
+                and boot_sector[32:40] == b"\x00" * 8
+            ),
+            "total_sectors_valid": total_sectors > 0,
+            "mft_lcn_valid": 0 < mft_lcn < cluster_count,
+            "mft_mirror_lcn_valid": 0 < mft_mirror_lcn < cluster_count,
+            "file_record_size_valid": (
+                256 <= file_record_size <= 65_536
+                and file_record_size & (file_record_size - 1) == 0
+            ),
+            "index_record_size_valid": (
+                256 <= index_record_size <= 65_536
+                and index_record_size & (index_record_size - 1) == 0
+            ),
+        }
+        declared_volume_bytes = total_sectors * bytes_per_sector
+        return {
+            "available": len(boot_sector) == 512,
+            "valid": all(checks.values()),
+            "failed_checks": [name for name, valid in checks.items() if not valid],
+            "checks": checks,
+            "jump_target_offset": jump_target,
+            "bytes_per_sector": bytes_per_sector,
+            "sectors_per_cluster": sectors_per_cluster,
+            "cluster_size": cluster_size,
+            "total_sectors": total_sectors,
+            "cluster_count": cluster_count,
+            "mft_lcn": mft_lcn,
+            "mft_mirror_lcn": mft_mirror_lcn,
+            "file_record_size": file_record_size,
+            "index_record_size": index_record_size,
+            "declared_volume_bytes": declared_volume_bytes,
+            "declared_volume_within_partition": declared_volume_bytes <= partition_bytes,
+        }
+
+    @staticmethod
+    def _exfat_partition_boot_validation(
+        boot_sector: bytes, partition_bytes: int,
+    ) -> dict[str, object]:
+        volume_sectors = int.from_bytes(boot_sector[72:80], "little")
+        fat_offset = int.from_bytes(boot_sector[80:84], "little")
+        fat_length = int.from_bytes(boot_sector[84:88], "little")
+        cluster_heap_offset = int.from_bytes(boot_sector[88:92], "little")
+        cluster_count = int.from_bytes(boot_sector[92:96], "little")
+        root_cluster = int.from_bytes(boot_sector[96:100], "little")
+        revision = int.from_bytes(boot_sector[104:106], "little")
+        bytes_shift = boot_sector[108]
+        sectors_shift = boot_sector[109]
+        fat_count = boot_sector[110]
+        percent_in_use = boot_sector[112]
+        bytes_per_sector = 1 << bytes_shift if bytes_shift < 31 else 0
+        sectors_per_cluster = 1 << sectors_shift if sectors_shift < 31 else 0
+        fat_entry_capacity = (
+            fat_length * bytes_per_sector // 4 if bytes_per_sector else 0
+        )
+        checks = {
+            "jump_instruction_valid": boot_sector[:3] == b"\xeb\x76\x90",
+            "filesystem_name_valid": boot_sector[3:11] == b"EXFAT   ",
+            "must_be_zero_valid": boot_sector[11:64] == b"\x00" * 53,
+            "end_marker_valid": boot_sector[510:512] == b"\x55\xaa",
+            "revision_valid": revision == 0x0100,
+            "bytes_per_sector_shift_valid": 9 <= bytes_shift <= 12,
+            "sectors_per_cluster_shift_valid": (
+                sectors_shift <= 25 - bytes_shift if bytes_shift <= 25 else False
+            ),
+            "fat_count_valid": fat_count in {1, 2},
+            "percent_in_use_valid": percent_in_use <= 100 or percent_in_use == 0xFF,
+            "volume_sectors_valid": volume_sectors > 0,
+            "fat_region_valid": (
+                fat_offset >= 24 and fat_length > 0
+                and fat_offset + fat_count * fat_length <= cluster_heap_offset
+            ),
+            "cluster_heap_valid": (
+                cluster_count > 0
+                and cluster_heap_offset + cluster_count * sectors_per_cluster <= volume_sectors
+            ),
+            "root_cluster_valid": 2 <= root_cluster < cluster_count + 2,
+            "fat_entry_capacity_sufficient": fat_entry_capacity >= cluster_count + 2,
+        }
+        declared_volume_bytes = volume_sectors * bytes_per_sector
+        return {
+            "available": len(boot_sector) == 512,
+            "valid": all(checks.values()),
+            "failed_checks": [name for name, valid in checks.items() if not valid],
+            "checks": checks,
+            "bytes_per_sector": bytes_per_sector,
+            "sectors_per_cluster": sectors_per_cluster,
+            "volume_sectors": volume_sectors,
+            "fat_offset_sectors": fat_offset,
+            "fat_length_sectors": fat_length,
+            "fat_count": fat_count,
+            "fat_entry_capacity": fat_entry_capacity,
+            "cluster_heap_offset_sectors": cluster_heap_offset,
+            "cluster_count": cluster_count,
+            "root_cluster": root_cluster,
+            "filesystem_revision": f"{revision >> 8}.{revision & 0xFF}",
+            "declared_volume_bytes": declared_volume_bytes,
+            "declared_volume_within_partition": declared_volume_bytes <= partition_bytes,
+        }
 
     @staticmethod
     def _gpt_partitions(path: Path, image_size: int, header: bytes) -> tuple[dict[str, object], list[dict[str, object]]]:
@@ -2017,22 +2320,7 @@ class GenericTriageEngine:
                 pass
         ntfs = len(header) >= 11 and header[3:11] == b"NTFS    "
         exfat = len(header) >= 11 and header[3:11] == b"EXFAT   "
-        fat_label_records: list[dict[str, object]] = []
-        for offset, field in ((54, boot_sector[54:62]), (82, boot_sector[82:90])):
-            if not field.startswith(b"FAT"):
-                continue
-            explicit_bits = (
-                12 if field.startswith(b"FAT12")
-                else 16 if field.startswith(b"FAT16")
-                else 32 if field.startswith(b"FAT32")
-                else None
-            )
-            fat_label_records.append({
-                "offset": offset,
-                "raw_hex": field.hex(),
-                "text": field.decode("ascii", errors="replace"),
-                "explicit_fat_bits": explicit_bits,
-            })
+        fat_label_records = self._fat_type_label_records(boot_sector)
         explicit_label_bits = {
             int(item["explicit_fat_bits"])
             for item in fat_label_records
@@ -2205,6 +2493,27 @@ class GenericTriageEngine:
                 artifact, path, size, ext_superblock,
             ))
         return observations
+
+    @staticmethod
+    def _fat_type_label_records(header: bytes) -> list[dict[str, object]]:
+        """Retain informational FAT type-label fields without treating them as truth."""
+        records: list[dict[str, object]] = []
+        for offset, field in ((54, header[54:62]), (82, header[82:90])):
+            if not field.startswith(b"FAT"):
+                continue
+            explicit_bits = (
+                12 if field.startswith(b"FAT12")
+                else 16 if field.startswith(b"FAT16")
+                else 32 if field.startswith(b"FAT32")
+                else None
+            )
+            records.append({
+                "offset": offset,
+                "raw_hex": field.hex(),
+                "text": field.decode("ascii", errors="replace"),
+                "explicit_fat_bits": explicit_bits,
+            })
+        return records
 
     @staticmethod
     def _fat_bpb_cluster_count_variant(header: bytes) -> int:

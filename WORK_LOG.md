@@ -1,5 +1,18 @@
 # ForensicKit Work Log
 
+## 2026-09-05 02:04 KST
+
+### Exact-offset MBR partition filesystem validation
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/profiles/disk.py`, and `tests/test_triage.py`.
+- Each of at most four bounded primary MBR entries now supplies an exact `start_lba * 512` boot-sector read. FAT candidates reuse cluster-count/capacity/BPB validation; NTFS validates its OEM marker, jump, reserved BPB fields, geometry, MFT/MFTMirr locations, and record sizes; exFAT validates its jump/name/zero region, shifts, revision, FAT/heap/root relationships, and FAT capacity. A format is confirmed only after its complete checks pass.
+- `disk.mbr.partition_filesystems` retains the MBR slot/type/start/length, exact boot offset, available evidence length, format candidate and basis, full validation map, and independent detected format. It also compares the MBR type-code expectation and the boot sector's own hidden-sector/partition-offset and volume-length fields, retaining exact image offsets and widths rather than reconciling conflicts.
+- Added inventory, malformed-boot, type-code mismatch, and embedded boot-geometry mismatch findings. The synthetic whole disk contains exact-offset FAT12, NTFS, and exFAT partitions, plus a malformed NTFS copy; focused triage/profile regression passed: 95 passed, 0 failed. The full direct synthetic suite passed: 301 passed, 0 failed; compileall and `git diff --check` passed.
+
+### Next
+
+- Apply the same bounded format validators to CRC-validated GPT partition entries, retaining GUID/type and primary/backup GPT provenance without treating a type GUID as filesystem truth.
+
 ## 2026-09-05 01:52 KST
 
 ### Label-independent FAT variant identification
