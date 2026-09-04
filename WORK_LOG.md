@@ -1,5 +1,18 @@
 # ForensicKit Work Log
 
+## 2026-09-04 22:57 KST
+
+### Anonymous FAT lost-chain recursive recovery
+
+- Changed `src/forensickit/extraction.py` and `tests/test_engine_pipeline.py`.
+- The extraction manager now accepts only inventoried FAT12/16/32 candidates marked as complete EOC chains with 1–64 unique, exactly linked clusters whose full mapped ranges remain inside the immutable source. Candidates with a start already represented by deleted-entry metadata are skipped to avoid redundant anonymous copies.
+- At most 32 anonymous chains and 8 MiB total are copied under the existing depth/artifact/single/cumulative-byte controls. Logical names expose only FAT variant/start cluster; findings retain every segment plus `logical_size=unknown_full_clusters_include_final_cluster_slack` and `directory_ownership=not_inferred`. Existing per-variant deleted recovery and anonymous recovery are merged so one does not mask the other.
+- Added a FAT12 Engine/report E2E: the active cluster-5 file is excluded, `7 -> 8 -> EOC` becomes `FAT12_LOST_CHAIN_00000007.bin`, exact offsets survive finding/report provenance, and recursive FlagHunter attributes `CTF{fat12_lost_chain_recursive}` to the child. Combined Engine/triage regression: 131 passed, 0 failed.
+
+### Next
+
+- Parse active FAT12/16 regular entries (including validated active LFNs) from bounded root/subdirectory directories, map only exact size-required EOC chains, and register named recursive child artifacts with full directory/FAT provenance.
+
 ## 2026-09-04 22:52 KST
 
 ### FAT lost allocation-chain inventory
