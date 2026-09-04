@@ -617,6 +617,40 @@ class DiskProfile(BaseProfile):
                 evidence=[str(item)[:2_000] for item in fat12_subdirectory_errors[:128]],
                 severity="low",
             ))
+        for fat_bits in (12, 16, 32):
+            fat_header_inventory = next(
+                (
+                    value for value in context.values(f"filesystem.fat{fat_bits}.fat_copies")
+                    if isinstance(value, dict)
+                ),
+                {},
+            )
+            declared_count = fat_header_inventory.get("declared_count")
+            if not isinstance(declared_count, int) or declared_count < 1:
+                continue
+            copies = fat_header_inventory.get("copies")
+            invalid_reserved_entries = [
+                item for item in copies
+                if isinstance(item, dict) and item.get("available") is True
+                and (
+                    not isinstance(item.get("reserved_entries"), dict)
+                    or item["reserved_entries"].get("valid") is not True
+                )
+            ] if isinstance(copies, list) else []
+            if (
+                fat_header_inventory.get("media_descriptor_valid") is False
+                or invalid_reserved_entries
+            ):
+                result.findings.append(self.finding(
+                    context,
+                    title=f"FAT{fat_bits} reserved allocation-table entries are inconsistent",
+                    category=f"fat{fat_bits}_reserved_fat_entry_anomaly", confidence=0.97,
+                    explanation=(
+                        "The BPB media descriptor is outside the defined fixed/removable values, or one or more available FAT copies has a cluster-zero media/reserved pattern or cluster-one reserved/EOC pattern that does not validate. "
+                        "FAT16/32 clean-shutdown and hard-error bits are retained independently; malformed reserved entries do not cause another copy to be selected or repaired."
+                    ),
+                    evidence=[str(fat_header_inventory)[:2_000]], severity="medium",
+                ))
         qcow_header = next((value for value in context.values("disk.qcow2.header") if isinstance(value, dict)), {})
         vhd_footer = next((value for value in context.values("disk.vhd.footer") if isinstance(value, dict)), {})
         virtual_disk = context.format_is("vhd", "qcow2") or bool(qcow_header.get("valid")) or bool(vhd_footer.get("signature"))
