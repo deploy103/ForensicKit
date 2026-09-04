@@ -1733,6 +1733,81 @@ def test_fat32_extflags_control_copy_consistency_and_active_chain_traversal(tmp_
     assert "fat32_fat_copy_anomaly" not in malformed_categories
 
 
+def test_fat12_lost_chain_inventory_excludes_validated_active_file_chain(tmp_path: Path) -> None:
+    sector_size = 512
+    first_data_sector = 3
+    image = bytearray(12 * sector_size)
+    image[11:13] = sector_size.to_bytes(2, "little")
+    image[13] = 1
+    image[14:16] = (1).to_bytes(2, "little")
+    image[16] = 1
+    image[17:19] = (16).to_bytes(2, "little")
+    image[19:21] = (100).to_bytes(2, "little")
+    image[21] = 0xF0
+    image[22:24] = (1).to_bytes(2, "little")
+    image[54:62] = b"FAT12   "
+    image[510:512] = b"\x55\xaa"
+    image[sector_size:sector_size + 3] = b"\xf0\xff\xff"
+
+    def set_fat12(cluster: int, value: int) -> None:
+        offset = sector_size + cluster + cluster // 2
+        packed = int.from_bytes(image[offset:offset + 2], "little")
+        if cluster & 1:
+            packed = (packed & 0x000F) | ((value & 0x0FFF) << 4)
+        else:
+            packed = (packed & 0xF000) | (value & 0x0FFF)
+        image[offset:offset + 2] = packed.to_bytes(2, "little")
+
+    set_fat12(5, 0xFFF)
+    set_fat12(7, 8)
+    set_fat12(8, 0xFFF)
+    root_offset = 2 * sector_size
+    image[root_offset:root_offset + 11] = b"ACTIVE  TXT"
+    image[root_offset + 11] = 0x20
+    image[root_offset + 26:root_offset + 28] = (5).to_bytes(2, "little")
+    image[root_offset + 28:root_offset + 32] = (20).to_bytes(4, "little")
+    evidence = tmp_path / "fat12-lost-chain.raw"
+    evidence.write_bytes(image)
+    artifact = _artifact(evidence)
+
+    observations = GenericTriageEngine().analyze(artifact, evidence)
+    values = _values(observations)
+    inventory = values["filesystem.fat12.lost_chains"]
+    assert inventory["available"] is True
+    assert inventory["scan_complete_for_volume"] is True
+    assert inventory["active_start_clusters"] == [5]
+    assert inventory["allocated_cluster_count_in_scan"] == 3
+    assert inventory["validated_reference_cluster_count_in_scan"] == 1
+    assert inventory["unreferenced_allocated_cluster_count_in_scan"] == 2
+    assert inventory["ownership_inferred"] is False
+    assert inventory["content_recovered"] is False
+    assert inventory["chains_truncated"] is False
+    assert inventory["chains"] == [{
+        "start_cluster": 7,
+        "cluster_chain": [
+            {
+                "cluster": 7, "fat_entry_offset": sector_size + 10,
+                "fat_entry_raw": bytes(image[sector_size + 10:sector_size + 12]).hex(),
+                "next_cluster": 8, "data_offset": 8 * sector_size,
+                "data_length": sector_size, "data_within_supplied_image": True,
+            },
+            {
+                "cluster": 8, "fat_entry_offset": sector_size + 12,
+                "fat_entry_raw": bytes(image[sector_size + 12:sector_size + 14]).hex(),
+                "next_cluster": 0xFFF, "data_offset": 9 * sector_size,
+                "data_length": sector_size, "data_within_supplied_image": True,
+            },
+        ],
+        "termination": "eoc", "complete_eoc_chain": True,
+    }]
+    profile = ProfileEngine().evaluate(artifact, observations)
+    finding = next(
+        item for item in profile.findings
+        if item.category == "fat12_lost_allocation_chain_candidate"
+    )
+    assert "rather than proof of deletion" in finding.explanation
+
+
 def test_fat32_deleted_lfn_chain_requires_checksum_and_terminal_validation(tmp_path: Path) -> None:
     image = bytearray(4096)
     image[11:13] = (512).to_bytes(2, "little")

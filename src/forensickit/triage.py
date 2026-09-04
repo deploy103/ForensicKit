@@ -3982,12 +3982,20 @@ class GenericTriageEngine:
         entry_offsets = [root_offset + index * 32 for index in range(root_entries)]
         fat_offset = reserved_sectors * bytes_per_sector
         fat_end = fat_offset + fat_size * bytes_per_sector
-        subdirectory_entries, subdirectory_inventory, subdirectory_errors = (
+        subdirectory_entries, subdirectory_inventory, subdirectory_errors, active_cluster_starts = (
             self._fat_fixed_subdirectory_deleted_entries(
                 path, image_size, data, entry_offsets, bytes_per_sector,
                 sectors_per_cluster, first_data_sector, fat_offset, fat_end,
                 cluster_count, fat_bits=fat_bits,
             )
+        )
+        lost_chains = self._fat_lost_chain_inventory(
+            path, image_size, bytes_per_sector, sectors_per_cluster,
+            first_data_sector, fat_offset, fat_end, cluster_count,
+            active_cluster_starts, fat_bits=fat_bits,
+            directory_reference_scope_limited=(
+                root_entries > 4_096 or bool(subdirectory_errors)
+            ),
         )
         deleted_entries: list[dict[str, object]] = []
         unlinked_lfn_slots: list[dict[str, object]] = []
@@ -4074,6 +4082,7 @@ class GenericTriageEngine:
             self._observation(artifact, f"{prefix}.subdirectory_deleted_entries", subdirectory_entries),
             self._observation(artifact, f"{prefix}.subdirectory_inventory", subdirectory_inventory),
             self._observation(artifact, f"{prefix}.subdirectory_errors", subdirectory_errors),
+            self._observation(artifact, f"filesystem.{variant}.lost_chains", lost_chains),
             self._observation(artifact, f"{prefix}.unlinked_lfn_slots", unlinked_lfn_slots),
             self._observation(artifact, f"{prefix}.deleted_entries_truncated", len(deleted_entries) >= 256),
         ]
@@ -4092,7 +4101,7 @@ class GenericTriageEngine:
         cluster_count: int,
         *,
         fat_bits: int,
-    ) -> tuple[list[dict[str, object]], list[dict[str, object]], list[str]]:
+    ) -> tuple[list[dict[str, object]], list[dict[str, object]], list[str], set[int]]:
         """Traverse exact-EOC active FAT12/16 directories and inventory deleted children."""
         variant = f"FAT{fat_bits}"
         cluster_size = bytes_per_sector * sectors_per_cluster
@@ -4102,6 +4111,7 @@ class GenericTriageEngine:
         errors: list[str] = []
         visited_starts: set[int] = set()
         visited_clusters: set[int] = set()
+        active_cluster_starts: set[int] = set()
         total_clusters = 0
         total_bytes = 0
 
@@ -4112,14 +4122,18 @@ class GenericTriageEngine:
                     break
                 attributes = entry[11]
                 if (
-                    entry[0] == 0xE5 or attributes == 0x0F or not attributes & 0x10
+                    entry[0] == 0xE5 or attributes == 0x0F or attributes & 0x08
                     or int.from_bytes(entry[20:22], "little") != 0
                 ):
+                    continue
+                start = int.from_bytes(entry[26:28], "little")
+                if 2 <= start < cluster_count + 2:
+                    active_cluster_starts.add(start)
+                if not attributes & 0x10:
                     continue
                 name = entry[:8].decode("cp437", errors="replace").rstrip(" ")
                 if name in {".", ".."}:
                     continue
-                start = int.from_bytes(entry[26:28], "little")
                 if 2 <= start < cluster_count + 2 and len(queue) < 64:
                     queue.append({
                         "name": name, "start_cluster": start,
@@ -4261,12 +4275,208 @@ class GenericTriageEngine:
                         deleted.append(recovered)
                         pending_lfn = []
                         if len(deleted) >= 512:
-                            return deleted, inventory, errors
+                            return deleted, inventory, errors, active_cluster_starts
         except OSError as exc:
             errors.append(str(exc)[:2_000])
         if queue:
             errors.append(f"{variant} subdirectory traversal reached the 32-directory/64-cluster/8-MiB bound")
-        return deleted, inventory, errors
+        return deleted, inventory, errors, active_cluster_starts
+
+    @staticmethod
+    def _fat_lost_chain_inventory(
+        path: Path,
+        image_size: int,
+        bytes_per_sector: int,
+        sectors_per_cluster: int,
+        first_data_sector: int,
+        fat_offset: int,
+        fat_end: int,
+        cluster_count: int,
+        active_cluster_starts: set[int],
+        *,
+        fat_bits: int,
+        directory_reference_scope_limited: bool,
+    ) -> dict[str, object]:
+        """Inventory allocated chains absent from the bounded active-directory reference set."""
+        cluster_size = bytes_per_sector * sectors_per_cluster
+        cluster_scan_limit = 131_072
+        maximum_cluster = min(cluster_count + 1, cluster_scan_limit + 1)
+        scan_cluster_count = max(0, maximum_cluster - 1)
+        available = (
+            fat_bits in {12, 16, 32} and cluster_count > 0
+            and (fat_bits != 32 or cluster_count >= 65_525)
+            and 0 < cluster_size <= 2 * _MIB and fat_offset >= 0
+            and fat_end > fat_offset and fat_end <= image_size
+            and first_data_sector > 0
+        )
+        inventory: dict[str, object] = {
+            "available": available,
+            "fat_bits": fat_bits,
+            "active_fat_offset": fat_offset,
+            "cluster_count": cluster_count,
+            "cluster_scan_limit": cluster_scan_limit,
+            "scanned_cluster_count": scan_cluster_count,
+            "scan_complete_for_volume": scan_cluster_count == cluster_count,
+            "directory_reference_scope": "bounded_validated_active_entries_only",
+            "directory_reference_scope_limited": directory_reference_scope_limited,
+            "active_start_clusters": sorted(active_cluster_starts)[:65_536],
+            "active_start_clusters_truncated": len(active_cluster_starts) > 65_536,
+            "chains": [],
+            "chains_truncated": False,
+            "ownership_inferred": False,
+            "content_recovered": False,
+        }
+        if not available or scan_cluster_count == 0:
+            inventory["reason"] = "invalid FAT/data geometry or active FAT is outside supplied image"
+            return inventory
+
+        relative_end = (
+            maximum_cluster + maximum_cluster // 2 + 2 if fat_bits == 12
+            else (maximum_cluster + 1) * (2 if fat_bits == 16 else 4)
+        )
+        read_length = min(fat_end - fat_offset, relative_end)
+        try:
+            with path.open("rb") as stream:
+                stream.seek(fat_offset)
+                fat_data = stream.read(read_length)
+        except OSError as exc:
+            inventory["available"] = False
+            inventory["error"] = str(exc)[:2_000]
+            return inventory
+        if len(fat_data) != read_length:
+            inventory["available"] = False
+            inventory["reason"] = "truncated active-FAT scan"
+            inventory["bytes_read"] = len(fat_data)
+            return inventory
+
+        eoc_minimum = 0xFF8 if fat_bits == 12 else 0xFFF8 if fat_bits == 16 else 0x0FFFFFF8
+
+        def decode(cluster: int) -> tuple[int, int, str] | None:
+            relative = (
+                cluster + cluster // 2 if fat_bits == 12
+                else cluster * (2 if fat_bits == 16 else 4)
+            )
+            width = 2 if fat_bits in {12, 16} else 4
+            if relative < 0 or relative + width > len(fat_data):
+                return None
+            raw = fat_data[relative:relative + width]
+            packed = int.from_bytes(raw, "little")
+            value = (
+                ((packed >> 4) & 0x0FFF if cluster & 1 else packed & 0x0FFF)
+                if fat_bits == 12 else packed if fat_bits == 16 else packed & 0x0FFFFFFF
+            )
+            return value, fat_offset + relative, raw.hex()
+
+        allocated: dict[int, tuple[int, int, str]] = {}
+        for cluster in range(2, maximum_cluster + 1):
+            decoded = decode(cluster)
+            if decoded is None:
+                break
+            value = decoded[0]
+            if value >= eoc_minimum or 2 <= value < cluster_count + 2:
+                allocated[cluster] = decoded
+
+        referenced_clusters: set[int] = set()
+        reference_walk_limit = 262_144
+        reference_steps = 0
+        for start in sorted(active_cluster_starts)[:65_536]:
+            current = start
+            local_seen: set[int] = set()
+            while reference_steps < reference_walk_limit and 2 <= current < cluster_count + 2:
+                if current in local_seen:
+                    break
+                local_seen.add(current)
+                referenced_clusters.add(current)
+                reference_steps += 1
+                decoded = allocated.get(current)
+                if decoded is None or decoded[0] >= eoc_minimum:
+                    break
+                current = decoded[0]
+
+        orphan_clusters = set(allocated) - referenced_clusters
+        incoming: set[int] = set()
+        for cluster in orphan_clusters:
+            next_cluster = allocated[cluster][0]
+            if next_cluster in orphan_clusters:
+                incoming.add(next_cluster)
+        heads = sorted(orphan_clusters - incoming)
+        visited: set[int] = set()
+        chains: list[dict[str, object]] = []
+
+        def build_chain(start: int) -> dict[str, object]:
+            chain: list[dict[str, object]] = []
+            local_seen: set[int] = set()
+            current = start
+            termination = "cluster_limit"
+            for _ in range(64):
+                if current in local_seen:
+                    termination = "loop"
+                    break
+                if current in visited:
+                    termination = "joins_inventoried_chain"
+                    break
+                decoded = allocated.get(current)
+                if current not in orphan_clusters or decoded is None:
+                    termination = (
+                        "joins_validated_reference" if current in referenced_clusters
+                        else "points_to_nonallocated_cluster"
+                    )
+                    break
+                local_seen.add(current)
+                visited.add(current)
+                next_cluster, entry_offset, raw_hex = decoded
+                data_offset = (
+                    first_data_sector + (current - 2) * sectors_per_cluster
+                ) * bytes_per_sector
+                chain.append({
+                    "cluster": current,
+                    "fat_entry_offset": entry_offset,
+                    "fat_entry_raw": raw_hex,
+                    "next_cluster": next_cluster,
+                    "data_offset": data_offset,
+                    "data_length": cluster_size,
+                    "data_within_supplied_image": (
+                        data_offset >= 0 and data_offset + cluster_size <= image_size
+                    ),
+                })
+                if next_cluster >= eoc_minimum:
+                    termination = "eoc"
+                    break
+                if next_cluster >= maximum_cluster + 1 and next_cluster < cluster_count + 2:
+                    termination = "continues_beyond_fat_scan"
+                    break
+                current = next_cluster
+            return {
+                "start_cluster": start,
+                "cluster_chain": chain,
+                "termination": termination,
+                "complete_eoc_chain": termination == "eoc",
+            }
+
+        for head in heads:
+            if len(chains) >= 64:
+                break
+            chains.append(build_chain(head))
+        if len(chains) < 64:
+            for cycle_or_fragment in sorted(orphan_clusters - visited):
+                if len(chains) >= 64:
+                    break
+                chains.append(build_chain(cycle_or_fragment))
+        inventory.update({
+            "allocated_cluster_count_in_scan": len(allocated),
+            "validated_reference_cluster_count_in_scan": len(referenced_clusters & set(allocated)),
+            "reference_walk_steps": reference_steps,
+            "reference_walk_limit_reached": reference_steps >= reference_walk_limit,
+            "unreferenced_allocated_cluster_count_in_scan": len(orphan_clusters),
+            "candidate_chain_count": len(chains),
+            "chains": chains,
+            "chains_truncated": len(visited) < len(orphan_clusters),
+            "interpretation": (
+                "allocation chains absent from the bounded validated active-directory reference sample; "
+                "not proof of lost-file ownership"
+            ),
+        })
+        return inventory
 
     def _inspect_fat32_metadata_sectors(
         self,
@@ -4524,9 +4734,24 @@ class GenericTriageEngine:
                 self._observation(artifact, f"{prefix}.error", str(exc)[:2_000], confidence=0.9),
             ]
         data = b"".join(chunks)
-        subdirectory_entries, subdirectory_inventory, subdirectory_errors = self._fat32_subdirectory_deleted_entries(
+        subdirectory_entries, subdirectory_inventory, subdirectory_errors, active_cluster_starts = self._fat32_subdirectory_deleted_entries(
             path, image_size, data, entry_offsets, bytes_per_sector, sectors_per_cluster,
             first_data_sector, fat_offset, fat_end,
+        )
+        total_sectors = (
+            int.from_bytes(header[19:21], "little")
+            or int.from_bytes(header[32:36], "little")
+        )
+        cluster_count = (
+            (total_sectors - first_data_sector) // sectors_per_cluster
+            if sectors_per_cluster and total_sectors > first_data_sector else 0
+        )
+        active_cluster_starts.add(root_cluster)
+        lost_chains = self._fat_lost_chain_inventory(
+            path, image_size, bytes_per_sector, sectors_per_cluster,
+            first_data_sector, fat_offset, fat_end, cluster_count,
+            active_cluster_starts, fat_bits=32,
+            directory_reference_scope_limited=bool(chain_errors or subdirectory_errors),
         )
         deleted_entries: list[dict[str, object]] = []
         unlinked_lfn_slots: list[dict[str, object]] = []
@@ -4621,6 +4846,7 @@ class GenericTriageEngine:
             self._observation(artifact, "filesystem.fat.subdirectory_deleted_entries", subdirectory_entries),
             self._observation(artifact, "filesystem.fat.subdirectory_inventory", subdirectory_inventory),
             self._observation(artifact, "filesystem.fat.subdirectory_errors", subdirectory_errors),
+            self._observation(artifact, "filesystem.fat32.lost_chains", lost_chains),
             self._observation(artifact, "filesystem.fat.unlinked_lfn_slots", unlinked_lfn_slots),
             self._observation(artifact, "filesystem.fat.deleted_short_entries_truncated", len(deleted_entries) >= 256),
         ]
@@ -4636,7 +4862,7 @@ class GenericTriageEngine:
         first_data_sector: int,
         fat_offset: int,
         fat_end: int,
-    ) -> tuple[list[dict[str, object]], list[dict[str, object]], list[str]]:
+    ) -> tuple[list[dict[str, object]], list[dict[str, object]], list[str], set[int]]:
         """Traverse active FAT32 directory chains and inventory deleted children."""
         cluster_size = bytes_per_sector * sectors_per_cluster
         queue: list[dict[str, object]] = []
@@ -4645,6 +4871,7 @@ class GenericTriageEngine:
         errors: list[str] = []
         visited_starts: set[int] = set()
         visited_clusters: set[int] = set()
+        active_cluster_starts: set[int] = set()
         total_clusters = 0
 
         def active_directories(data: bytes, offsets: list[int], parent_lineage: list[int]) -> None:
@@ -4652,12 +4879,16 @@ class GenericTriageEngine:
                 entry = data[index * 32:(index + 1) * 32]
                 if entry[0] == 0:
                     break
-                if entry[0] == 0xE5 or entry[11] == 0x0F or not entry[11] & 0x10:
+                if entry[0] == 0xE5 or entry[11] == 0x0F or entry[11] & 0x08:
+                    continue
+                start = int.from_bytes(entry[20:22], "little") << 16 | int.from_bytes(entry[26:28], "little")
+                if start >= 2:
+                    active_cluster_starts.add(start)
+                if not entry[11] & 0x10:
                     continue
                 name = entry[:8].decode("cp437", errors="replace").rstrip(" ")
                 if name in {".", ".."}:
                     continue
-                start = int.from_bytes(entry[20:22], "little") << 16 | int.from_bytes(entry[26:28], "little")
                 if start >= 2 and len(queue) < 64:
                     queue.append({
                         "name": name, "start_cluster": start,
@@ -4749,12 +4980,12 @@ class GenericTriageEngine:
                             "raw_hex": entry.hex(),
                         })
                         if len(deleted) >= 512:
-                            return deleted, inventory, errors
+                            return deleted, inventory, errors, active_cluster_starts
         except OSError as exc:
             errors.append(str(exc)[:2_000])
         if queue:
             errors.append("subdirectory traversal reached the 32-directory/64-cluster bound")
-        return deleted, inventory, errors
+        return deleted, inventory, errors, active_cluster_starts
 
     @staticmethod
     def _fat_short_name_checksum(short_name: bytes) -> int:
