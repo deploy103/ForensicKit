@@ -1,5 +1,17 @@
 # ForensicKit Work Log
 
+## 2026-09-05 00:17 KST
+
+### Active FAT root directory-LFN validation
+
+- Changed `src/forensickit/triage.py` and `tests/test_triage.py`.
+- Pending active LFNs before FAT12/16/32 root directory short entries now receive the same bounded structure, ordinal, checksum, UTF-16, terminator/padding, and path-separator validation used for active regular files. Valid names enrich the exact matching traversed subdirectory inventory record; invalid names remain raw unlinked evidence, and volume-label entries are explicitly incompatible.
+- Added valid-class FAT12, FAT16, and FAT32 geometries containing one valid and one checksum-invalid directory LFN. Exact root slot/short offsets and the absence of a trusted long name on the invalid inventory entry are asserted. Focused triage regression passed: 92 passed, 0 failed. The full direct synthetic suite passed: 298 passed, 0 failed; compileall and `git diff --check` passed.
+
+### Next
+
+- Carry the same valid directory-LFN enrichment and invalid-chain provenance through nested FAT12/16/32 subdirectory discovery.
+
 ## 2026-09-05 00:12 KST
 
 ### Active FAT root orphan-LFN provenance

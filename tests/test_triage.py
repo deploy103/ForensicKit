@@ -1995,6 +1995,123 @@ def test_active_fat_root_lfn_orphans_keep_exact_slot_provenance(tmp_path: Path) 
     )
 
 
+def test_active_fat_root_directory_lfns_are_validated_before_inventory(tmp_path: Path) -> None:
+    sector_size = 512
+    valid_short = b"VALIDD~1   "
+    invalid_short = b"BROKEN~1   "
+
+    def lfn_slot(name: str, short_name: bytes) -> bytearray:
+        units = [
+            int.from_bytes(name.encode("utf-16le")[offset:offset + 2], "little")
+            for offset in range(0, len(name.encode("utf-16le")), 2)
+        ]
+        units.extend([0, *([0xFFFF] * (12 - len(units)))])
+        result = bytearray(32)
+        result[0] = 0x41
+        result[11] = 0x0F
+        result[13] = GenericTriageEngine._fat_short_name_checksum(short_name)
+        encoded = b"".join(value.to_bytes(2, "little") for value in units)
+        result[1:11] = encoded[:10]
+        result[14:26] = encoded[10:22]
+        result[28:32] = encoded[22:26]
+        return result
+
+    valid_slot = lfn_slot("Valid Dir", valid_short)
+    invalid_slot = lfn_slot("Broken Dir", invalid_short)
+    invalid_slot[13] ^= 0xFF
+
+    def write_root_entries(image: bytearray, root_offset: int, clusters: tuple[int, int]) -> None:
+        image[root_offset:root_offset + 32] = valid_slot
+        first_short_offset = root_offset + 32
+        image[first_short_offset:first_short_offset + 11] = valid_short
+        image[first_short_offset + 11] = 0x10
+        image[first_short_offset + 26:first_short_offset + 28] = clusters[0].to_bytes(2, "little")
+        image[root_offset + 64:root_offset + 96] = invalid_slot
+        second_short_offset = root_offset + 96
+        image[second_short_offset:second_short_offset + 11] = invalid_short
+        image[second_short_offset + 11] = 0x10
+        image[second_short_offset + 26:second_short_offset + 28] = clusters[1].to_bytes(2, "little")
+
+    fixed_variants = (
+        (12, 1, 100, b"FAT12   ", 2 * sector_size, 3),
+        (16, 17, 4_119, b"FAT16   ", 18 * sector_size, 19),
+    )
+    for fat_bits, fat_size, total_sectors, label, root_offset, first_data_sector in fixed_variants:
+        image = bytearray((first_data_sector + 2) * sector_size)
+        image[11:13] = sector_size.to_bytes(2, "little")
+        image[13] = 1
+        image[14:16] = (1).to_bytes(2, "little")
+        image[16] = 1
+        image[17:19] = (16).to_bytes(2, "little")
+        image[19:21] = total_sectors.to_bytes(2, "little")
+        image[21] = 0xF0 if fat_bits == 12 else 0xF8
+        image[22:24] = fat_size.to_bytes(2, "little")
+        image[54:62] = label
+        image[510:512] = b"\x55\xaa"
+        if fat_bits == 12:
+            image[sector_size:sector_size + 3] = b"\xf0\xff\xff"
+            for cluster in (2, 3):
+                offset = sector_size + cluster + cluster // 2
+                packed = int.from_bytes(image[offset:offset + 2], "little")
+                if cluster & 1:
+                    packed = (packed & 0x000F) | (0xFFF << 4)
+                else:
+                    packed = (packed & 0xF000) | 0xFFF
+                image[offset:offset + 2] = packed.to_bytes(2, "little")
+        else:
+            image[sector_size:sector_size + 4] = b"\xf8\xff\xff\xff"
+            for cluster in (2, 3):
+                offset = sector_size + cluster * 2
+                image[offset:offset + 2] = (0xFFFF).to_bytes(2, "little")
+        write_root_entries(image, root_offset, (2, 3))
+        path = tmp_path / f"fat{fat_bits}-root-directory-lfns.raw"
+        path.write_bytes(image)
+        values = _values(GenericTriageEngine().analyze(_artifact(path), path))
+        inventory = values[f"filesystem.fat{fat_bits}.root.subdirectory_inventory"]
+        assert inventory[0]["long_name"] == "Valid Dir"
+        assert inventory[0]["lfn_slot_offsets"] == [root_offset]
+        assert "long_name" not in inventory[1]
+        assert values[f"filesystem.fat{fat_bits}.root.unlinked_lfn_slots"] == [{
+            "short_entry_index": 3,
+            "short_entry_offset": root_offset + 96,
+            "slot_offsets": [root_offset + 64],
+            "reason": "active LFN checksum does not match the short entry",
+            "raw_hex": [invalid_slot.hex()],
+        }]
+
+    fat32_first_data_sector = 2
+    fat32 = bytearray((fat32_first_data_sector + 3) * sector_size)
+    fat32[11:13] = sector_size.to_bytes(2, "little")
+    fat32[13] = 1
+    fat32[14:16] = (1).to_bytes(2, "little")
+    fat32[16] = 1
+    fat32[32:36] = (8).to_bytes(4, "little")
+    fat32[36:40] = (1).to_bytes(4, "little")
+    fat32[44:48] = (2).to_bytes(4, "little")
+    fat32[82:90] = b"FAT32   "
+    fat32[510:512] = b"\x55\xaa"
+    fat32[sector_size:sector_size + 8] = b"\xf8\xff\xff\x0f\xff\xff\xff\x0f"
+    for cluster in (2, 3, 4):
+        offset = sector_size + cluster * 4
+        fat32[offset:offset + 4] = (0x0FFFFFFF).to_bytes(4, "little")
+    fat32_root_offset = fat32_first_data_sector * sector_size
+    write_root_entries(fat32, fat32_root_offset, (3, 4))
+    fat32_path = tmp_path / "fat32-root-directory-lfns.raw"
+    fat32_path.write_bytes(fat32)
+    fat32_values = _values(GenericTriageEngine().analyze(_artifact(fat32_path), fat32_path))
+    fat32_inventory = fat32_values["filesystem.fat.subdirectory_inventory"]
+    assert fat32_inventory[0]["long_name"] == "Valid Dir"
+    assert fat32_inventory[0]["lfn_slot_offsets"] == [fat32_root_offset]
+    assert "long_name" not in fat32_inventory[1]
+    assert fat32_values["filesystem.fat.unlinked_lfn_slots"] == [{
+        "short_entry_index": 3,
+        "short_entry_offset": fat32_root_offset + 96,
+        "slot_offsets": [fat32_root_offset + 64],
+        "reason": "active LFN checksum does not match the short entry",
+        "raw_hex": [invalid_slot.hex()],
+    }]
+
+
 def test_fat32_deleted_lfn_chain_requires_checksum_and_terminal_validation(tmp_path: Path) -> None:
     image = bytearray(4096)
     image[11:13] = (512).to_bytes(2, "little")
