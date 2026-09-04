@@ -2601,6 +2601,129 @@ class ExtractionManager:
             ))
         return result
 
+    def extract_validated_partitions(self, artifact: Artifact) -> ExtractionResult:
+        """Copy complete small partition extents after native table/boot validation."""
+        result = ExtractionResult()
+        candidates: list[dict[str, object]] = []
+        candidate_keys = {
+            "disk.mbr.partition_filesystems",
+            "disk.mbr.logical_partition_filesystems",
+            "disk.gpt.partition_filesystems",
+        }
+        for observation in self.workspace.database.observations(artifact.id):
+            if observation.key not in candidate_keys:
+                continue
+            records = observation.value
+            if not isinstance(records, list):
+                continue
+            candidates.extend(
+                {
+                    **record,
+                    "source_observation_key": observation.key,
+                    "source_observation_id": observation.id,
+                }
+                for record in records
+                if isinstance(record, dict)
+            )
+        if not candidates:
+            return result
+        source = self.workspace.resolve_stored_path(artifact.path)
+        target_root = self.workspace.path(
+            "extracted", artifact.id, "builtin_partitions",
+        )
+        seen_extents: set[tuple[int, int]] = set()
+        evidence: list[str] = []
+        try:
+            source_stream = source.open("rb")
+        except OSError as exc:
+            result.errors.append(f"partition source open failed: {exc}")
+            return result
+        with source_stream:
+            for candidate_index, candidate in enumerate(candidates[:64]):
+                validation = candidate.get("validation")
+                offset = candidate.get("partition_offset")
+                size = candidate.get("declared_partition_bytes")
+                available = candidate.get("available_partition_bytes")
+                detected = candidate.get("detected_filesystem")
+                if (
+                    not isinstance(validation, dict) or validation.get("valid") is not True
+                    or not isinstance(detected, str) or not detected
+                    or not isinstance(offset, int) or offset < 0
+                    or not isinstance(size, int) or size <= 0
+                    or available != size
+                    or candidate.get("partition_entry_valid") is not True
+                    or candidate.get("partition_within_supplied_image") is not True
+                    or offset + size > artifact.size
+                ):
+                    continue
+                extent = (offset, size)
+                if extent in seen_extents:
+                    continue
+                seen_extents.add(extent)
+                reason = self.can_register(artifact, size)
+                if reason:
+                    result.errors.append(
+                        f"skipped validated partition at offset {offset}: {reason}"
+                    )
+                    continue
+                table = candidate.get("partition_table")
+                if table == "gpt":
+                    identity = f"gpt_{int(candidate.get('gpt_partition_index', candidate_index + 1)):03d}"
+                elif table == "mbr_logical":
+                    identity = f"mbr_logical_{int(candidate.get('logical_partition_index', candidate_index + 1)):03d}"
+                else:
+                    identity = f"mbr_primary_{int(candidate.get('slot', candidate_index + 1)):02d}"
+                logical_name = f"{identity}_{detected}.img"
+                output = target_root / safe_name(logical_name)
+                output.parent.mkdir(parents=True, exist_ok=True)
+                written = 0
+                try:
+                    source_stream.seek(offset)
+                    with output.open("xb") as writer:
+                        remaining = size
+                        while remaining:
+                            chunk = source_stream.read(min(1024 * 1024, remaining))
+                            if not chunk:
+                                raise RuntimeError("validated partition extent read ended early")
+                            writer.write(chunk)
+                            written += len(chunk)
+                            remaining -= len(chunk)
+                    if written != size:
+                        raise RuntimeError("validated partition extent size mismatch")
+                except (OSError, RuntimeError) as exc:
+                    output.unlink(missing_ok=True)
+                    result.errors.append(
+                        f"failed validated partition at offset {offset}: {exc}"
+                    )
+                    continue
+                child = self.register_file(output, artifact, logical_name)
+                if child is None:
+                    result.errors.append(
+                        f"skipped validated partition at offset {offset}: duplicate or extraction limit"
+                    )
+                    continue
+                result.artifacts.append(child)
+                result.extracted_bytes += child.size
+                evidence.append(
+                    f"child:{child.id};source_observation_id:{candidate.get('source_observation_id')};"
+                    f"source_observation_key:{candidate.get('source_observation_key')};"
+                    f"table:{table or 'mbr_primary'};offset:{offset};length:{size};"
+                    f"detected_filesystem:{detected};partition_record:{candidate}"
+                )
+        if result.artifacts:
+            result.findings.append(Finding(
+                artifact_id=artifact.id,
+                title=f"Materialized {len(result.artifacts)} validated partition extent(s)",
+                category="validated_partition_extraction", severity="info", confidence=0.99,
+                explanation=(
+                    "Only complete supplied-image extents whose partition entry and format-specific boot structure validated were copied under artifact/count/byte/depth limits. "
+                    "Each immutable child retains its exact MBR, EBR, or CRC-gated GPT record and byte range, then re-enters ordinary recursive analysis without mounting."
+                ),
+                source="builtin_partition_extent_extractor",
+                supporting_evidence=evidence[:64],
+            ))
+        return result
+
     @staticmethod
     def _write_zeros(writer, length: int) -> None:
         """Write an already-budgeted logical zero range without a large allocation."""
@@ -2641,6 +2764,9 @@ class ExtractionManager:
         ext_result = self.extract_ext_root_regular_files(artifact)
         if ext_result.artifacts or ext_result.errors:
             return ext_result
+        partition_result = self.extract_validated_partitions(artifact)
+        if partition_result.artifacts or partition_result.errors:
+            return partition_result
         if artifact.artifact_type == "pcap" or any(item.artifact_type == "pcap" for item in artifact.classifications):
             pcap_result = self.extract_pcap_http(artifact)
             if pcap_result.artifacts or pcap_result.errors:

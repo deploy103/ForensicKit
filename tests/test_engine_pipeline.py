@@ -2500,6 +2500,96 @@ def test_native_partition_offsets_drive_distinct_fls_runs(tmp_path: Path) -> Non
     assert "partition_offset=1" in report and "partition_offset=3" in report
 
 
+def test_validated_small_partition_becomes_recursive_filesystem_child(tmp_path: Path) -> None:
+    sector_size = 512
+    image = bytearray(5 * sector_size)
+    image[446 + 4] = 0x01
+    image[446 + 8:446 + 12] = (1).to_bytes(4, "little")
+    image[446 + 12:446 + 16] = (4).to_bytes(4, "little")
+    image[510:512] = b"\x55\xaa"
+
+    partition = sector_size
+    image[partition:partition + 3] = b"\xeb\x3c\x90"
+    image[partition + 11:partition + 13] = sector_size.to_bytes(2, "little")
+    image[partition + 13] = 1
+    image[partition + 14:partition + 16] = (1).to_bytes(2, "little")
+    image[partition + 16] = 1
+    image[partition + 17:partition + 19] = (16).to_bytes(2, "little")
+    image[partition + 19:partition + 21] = (4).to_bytes(2, "little")
+    image[partition + 21] = 0xF8
+    image[partition + 22:partition + 24] = (1).to_bytes(2, "little")
+    image[partition + 28:partition + 32] = (1).to_bytes(4, "little")
+    image[partition + 510:partition + 512] = b"\x55\xaa"
+    fat = partition + sector_size
+    image[fat:fat + 5] = b"\xf8\xff\xff\xff\x0f"
+    root = partition + 2 * sector_size
+    payload = b"CTF{validated_partition_recursion}"
+    image[root:root + 11] = b"FLAG    TXT"
+    image[root + 11] = 0x20
+    image[root + 26:root + 28] = (2).to_bytes(2, "little")
+    image[root + 28:root + 32] = len(payload).to_bytes(4, "little")
+    data = partition + 3 * sector_size
+    image[data:data + len(payload)] = payload
+    evidence = tmp_path / "partitioned.dd"
+    evidence.write_bytes(image)
+
+    result = AnalysisEngine().analyze(
+        evidence, tmp_path / "partition-cases", mode=AnalysisMode.AUTO,
+        execute=False,
+    )
+
+    partition_child = next(
+        item for item in result.artifacts
+        if item.logical_name == "mbr_primary_01_fat12.img"
+    )
+    file_child = next(item for item in result.artifacts if item.logical_name == "FLAG.TXT")
+    assert partition_child.parent_id == result.artifacts[0].id
+    assert partition_child.size == 4 * sector_size
+    assert partition_child.artifact_type == "filesystem"
+    assert file_child.parent_id == partition_child.id
+    assert file_child.size == len(payload)
+    assert any(
+        candidate.value == "CTF{validated_partition_recursion}"
+        and candidate.artifact_id == file_child.id
+        for candidate in result.flags
+    )
+    recovery = next(
+        item for item in result.findings
+        if item.category == "validated_partition_extraction"
+    )
+    assert recovery.source == "builtin_partition_extent_extractor"
+    partition_observation = next(
+        item for item in result.observations
+        if item.artifact_id == result.artifacts[0].id
+        and item.key == "disk.mbr.partition_filesystems"
+    )
+    assert f"source_observation_id:{partition_observation.id}" in recovery.supporting_evidence[0]
+    assert "source_observation_key:disk.mbr.partition_filesystems" in recovery.supporting_evidence[0]
+    assert "offset:512;length:2048;detected_filesystem:fat12" in recovery.supporting_evidence[0]
+    report = next((tmp_path / "partition-cases").glob("*/reports/report.json")).read_text(
+        encoding="utf-8"
+    )
+    assert "mbr_primary_01_fat12.img" in report
+    assert "builtin_partition_extent_extractor" in report
+    assert "CTF{validated_partition_recursion}" in report
+
+    bounded_config = ForensicKitConfig()
+    bounded_config.limits.max_single_artifact_size = 1024
+    bounded_result = AnalysisEngine(bounded_config).analyze(
+        evidence, tmp_path / "partition-limit-cases", mode=AnalysisMode.AUTO,
+        execute=False,
+    )
+    assert [item.logical_name for item in bounded_result.artifacts] == ["partitioned.dd"]
+    assert any(
+        "skipped validated partition at offset 512: child exceeds maximum single artifact size"
+        in error for error in bounded_result.errors
+    )
+    assert not any(
+        item.category == "validated_partition_extraction"
+        for item in bounded_result.findings
+    )
+
+
 def test_mmls_parser_output_drives_followup_offset_fls_run(tmp_path: Path) -> None:
     mmls = tmp_path / "mmls"
     mmls.write_text(

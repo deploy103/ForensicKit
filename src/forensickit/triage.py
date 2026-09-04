@@ -904,7 +904,11 @@ class GenericTriageEngine:
             partitions.append({
                 "slot": index + 1,
                 "bootable": status == 0x80,
+                "status": f"0x{status:02x}",
                 "status_valid": status in {0x00, 0x80},
+                "entry_valid": status in {0x00, 0x80} and kind != 0 and sector_count > 0,
+                "entry_offset": 446 + index * 16,
+                "raw_hex": entry.hex(),
                 "type_code": f"0x{kind:02x}",
                 "type": type_names.get(kind, "unknown"),
                 "start_lba": start_lba,
@@ -1116,6 +1120,8 @@ class GenericTriageEngine:
                 "declared_partition_bytes": declared_bytes,
                 "available_partition_bytes": available_bytes,
                 "partition_within_supplied_image": partition.get("within_image"),
+                "partition_entry_valid": partition.get("entry_valid"),
+                "partition_entry_offset": partition.get("entry_offset"),
                 "boot_sector_offset": partition_offset,
                 "boot_sector_available": available_bytes >= 512,
                 "expected_filesystems_from_type_code": expected,
@@ -1132,6 +1138,10 @@ class GenericTriageEngine:
                 "boot_declared_volume_field_width": None,
                 "boot_declared_volume_matches_partition": None,
             }
+            if record["partition_entry_valid"] is False:
+                record["error"] = "partition table entry failed structural validation"
+                results.append(record)
+                continue
             if available_bytes < 512:
                 record["error"] = "partition boot sector is outside supplied image bounds"
                 results.append(record)
@@ -1253,6 +1263,8 @@ class GenericTriageEngine:
                 "start_lba": partition.get("start_lba"),
                 "sector_count": partition.get("sector_count"),
                 "within_image": partition.get("within_image"),
+                "entry_valid": True,
+                "entry_offset": partition.get("entry_offset"),
             }
             records = self._inspect_mbr_partition_filesystems(
                 path, image_size, [pseudo_partition],
@@ -1302,6 +1314,8 @@ class GenericTriageEngine:
                 "start_lba": first_lba,
                 "sector_count": partition.get("sector_count", 0),
                 "within_image": partition.get("within_image"),
+                "entry_valid": partition.get("entry_valid"),
+                "entry_offset": partition.get("entry_offset"),
             }
             records = self._inspect_mbr_partition_filesystems(
                 path, image_size, [pseudo_partition],
@@ -1555,14 +1569,20 @@ class GenericTriageEngine:
             first_lba = int.from_bytes(entry[32:40], "little")
             last_lba = int.from_bytes(entry[40:48], "little")
             name = entry[56:128].decode("utf-16le", errors="replace").split("\x00", 1)[0]
+            within_usable_range = (
+                first_usable_lba <= first_lba <= last_lba <= last_usable_lba
+            )
             partitions.append({
                 "index": index + 1,
+                "entry_offset": entry_lba * 512 + index * entry_size,
+                "entry_valid": within_usable_range,
                 "type_guid": str(uuid.UUID(bytes_le=entry[:16])),
                 "unique_guid": str(uuid.UUID(bytes_le=entry[16:32])),
                 "first_lba": first_lba,
                 "last_lba": last_lba,
                 "sector_count": last_lba - first_lba + 1 if last_lba >= first_lba else 0,
                 "name": name[:512],
+                "within_usable_range": within_usable_range,
                 "within_image": first_lba <= last_lba < image_sectors,
             })
         return details, partitions
