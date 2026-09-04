@@ -1,10 +1,10 @@
 # ForensicKit Work Queue
 
-Last reviewed: 2026-09-05 00:23 KST
+Last reviewed: 2026-09-05 00:34 KST
 
 ## Post-v1.1 backlog
 
-- [ ] Propagate validated containing-directory short/LFN names into nested FAT12/16/32 file and deleted-entry recovery provenance.
+- [ ] Preserve complete ancestor directory identity chains for nested FAT12/16/32 files without inferring unvalidated path separators or ownership.
 
 ## v1.1.0 release gate
 
@@ -40,6 +40,7 @@ Last reviewed: 2026-09-05 00:23 KST
 - [x] Active FAT12/16/32 root end-marker LFN orphan provenance and per-variant profile findings.
 - [x] Active FAT12/16/32 root directory LFN validation, inventory linkage, and invalid-chain provenance.
 - [x] Nested active FAT12/16/32 directory LFN inventory enrichment and invalid-chain provenance.
+- [x] Immediate containing-directory short/LFN identity in nested FAT file records and recursive recovery findings.
 - [x] Shared bounded ext inode mapper for direct blocks and depth-zero/depth-one extent trees.
 - [x] Depth-one extent-index/leaf/data provenance, repeated-leaf protection, and recursive Engine flag E2E.
 - [x] Bounded active ext subdirectory traversal and recursively recoverable regular-file children with inode/directory/block lineage.

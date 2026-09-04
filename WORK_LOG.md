@@ -1,5 +1,17 @@
 # ForensicKit Work Log
 
+## 2026-09-05 00:34 KST
+
+### FAT nested-file containing-directory identity
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/extraction.py`, `tests/test_triage.py`, and `tests/test_engine_pipeline.py`.
+- FAT12/16/32 directory discovery now validates and attaches each active LFN before its queue record is traversed. Active/deleted file records inside that directory therefore retain the immediate directory short name, validated long name, LFN slot offsets, source entry, and physical cluster lineage; root files keep these fields absent rather than receiving a fabricated path.
+- All FAT active/deleted extractors serialize the new identity fields into recovery findings. A FAT12 Engine E2E now recovers a deleted child under validated `Evidence Dir` and asserts the containing-directory identity through observation and finding provenance. Combined triage/Engine regression passed: 137 passed, 0 failed. The full direct synthetic suite passed: 298 passed, 0 failed; compileall and `git diff --check` passed.
+
+### Next
+
+- Carry a bounded list of validated ancestor directory identities through deeper FAT traversal, while keeping it distinct from a reconstructed full filesystem path.
+
 ## 2026-09-05 00:23 KST
 
 ### Nested active FAT directory-LFN validation
