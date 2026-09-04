@@ -4037,6 +4037,36 @@ class GenericTriageEngine:
                         "reason": "deleted LFN slots are followed by an active short entry",
                         "raw_hex": [slot.hex() for _, slot in pending_lfn],
                     })
+                elif pending_lfn and attributes & 0x08:
+                    unlinked_lfn_slots.append({
+                        "short_entry_index": index,
+                        "short_entry_offset": entry_offsets[index],
+                        "slot_offsets": [entry_offsets[slot_index] for slot_index, _ in pending_lfn],
+                        "reason": "LFN slots are followed by an incompatible volume-label entry",
+                        "raw_hex": [slot.hex() for _, slot in pending_lfn],
+                    })
+                elif pending_lfn and attributes & 0x10:
+                    directory_lfn, lfn_error = self._fat_active_lfn_candidate(
+                        pending_lfn, entry, entry_offsets,
+                    )
+                    if directory_lfn is not None:
+                        directory_record = next(
+                            (
+                                item for item in subdirectory_inventory
+                                if item.get("source_entry_offset") == entry_offsets[index]
+                            ),
+                            None,
+                        )
+                        if directory_record is not None:
+                            directory_record.update(directory_lfn)
+                    else:
+                        unlinked_lfn_slots.append({
+                            "short_entry_index": index,
+                            "short_entry_offset": entry_offsets[index],
+                            "slot_offsets": [entry_offsets[slot_index] for slot_index, _ in pending_lfn],
+                            "reason": lfn_error,
+                            "raw_hex": [slot.hex() for _, slot in pending_lfn],
+                        })
                 elif not attributes & 0x18:
                     first_cluster = int.from_bytes(entry[26:28], "little")
                     high_reserved = int.from_bytes(entry[20:22], "little")
@@ -4919,6 +4949,36 @@ class GenericTriageEngine:
                         "reason": "deleted LFN slots are followed by an active short entry",
                         "raw_hex": [slot.hex() for _, slot in pending_lfn],
                     })
+                elif pending_lfn and attributes & 0x08:
+                    unlinked_lfn_slots.append({
+                        "short_entry_index": index,
+                        "short_entry_offset": entry_offsets[index],
+                        "slot_offsets": [entry_offsets[slot_index] for slot_index, _ in pending_lfn],
+                        "reason": "LFN slots are followed by an incompatible volume-label entry",
+                        "raw_hex": [slot.hex() for _, slot in pending_lfn],
+                    })
+                elif pending_lfn and attributes & 0x10:
+                    directory_lfn, lfn_error = self._fat_active_lfn_candidate(
+                        pending_lfn, entry, entry_offsets,
+                    )
+                    if directory_lfn is not None:
+                        directory_record = next(
+                            (
+                                item for item in subdirectory_inventory
+                                if item.get("source_entry_offset") == entry_offsets[index]
+                            ),
+                            None,
+                        )
+                        if directory_record is not None:
+                            directory_record.update(directory_lfn)
+                    else:
+                        unlinked_lfn_slots.append({
+                            "short_entry_index": index,
+                            "short_entry_offset": entry_offsets[index],
+                            "slot_offsets": [entry_offsets[slot_index] for slot_index, _ in pending_lfn],
+                            "reason": lfn_error,
+                            "raw_hex": [slot.hex() for _, slot in pending_lfn],
+                        })
                 elif not attributes & 0x18:
                     raw_cluster = (
                         int.from_bytes(entry[20:22], "little") << 16
