@@ -11,6 +11,7 @@ Notable user-facing changes are documented here. This project follows Semantic V
 - Bounded ext2/3 single-indirect-block mapping for active directories and regular files, including pointer-block and pointer-entry provenance.
 - FAT16 BPB/fixed-root validation, deleted short/LFN inventory, and cautious recursive recovery through single-cluster or exact EOC-terminated FAT chains.
 - Bounded active FAT16 subdirectory traversal with complete-chain gating and deleted-child directory lineage.
+- Strict FAT12 fixed-root classification, deleted-entry inventory, and recursive recovery through direct or correctly packed exact-EOC chains.
 
 ## [1.1.0] - 2026-09-04
 

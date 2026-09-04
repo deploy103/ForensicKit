@@ -2064,8 +2064,12 @@ class GenericTriageEngine:
             fat_size_16 = int.from_bytes(header[22:24], "little")
             fat32 = header[82:90].startswith(b"FAT")
             fat16 = not fat32 and header[54:62].startswith(b"FAT16")
+            fat12 = not fat32 and not fat16 and header[54:62].startswith(b"FAT12")
             observations.extend((
-                self._observation(artifact, "filesystem.fat.variant", "fat32" if fat32 else "fat16" if fat16 else "fat12_or_fat16"),
+                self._observation(
+                    artifact, "filesystem.fat.variant",
+                    "fat32" if fat32 else "fat16" if fat16 else "fat12" if fat12 else "fat12_or_fat16",
+                ),
                 self._observation(artifact, "filesystem.fat.bytes_per_sector", bytes_per_sector),
                 self._observation(artifact, "filesystem.fat.sectors_per_cluster", sectors_per_cluster),
                 self._observation(artifact, "filesystem.fat.reserved_sector_count", int.from_bytes(header[14:16], "little")),
@@ -2081,10 +2085,16 @@ class GenericTriageEngine:
                     header[16], int.from_bytes(header[36:40], "little"),
                 ))
             elif fat16:
-                observations.extend(self._inspect_fat16_root_directory(
+                observations.extend(self._inspect_fat_fixed_root_directory(
                     artifact, path, size, header, bytes_per_sector,
                     sectors_per_cluster, int.from_bytes(header[14:16], "little"),
-                    header[16], fat_size_16,
+                    header[16], fat_size_16, fat_bits=16,
+                ))
+            elif fat12:
+                observations.extend(self._inspect_fat_fixed_root_directory(
+                    artifact, path, size, header, bytes_per_sector,
+                    sectors_per_cluster, int.from_bytes(header[14:16], "little"),
+                    header[16], fat_size_16, fat_bits=12,
                 ))
         if ext and len(ext_superblock) >= 136:
             log_block_size = int.from_bytes(ext_superblock[24:28], "little")
@@ -3603,7 +3613,7 @@ class GenericTriageEngine:
                 name_hash = (name_hash + value) & 0xFFFF
         return name_hash
 
-    def _inspect_fat16_root_directory(
+    def _inspect_fat_fixed_root_directory(
         self,
         artifact: Artifact,
         path: Path,
@@ -3614,8 +3624,11 @@ class GenericTriageEngine:
         reserved_sectors: int,
         fat_count: int,
         fat_size: int,
+        *,
+        fat_bits: int,
     ) -> list[Observation]:
-        prefix = "filesystem.fat16.root"
+        variant = f"fat{fat_bits}"
+        prefix = f"filesystem.{variant}.root"
         root_entries = int.from_bytes(header[17:19], "little")
         total_sectors = (
             int.from_bytes(header[19:21], "little")
@@ -3631,7 +3644,12 @@ class GenericTriageEngine:
         first_data_sector = root_sector + root_sectors
         data_sectors = total_sectors - first_data_sector
         cluster_count = data_sectors // sectors_per_cluster if sectors_per_cluster else 0
-        fat_entry_capacity = fat_size * bytes_per_sector // 2 if bytes_per_sector else 0
+        fat_bytes = fat_size * bytes_per_sector
+        fat_entry_capacity = (
+            fat_bytes // 2 if fat_bits == 16
+            else fat_bytes * 2 // 3 if fat_bits == 12
+            else 0
+        )
         root_offset = root_sector * bytes_per_sector
         root_storage_bytes = root_sectors * bytes_per_sector
         valid_geometry = (
@@ -3641,7 +3659,11 @@ class GenericTriageEngine:
             and sectors_per_cluster <= 128 and reserved_sectors > 0
             and 1 <= fat_count <= 4 and fat_size > 0
             and 0 < root_entries <= 65_535 and 0 < root_logical_bytes <= 8 * _MIB
-            and total_sectors > first_data_sector and 4_085 <= cluster_count < 65_525
+            and total_sectors > first_data_sector
+            and (
+                (fat_bits == 16 and 4_085 <= cluster_count < 65_525)
+                or (fat_bits == 12 and 0 < cluster_count < 4_085)
+            )
             and fat_entry_capacity >= cluster_count + 2
             and root_offset >= 0 and root_storage_bytes >= root_logical_bytes
             and root_offset + root_storage_bytes <= image_size
@@ -3652,7 +3674,7 @@ class GenericTriageEngine:
             return [
                 self._observation(artifact, f"{prefix}.available", False),
                 self._observation(artifact, f"{prefix}.offset", root_offset if bytes_per_sector else None),
-                self._observation(artifact, f"{prefix}.error", "invalid FAT16 fixed-root geometry"),
+                self._observation(artifact, f"{prefix}.error", f"invalid {variant.upper()} fixed-root geometry"),
             ]
         try:
             with path.open("rb") as stream:
@@ -3666,7 +3688,7 @@ class GenericTriageEngine:
         if len(stored) != root_storage_bytes:
             return [
                 self._observation(artifact, f"{prefix}.available", False),
-                self._observation(artifact, f"{prefix}.error", "truncated FAT16 fixed-root directory"),
+                self._observation(artifact, f"{prefix}.error", f"truncated {variant.upper()} fixed-root directory"),
             ]
         data = stored[:root_logical_bytes]
         entry_offsets = [root_offset + index * 32 for index in range(root_entries)]
@@ -3678,7 +3700,7 @@ class GenericTriageEngine:
                 sectors_per_cluster, first_data_sector, fat_offset, fat_end,
                 cluster_count,
             )
-        )
+        ) if fat_bits == 16 else ([], [], [])
         deleted_entries: list[dict[str, object]] = []
         unlinked_lfn_slots: list[dict[str, object]] = []
         pending_lfn: list[tuple[int, bytes]] = []
@@ -3719,7 +3741,8 @@ class GenericTriageEngine:
                 "short_name": f"?{base}" + (f".{extension}" if extension else ""),
                 "first_character_unknown": True, "attributes": f"0x{attributes:02X}",
                 "first_cluster": int.from_bytes(entry[26:28], "little"),
-                "fat16_cluster_high_reserved": int.from_bytes(entry[20:22], "little"),
+                "cluster_high_reserved": int.from_bytes(entry[20:22], "little"),
+                f"{variant}_cluster_high_reserved": int.from_bytes(entry[20:22], "little"),
                 "size": int.from_bytes(entry[28:32], "little"),
                 "created": self._fat_datetime(
                     int.from_bytes(entry[16:18], "little"),

@@ -1647,6 +1647,121 @@ def test_fat16_fixed_root_deleted_lfn_recovers_one_cluster_with_lineage(tmp_path
     )
 
 
+def test_fat12_fixed_root_recovers_single_and_exact_packed_multicluster_chain(tmp_path: Path) -> None:
+    sector_size = 512
+    image = bytearray(10 * sector_size)
+    image[11:13] = sector_size.to_bytes(2, "little")
+    image[13] = 1
+    image[14:16] = (1).to_bytes(2, "little")
+    image[16] = 1
+    image[17:19] = (16).to_bytes(2, "little")
+    image[19:21] = (100).to_bytes(2, "little")
+    image[21] = 0xF0
+    image[22:24] = (1).to_bytes(2, "little")
+    image[54:62] = b"FAT12   "
+    image[510:512] = b"\x55\xaa"
+    root_offset = 2 * sector_size
+    first_data_sector = 3
+    entry = root_offset
+    image[entry:entry + 11] = b"\xe5LAG    TXT"
+    image[entry + 11] = 0x20
+    image[entry + 26:entry + 28] = (5).to_bytes(2, "little")
+    payload = b"CTF{fat12_single_cluster}"
+    image[entry + 28:entry + 32] = len(payload).to_bytes(4, "little")
+    multi = entry + 32
+    image[multi:multi + 11] = b"\xe5ULTI   BIN"
+    image[multi + 11] = 0x20
+    image[multi + 26:multi + 28] = (6).to_bytes(2, "little")
+    multi_payload = b"M" * sector_size + b"CTF{fat12_packed_chain}"
+    image[multi + 28:multi + 32] = len(multi_payload).to_bytes(4, "little")
+
+    def set_fat12(cluster: int, value: int) -> None:
+        offset = sector_size + cluster + cluster // 2
+        packed = int.from_bytes(image[offset:offset + 2], "little")
+        if cluster & 1:
+            packed = (packed & 0x000F) | ((value & 0x0FFF) << 4)
+        else:
+            packed = (packed & 0xF000) | (value & 0x0FFF)
+        image[offset:offset + 2] = packed.to_bytes(2, "little")
+
+    set_fat12(6, 8)
+    set_fat12(8, 0xFFF)
+    content_offset = (first_data_sector + 3) * sector_size
+    image[content_offset:content_offset + len(payload)] = payload
+    multi_first_offset = (first_data_sector + 4) * sector_size
+    multi_second_offset = (first_data_sector + 6) * sector_size
+    image[multi_first_offset:multi_first_offset + sector_size] = multi_payload[:sector_size]
+    image[multi_second_offset:multi_second_offset + len(multi_payload) - sector_size] = multi_payload[sector_size:]
+    evidence = tmp_path / "fat12-deleted.raw"
+    evidence.write_bytes(image)
+
+    result = AnalysisEngine().analyze(
+        evidence, tmp_path / "fat12-cases", mode=AnalysisMode.AUTO, execute=False,
+    )
+
+    values = {
+        observation.key: observation.value
+        for observation in result.observations
+        if observation.artifact_id == result.root_artifact.id
+    }
+    assert values["filesystem.fat.variant"] == "fat12"
+    assert values["filesystem.fat12.root.available"] is True
+    assert values["filesystem.fat12.root.offset"] == root_offset
+    assert values["filesystem.fat12.root.first_data_sector"] == first_data_sector
+    assert values["filesystem.fat12.root.cluster_count"] == 97
+    assert values["filesystem.fat12.root.fat_entry_capacity"] == 341
+    assert values["filesystem.fat12.root.deleted_entries"][0]["fat12_cluster_high_reserved"] == 0
+    child = next(item for item in result.artifacts if item.logical_name == "?LAG.TXT")
+    multi_child = next(item for item in result.artifacts if item.logical_name == "?ULTI.BIN")
+    assert any(
+        item.value == "CTF{fat12_single_cluster}" and item.artifact_id == child.id
+        for item in result.flags
+    )
+    assert any(
+        item.value == "CTF{fat12_packed_chain}" and item.artifact_id == multi_child.id
+        for item in result.flags
+    )
+    assert any(item.category == "fat12_deleted_directory_entry" for item in result.findings)
+    recovery = next(item for item in result.findings if item.category == "fat12_deleted_content_recovery")
+    assert f"entry_offset:{root_offset}" in recovery.supporting_evidence[0]
+    assert f"physical_offset:{content_offset}" in recovery.supporting_evidence[0]
+    assert "chain_validation:single_cluster_direct" in recovery.supporting_evidence[0]
+    multi_evidence = next(item for item in recovery.supporting_evidence if multi_child.id in item)
+    assert f"physical_offset:{multi_first_offset}" in multi_evidence
+    assert f"'physical_offset': {multi_second_offset}" in multi_evidence
+    assert "'fat_entry_offset': 521" in multi_evidence
+    assert "'fat_entry_raw': '0800'" in multi_evidence
+    assert "'fat_entry_offset': 524" in multi_evidence
+    assert "chain_validation:complete_fat12_chain_eoc" in multi_evidence
+
+    fat16_sized = bytearray(image)
+    fat16_sized[19:21] = (5000).to_bytes(2, "little")
+    invalid = tmp_path / "fat12-label-fat16-geometry.raw"
+    invalid.write_bytes(fat16_sized)
+    invalid_artifact = Artifact(
+        id="fat12-invalid", case_id="case", path=str(invalid), logical_name=invalid.name,
+        sha256="0" * 64, size=len(fat16_sized),
+    )
+    invalid_values = {
+        item.key: item.value for item in GenericTriageEngine().analyze(invalid_artifact, invalid)
+    }
+    assert invalid_values["filesystem.fat12.root.available"] is False
+    assert invalid_values["filesystem.fat12.root.error"] == "invalid FAT12 fixed-root geometry"
+
+    non_eoc = bytearray(image)
+    packed_offset = sector_size + 8 + 8 // 2
+    packed = int.from_bytes(non_eoc[packed_offset:packed_offset + 2], "little")
+    non_eoc[packed_offset:packed_offset + 2] = ((packed & 0xF000) | 9).to_bytes(2, "little")
+    incomplete = tmp_path / "fat12-non-eoc.raw"
+    incomplete.write_bytes(non_eoc)
+    incomplete_result = AnalysisEngine().analyze(
+        incomplete, tmp_path / "fat12-incomplete-cases",
+        mode=AnalysisMode.AUTO, execute=False,
+    )
+    assert any(item.logical_name == "?LAG.TXT" for item in incomplete_result.artifacts)
+    assert not any(item.logical_name == "?ULTI.BIN" for item in incomplete_result.artifacts)
+
+
 def test_recycle_bin_exact_supplied_content_pair_is_correlated(tmp_path: Path) -> None:
     bundle = tmp_path / "recycle"
     bundle.mkdir()
