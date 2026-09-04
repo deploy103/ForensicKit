@@ -1,5 +1,18 @@
 # ForensicKit Work Log
 
+## 2026-09-04 23:34 KST
+
+### Deleted FAT32 subdirectory LFN reconstruction
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/extraction.py`, and `tests/test_engine_pipeline.py`.
+- Deleted LFN slots inside validated active FAT32 subdirectories now pass the same bounded missing-first-short-byte checksum search, contiguous physical-order, slot structure, UTF-16LE, and NUL/`FFFF` padding validation used at the root. Accepted long names retain slot offsets plus containing directory source/cluster lineage; invalid chains are preserved in the combined unlinked-LFN observation.
+- Deleted subdirectory cluster fields now expose both raw 32-bit and masked 28-bit values with reserved-high provenance. The FAT32 extractor rejects a nonzero retained reserved nibble and now includes deleted LFN slot offsets in child recovery evidence.
+- Expanded the mirroring-disabled noncontiguous `5 -> 9 -> EOC` directory E2E with deleted `Deleted.txt` at cluster 8. It recursively attributes a separate flag and asserts LFN slot/short-entry/data offsets plus directory source and `[5, 9]` lineage. Combined Engine/triage regression: 134 passed, 0 failed.
+
+### Next
+
+- Apply the same 28-bit mask/raw/reserved-high validation to deleted FAT32 root entries and add a regression proving malformed high bits cannot produce a recursive child.
+
 ## 2026-09-04 23:25 KST
 
 ### Noncontiguous FAT32 subdirectory LFN provenance
