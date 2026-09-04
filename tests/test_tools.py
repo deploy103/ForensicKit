@@ -173,7 +173,10 @@ def test_runner_times_out_and_keeps_bounded_preview(tmp_path: Path, case_artifac
     executable = _fake_executable(tmp_path / "slow-fake")
     runner = ToolRunner(workspace, _registry(executable), preview_bytes=32)
 
-    timed_out = runner.run("fake", artifact, timeout=0.1, extra_args=("--sleep",))
+    # Leave enough time for the shebang's Python interpreter to start even on a
+    # loaded CI host; the fixture still sleeps for 30 seconds, so this remains
+    # a real timeout while reliably exercising preservation of flushed output.
+    timed_out = runner.run("fake", artifact, timeout=1.0, extra_args=("--sleep",))
     assert timed_out.status is ToolRunStatus.TIMED_OUT
     assert timed_out.run.error and "timeout" in timed_out.run.error
     assert "started" in workspace.resolve_stored_path(timed_out.run.stdout_path or "").read_text()

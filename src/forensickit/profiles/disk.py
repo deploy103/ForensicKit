@@ -172,7 +172,7 @@ class DiskProfile(BaseProfile):
                 title=f"{len(ext_root_entries)} bounded ext root directory entry/entries validated",
                 category="ext_root_directory_inventory", confidence=0.94,
                 explanation=(
-                    "Group-zero descriptor and inode-table geometry mapped allocated root inode 2 through either a depth-zero initialized ext4 extent set or bounded ext2/3 direct pointers. "
+                    "Group-zero descriptor and inode-table geometry mapped allocated root inode 2 through an initialized depth-zero/depth-one ext4 extent tree or bounded ext2/3 direct pointers. "
                     "Each structurally valid active directory record retains its inode, type, logical offset, and exact physical evidence offset."
                 ),
                 evidence=[str(item)[:2_000] for item in ext_root_entries[:256]], severity="info",
