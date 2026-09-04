@@ -1987,6 +1987,81 @@ def test_fat12_active_lfn_file_requires_exact_eoc_chain_and_recurses(tmp_path: P
     )
 
 
+def test_fat32_active_file_recovery_uses_extflags_selected_fat(tmp_path: Path) -> None:
+    sector_size = 512
+    reserved = 1
+    fat_size = 600
+    fat_count = 2
+    first_data_sector = reserved + fat_count * fat_size
+    image = bytearray((first_data_sector + 6) * sector_size)
+    image[11:13] = sector_size.to_bytes(2, "little")
+    image[13] = 1
+    image[14:16] = reserved.to_bytes(2, "little")
+    image[16] = fat_count
+    image[21] = 0xF8
+    image[32:36] = (70_000).to_bytes(4, "little")
+    image[36:40] = fat_size.to_bytes(4, "little")
+    image[40:42] = (0x0081).to_bytes(2, "little")
+    image[44:48] = (2).to_bytes(4, "little")
+    image[82:90] = b"FAT32   "
+    image[510:512] = b"\x55\xaa"
+    fat0_offset = reserved * sector_size
+    fat1_offset = (reserved + fat_size) * sector_size
+    for offset in (fat0_offset, fat1_offset):
+        image[offset:offset + 8] = b"\xf8\xff\xff\x0f\xff\xff\xff\x0f"
+    image[fat0_offset + 2 * 4:fat0_offset + 2 * 4 + 4] = (0x0FFFFFFF).to_bytes(4, "little")
+    image[fat1_offset + 2 * 4:fat1_offset + 2 * 4 + 4] = (5).to_bytes(4, "little")
+    image[fat1_offset + 5 * 4:fat1_offset + 5 * 4 + 4] = (0x0FFFFFFF).to_bytes(4, "little")
+    image[fat1_offset + 7 * 4:fat1_offset + 7 * 4 + 4] = (0x0FFFFFFF).to_bytes(4, "little")
+    root_offset = first_data_sector * sector_size
+    for index in range(sector_size // 32):
+        offset = root_offset + index * 32
+        image[offset:offset + 11] = b"FILLER  TXT"
+        image[offset + 11] = 0x20
+    second_root_offset = (first_data_sector + 3) * sector_size
+    image[second_root_offset:second_root_offset + 11] = b"ACTIVE  TXT"
+    image[second_root_offset + 11] = 0x20
+    image[second_root_offset + 26:second_root_offset + 28] = (7).to_bytes(2, "little")
+    payload = b"CTF{fat32_extflags_active_file}"
+    image[second_root_offset + 28:second_root_offset + 32] = len(payload).to_bytes(4, "little")
+    content_offset = (first_data_sector + 5) * sector_size
+    image[content_offset:content_offset + len(payload)] = payload
+    evidence = tmp_path / "fat32-active-copy-file.raw"
+    evidence.write_bytes(image)
+
+    result = AnalysisEngine().analyze(
+        evidence, tmp_path / "fat32-active-cases", mode=AnalysisMode.AUTO, execute=False,
+    )
+
+    values = {
+        observation.key: observation.value
+        for observation in result.observations
+        if observation.artifact_id == result.root_artifact.id
+    }
+    assert values["filesystem.fat.root.active_fat_index"] == 1
+    active = values["filesystem.fat.root.recoverable_regular_files"]
+    assert active == [{
+        "entry_index": 16, "offset": second_root_offset, "short_name": "ACTIVE.TXT",
+        "attributes": "0x20", "first_cluster": 7,
+        "cluster_field_raw": "0x00000007", "fat32_cluster_high_reserved": 0,
+        "size": len(payload), "raw_hex": bytes(image[second_root_offset:second_root_offset + 32]).hex(),
+    }]
+    child = next(item for item in result.artifacts if item.logical_name == "ACTIVE.TXT")
+    assert child.parent_id == result.root_artifact.id and child.size == len(payload)
+    assert any(
+        item.value == "CTF{fat32_extflags_active_file}" and item.artifact_id == child.id
+        for item in result.flags
+    )
+    finding = next(
+        item for item in result.findings if item.category == "fat32_active_file_recovery"
+    )
+    assert finding.source == "builtin_fat32_active_file_extractor"
+    assert f"entry_offset:{second_root_offset}" in finding.supporting_evidence[0]
+    assert f"'fat_entry_offset': {fat1_offset + 7 * 4}" in finding.supporting_evidence[0]
+    assert f"'physical_offset': {content_offset}" in finding.supporting_evidence[0]
+    assert "chain_validation:exact_size_required_chain_eoc" in finding.supporting_evidence[0]
+
+
 def test_recycle_bin_exact_supplied_content_pair_is_correlated(tmp_path: Path) -> None:
     bundle = tmp_path / "recycle"
     bundle.mkdir()

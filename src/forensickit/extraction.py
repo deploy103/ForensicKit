@@ -1798,7 +1798,12 @@ class ExtractionManager:
             return result
         cluster_size = bytes_per_sector * sectors_per_cluster
         first_data_sector = reserved + fat_count * fat_size
-        fat_offset = reserved * bytes_per_sector
+        observed_active_fat_offset = values.get("filesystem.fat.root.active_fat_offset")
+        fat_offset = (
+            observed_active_fat_offset
+            if isinstance(observed_active_fat_offset, int)
+            else reserved * bytes_per_sector
+        )
         fat_end = fat_offset + fat_size * bytes_per_sector
         if (
             bytes_per_sector not in {512, 1024, 2048, 4096}
@@ -2225,21 +2230,34 @@ class ExtractionManager:
         return result
 
     def extract_fat_active_files(self, artifact: Artifact) -> ExtractionResult:
-        """Recover bounded active FAT12/16 regular files through exact EOC chains."""
+        """Recover bounded active FAT regular files through exact EOC chains."""
         result = ExtractionResult()
         values = {
             observation.key: observation.value
             for observation in self.workspace.database.observations(artifact.id)
         }
         variant = values.get("filesystem.fat.variant")
-        fat_bits = 12 if variant == "fat12" else 16 if variant == "fat16" else 0
-        entries = values.get(f"filesystem.fat{fat_bits}.root.recoverable_regular_files") if fat_bits else None
+        fat_bits = 12 if variant == "fat12" else 16 if variant == "fat16" else 32 if variant == "fat32" else 0
+        entries = (
+            values.get("filesystem.fat.root.recoverable_regular_files")
+            if fat_bits == 32 else values.get(f"filesystem.fat{fat_bits}.root.recoverable_regular_files")
+            if fat_bits else None
+        )
         bytes_per_sector = values.get("filesystem.fat.bytes_per_sector")
         sectors_per_cluster = values.get("filesystem.fat.sectors_per_cluster")
         reserved_sectors = values.get("filesystem.fat.reserved_sector_count")
         fat_size = values.get("filesystem.fat.size_sectors")
-        first_data_sector = values.get(f"filesystem.fat{fat_bits}.root.first_data_sector") if fat_bits else None
-        cluster_count = values.get(f"filesystem.fat{fat_bits}.root.cluster_count") if fat_bits else None
+        fat_count = values.get("filesystem.fat.count")
+        first_data_sector = (
+            reserved_sectors + fat_count * fat_size
+            if fat_bits == 32 and all(isinstance(value, int) for value in (reserved_sectors, fat_count, fat_size))
+            else values.get(f"filesystem.fat{fat_bits}.root.first_data_sector") if fat_bits else None
+        )
+        cluster_count = (
+            values.get("filesystem.fat32.cluster_count")
+            if fat_bits == 32 else values.get(f"filesystem.fat{fat_bits}.root.cluster_count")
+            if fat_bits else None
+        )
         if not isinstance(entries, list) or not entries:
             return result
         if not all(isinstance(value, int) for value in (
@@ -2249,7 +2267,13 @@ class ExtractionManager:
             result.errors.append(f"skipped active FAT{fat_bits} files: missing validated geometry")
             return result
         cluster_size = bytes_per_sector * sectors_per_cluster
-        fat_offset = reserved_sectors * bytes_per_sector
+        fat_offset = (
+            values.get("filesystem.fat.root.active_fat_offset")
+            if fat_bits == 32 else reserved_sectors * bytes_per_sector
+        )
+        if not isinstance(fat_offset, int):
+            result.errors.append(f"skipped active FAT{fat_bits} files: missing active FAT offset")
+            return result
         fat_end = fat_offset + fat_size * bytes_per_sector
         if (
             bytes_per_sector not in {512, 1024, 2048, 4096}
@@ -2258,6 +2282,7 @@ class ExtractionManager:
             or reserved_sectors <= 0 or fat_size <= 0 or first_data_sector <= 0
             or (fat_bits == 12 and not 0 < cluster_count < 4_085)
             or (fat_bits == 16 and not 4_085 <= cluster_count < 65_525)
+            or (fat_bits == 32 and cluster_count < 65_525)
         ):
             result.errors.append(f"skipped active FAT{fat_bits} files: invalid validated geometry")
             return result
@@ -2269,7 +2294,7 @@ class ExtractionManager:
         except OSError as exc:
             result.errors.append(f"active FAT{fat_bits} source open failed: {exc}")
             return result
-        eoc_minimum = 0xFF8 if fat_bits == 12 else 0xFFF8
+        eoc_minimum = 0xFF8 if fat_bits == 12 else 0xFFF8 if fat_bits == 16 else 0x0FFFFFF8
         with source_stream:
             for entry_index, entry in enumerate(entries[:256]):
                 if not isinstance(entry, dict):
@@ -2302,23 +2327,26 @@ class ExtractionManager:
                     fat_entry_offset = (
                         fat_offset + current + current // 2
                         if fat_bits == 12 else fat_offset + current * 2
+                        if fat_bits == 16 else fat_offset + current * 4
                     )
+                    fat_entry_width = 4 if fat_bits == 32 else 2
                     if (
                         physical_offset < 0 or physical_offset + cluster_size > artifact.size
-                        or fat_entry_offset < fat_offset or fat_entry_offset + 2 > fat_end
-                        or fat_entry_offset + 2 > artifact.size
+                        or fat_entry_offset < fat_offset or fat_entry_offset + fat_entry_width > fat_end
+                        or fat_entry_offset + fat_entry_width > artifact.size
                     ):
                         valid = False
                         break
                     source_stream.seek(fat_entry_offset)
-                    raw_next = source_stream.read(2)
-                    if len(raw_next) != 2:
+                    raw_next = source_stream.read(fat_entry_width)
+                    if len(raw_next) != fat_entry_width:
                         valid = False
                         break
                     packed = int.from_bytes(raw_next, "little")
                     next_cluster = (
                         (packed >> 4) & 0x0FFF if fat_bits == 12 and current & 1
-                        else packed & 0x0FFF if fat_bits == 12 else packed
+                        else packed & 0x0FFF if fat_bits == 12
+                        else packed if fat_bits == 16 else packed & 0x0FFFFFFF
                     )
                     chain.append({
                         "cluster": current, "physical_offset": physical_offset,
