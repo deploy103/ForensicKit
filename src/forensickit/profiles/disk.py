@@ -422,6 +422,44 @@ class DiskProfile(BaseProfile):
                 evidence=[str(item)[:2_000] for item in fat12_deleted[:128]],
                 severity="info",
             ))
+        fat12_subdirectory_deleted = next(
+            (
+                value for value in context.values("filesystem.fat12.root.subdirectory_deleted_entries")
+                if isinstance(value, list)
+            ),
+            [],
+        )
+        if fat12_subdirectory_deleted:
+            result.findings.append(self.finding(
+                context,
+                title=f"{len(fat12_subdirectory_deleted)} deleted FAT12 subdirectory entry candidate(s) recovered",
+                category="fat12_subdirectory_deleted_entry", confidence=0.88,
+                explanation=(
+                    "Deleted entries came only from complete active-directory chains decoded with exact packed 12-bit FAT semantics. "
+                    "Parent root entry, containing cluster chain, packed FAT offsets/raw values, and exact child entry offsets are retained."
+                ),
+                evidence=[str(item)[:2_000] for item in fat12_subdirectory_deleted[:128]],
+                severity="info",
+            ))
+        fat12_subdirectory_errors = next(
+            (
+                value for value in context.values("filesystem.fat12.root.subdirectory_errors")
+                if isinstance(value, list)
+            ),
+            [],
+        )
+        if fat12_subdirectory_errors:
+            result.findings.append(self.finding(
+                context,
+                title="FAT12 active-subdirectory traversal ended incompletely",
+                category="fat12_subdirectory_chain_anomaly", confidence=0.91,
+                explanation=(
+                    "A referenced FAT12 directory exceeded shared bounds or encountered an invalid, truncated, looping, or shared packed chain. "
+                    "Incomplete directory bytes were not used to recover deleted children."
+                ),
+                evidence=[str(item)[:2_000] for item in fat12_subdirectory_errors[:128]],
+                severity="low",
+            ))
         qcow_header = next((value for value in context.values("disk.qcow2.header") if isinstance(value, dict)), {})
         vhd_footer = next((value for value in context.values("disk.vhd.footer") if isinstance(value, dict)), {})
         virtual_disk = context.format_is("vhd", "qcow2") or bool(qcow_header.get("valid")) or bool(vhd_footer.get("signature"))

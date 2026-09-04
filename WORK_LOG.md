@@ -1,5 +1,20 @@
 # ForensicKit Work Log
 
+## 2026-09-04 22:13 KST
+
+### Active FAT12 subdirectory traversal
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/extraction.py`, `src/forensickit/profiles/disk.py`, and `tests/test_engine_pipeline.py`.
+- Generalized the fixed-root subdirectory walker across FAT12/16 while retaining format-specific decoding. FAT12 reads the correct shared two-byte packed window and selects low/high 12 bits by cluster parity; every directory-chain segment records packed entry offset, raw bytes, and decoded next cluster.
+- Active directories share visited start/data clusters plus 32-directory/64-cluster/8-MiB limits and must terminate at EOC before entries are trusted. Deleted children keep their parent root entry, containing cluster chain, exact child offset, and validated LFN metadata; content then enters the unchanged exact recovery checks.
+- Extended the FAT12 Engine fixture with active directory cluster 7 and deleted child cluster 4, recursively finding `CTF{fat12_subdirectory}`. A packed `7 → 7` loop yields a profile anomaly and no recovered child.
+- Verified `python -m compileall -q src tests scripts` and all 41 Engine regressions.
+- Full direct regression passed (**287 passed, 0 failed**) and `git diff --check` remained clean.
+
+### Next
+
+- Validate FAT32 FSInfo and backup boot sectors with exact signature, bounds, allocation-hint, and divergence provenance.
+
 ## 2026-09-04 22:07 KST
 
 ### FAT12 fixed-root and packed-chain recovery

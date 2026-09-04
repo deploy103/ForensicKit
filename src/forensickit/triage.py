@@ -3695,12 +3695,12 @@ class GenericTriageEngine:
         fat_offset = reserved_sectors * bytes_per_sector
         fat_end = fat_offset + fat_size * bytes_per_sector
         subdirectory_entries, subdirectory_inventory, subdirectory_errors = (
-            self._fat16_subdirectory_deleted_entries(
+            self._fat_fixed_subdirectory_deleted_entries(
                 path, image_size, data, entry_offsets, bytes_per_sector,
                 sectors_per_cluster, first_data_sector, fat_offset, fat_end,
-                cluster_count,
+                cluster_count, fat_bits=fat_bits,
             )
-        ) if fat_bits == 16 else ([], [], [])
+        )
         deleted_entries: list[dict[str, object]] = []
         unlinked_lfn_slots: list[dict[str, object]] = []
         pending_lfn: list[tuple[int, bytes]] = []
@@ -3791,7 +3791,7 @@ class GenericTriageEngine:
         ]
 
     @staticmethod
-    def _fat16_subdirectory_deleted_entries(
+    def _fat_fixed_subdirectory_deleted_entries(
         path: Path,
         image_size: int,
         root_data: bytes,
@@ -3802,8 +3802,11 @@ class GenericTriageEngine:
         fat_offset: int,
         fat_end: int,
         cluster_count: int,
+        *,
+        fat_bits: int,
     ) -> tuple[list[dict[str, object]], list[dict[str, object]], list[str]]:
-        """Traverse exact-EOC active FAT16 directories and inventory deleted children."""
+        """Traverse exact-EOC active FAT12/16 directories and inventory deleted children."""
+        variant = f"FAT{fat_bits}"
         cluster_size = bytes_per_sector * sectors_per_cluster
         queue: list[dict[str, object]] = []
         deleted: list[dict[str, object]] = []
@@ -3846,7 +3849,7 @@ class GenericTriageEngine:
                         continue
                     visited_starts.add(start)
                     current = start
-                    chain: list[dict[str, int]] = []
+                    chain: list[dict[str, object]] = []
                     chunks: list[bytes] = []
                     offsets: list[int] = []
                     local_seen: set[int] = set()
@@ -3854,18 +3857,18 @@ class GenericTriageEngine:
                     while total_clusters < 64 and total_bytes + cluster_size <= 8 * _MIB:
                         if current in local_seen or current in visited_clusters:
                             termination = "loop_or_shared_cluster"
-                            errors.append(f"FAT16 subdirectory cluster {start}: loop/shared cluster {current}")
+                            errors.append(f"{variant} subdirectory cluster {start}: loop/shared cluster {current}")
                             break
                         if not 2 <= current < cluster_count + 2:
                             termination = "cluster_bounds"
-                            errors.append(f"FAT16 subdirectory cluster {start}: invalid cluster {current}")
+                            errors.append(f"{variant} subdirectory cluster {start}: invalid cluster {current}")
                             break
                         physical_offset = (
                             first_data_sector + (current - 2) * sectors_per_cluster
                         ) * bytes_per_sector
                         if physical_offset < 0 or physical_offset + cluster_size > image_size:
                             termination = "image_bounds"
-                            errors.append(f"FAT16 subdirectory cluster {start}: cluster {current} outside image")
+                            errors.append(f"{variant} subdirectory cluster {start}: cluster {current} outside image")
                             break
                         local_seen.add(current)
                         visited_clusters.add(current)
@@ -3873,35 +3876,54 @@ class GenericTriageEngine:
                         chunk = stream.read(cluster_size)
                         if len(chunk) != cluster_size:
                             termination = "truncated_read"
-                            errors.append(f"FAT16 subdirectory cluster {start}: truncated cluster {current}")
+                            errors.append(f"{variant} subdirectory cluster {start}: truncated cluster {current}")
                             break
                         chunks.append(chunk)
                         chain.append({"cluster": current, "offset": physical_offset, "length": cluster_size})
                         offsets.extend(physical_offset + index * 32 for index in range(cluster_size // 32))
                         total_clusters += 1
                         total_bytes += cluster_size
-                        fat_entry_offset = fat_offset + current * 2
-                        if fat_entry_offset < fat_offset or fat_entry_offset + 2 > fat_end or fat_entry_offset + 2 > image_size:
+                        fat_entry_offset = (
+                            fat_offset + current * 2 if fat_bits == 16
+                            else fat_offset + current + current // 2
+                        )
+                        entry_width = 2
+                        if fat_entry_offset < fat_offset or fat_entry_offset + entry_width > fat_end or fat_entry_offset + entry_width > image_size:
                             termination = "fat_bounds"
-                            errors.append(f"FAT16 subdirectory cluster {start}: FAT entry outside bounds")
+                            errors.append(f"{variant} subdirectory cluster {start}: FAT entry outside bounds")
                             break
                         stream.seek(fat_entry_offset)
-                        raw_next = stream.read(2)
-                        if len(raw_next) != 2:
+                        raw_next = stream.read(entry_width)
+                        if len(raw_next) != entry_width:
                             termination = "truncated_fat"
-                            errors.append(f"FAT16 subdirectory cluster {start}: truncated FAT entry")
+                            errors.append(f"{variant} subdirectory cluster {start}: truncated FAT entry")
                             break
-                        next_cluster = int.from_bytes(raw_next, "little")
-                        if next_cluster >= 0xFFF8:
+                        packed = int.from_bytes(raw_next, "little")
+                        next_cluster = (
+                            packed if fat_bits == 16
+                            else (packed >> 4) & 0x0FFF if current & 1
+                            else packed & 0x0FFF
+                        )
+                        chain[-1].update({
+                            "fat_entry_offset": fat_entry_offset,
+                            "fat_entry_raw": raw_next.hex(),
+                            "next_cluster": next_cluster,
+                        })
+                        eoc_minimum = 0xFFF8 if fat_bits == 16 else 0xFF8
+                        bad_cluster = 0xFFF7 if fat_bits == 16 else 0xFF7
+                        reserved_minimum = 0xFFF0 if fat_bits == 16 else 0xFF0
+                        reserved_maximum = 0xFFF6 if fat_bits == 16 else 0xFF6
+                        if next_cluster >= eoc_minimum:
                             termination = "eoc"
                             break
                         if (
                             next_cluster < 2 or next_cluster >= cluster_count + 2
-                            or next_cluster == 0xFFF7 or 0xFFF0 <= next_cluster <= 0xFFF6
+                            or next_cluster == bad_cluster
+                            or reserved_minimum <= next_cluster <= reserved_maximum
                         ):
                             termination = "invalid_fat_value"
                             errors.append(
-                                f"FAT16 subdirectory cluster {start}: invalid next cluster 0x{next_cluster:04X}"
+                                f"{variant} subdirectory cluster {start}: invalid next cluster 0x{next_cluster:04X}"
                             )
                             break
                         current = next_cluster
@@ -3937,7 +3959,8 @@ class GenericTriageEngine:
                             "first_character_unknown": True,
                             "attributes": f"0x{attributes:02X}",
                             "first_cluster": int.from_bytes(entry[26:28], "little"),
-                            "fat16_cluster_high_reserved": int.from_bytes(entry[20:22], "little"),
+                            "cluster_high_reserved": int.from_bytes(entry[20:22], "little"),
+                            f"fat{fat_bits}_cluster_high_reserved": int.from_bytes(entry[20:22], "little"),
                             "size": int.from_bytes(entry[28:32], "little"),
                             "raw_hex": entry.hex(),
                         }
@@ -3954,7 +3977,7 @@ class GenericTriageEngine:
         except OSError as exc:
             errors.append(str(exc)[:2_000])
         if queue:
-            errors.append("FAT16 subdirectory traversal reached the 32-directory/64-cluster/8-MiB bound")
+            errors.append(f"{variant} subdirectory traversal reached the 32-directory/64-cluster/8-MiB bound")
         return deleted, inventory, errors
 
     def _inspect_fat32_root_directory(

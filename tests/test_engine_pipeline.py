@@ -1686,12 +1686,25 @@ def test_fat12_fixed_root_recovers_single_and_exact_packed_multicluster_chain(tm
 
     set_fat12(6, 8)
     set_fat12(8, 0xFFF)
+    active_directory_offset = multi + 32
+    image[active_directory_offset:active_directory_offset + 11] = b"ACTIVE     "
+    image[active_directory_offset + 11] = 0x10
+    image[active_directory_offset + 26:active_directory_offset + 28] = (7).to_bytes(2, "little")
+    set_fat12(7, 0xFFF)
     content_offset = (first_data_sector + 3) * sector_size
     image[content_offset:content_offset + len(payload)] = payload
     multi_first_offset = (first_data_sector + 4) * sector_size
     multi_second_offset = (first_data_sector + 6) * sector_size
     image[multi_first_offset:multi_first_offset + sector_size] = multi_payload[:sector_size]
     image[multi_second_offset:multi_second_offset + len(multi_payload) - sector_size] = multi_payload[sector_size:]
+    subdirectory_offset = (first_data_sector + 5) * sector_size
+    image[subdirectory_offset:subdirectory_offset + 11] = b"\xe5UBFLAG TXT"
+    image[subdirectory_offset + 11] = 0x20
+    image[subdirectory_offset + 26:subdirectory_offset + 28] = (4).to_bytes(2, "little")
+    sub_payload = b"CTF{fat12_subdirectory}"
+    image[subdirectory_offset + 28:subdirectory_offset + 32] = len(sub_payload).to_bytes(4, "little")
+    sub_content_offset = (first_data_sector + 2) * sector_size
+    image[sub_content_offset:sub_content_offset + len(sub_payload)] = sub_payload
     evidence = tmp_path / "fat12-deleted.raw"
     evidence.write_bytes(image)
 
@@ -1711,8 +1724,14 @@ def test_fat12_fixed_root_recovers_single_and_exact_packed_multicluster_chain(tm
     assert values["filesystem.fat12.root.cluster_count"] == 97
     assert values["filesystem.fat12.root.fat_entry_capacity"] == 341
     assert values["filesystem.fat12.root.deleted_entries"][0]["fat12_cluster_high_reserved"] == 0
+    sub_deleted = values["filesystem.fat12.root.subdirectory_deleted_entries"]
+    assert sub_deleted[0]["directory_start_cluster"] == 7
+    assert sub_deleted[0]["directory_cluster_lineage"] == [7]
+    assert sub_deleted[0]["directory_source_entry_offset"] == active_directory_offset
+    assert sub_deleted[0]["offset"] == subdirectory_offset
     child = next(item for item in result.artifacts if item.logical_name == "?LAG.TXT")
     multi_child = next(item for item in result.artifacts if item.logical_name == "?ULTI.BIN")
+    sub_child = next(item for item in result.artifacts if item.logical_name == "?UBFLAG.TXT")
     assert any(
         item.value == "CTF{fat12_single_cluster}" and item.artifact_id == child.id
         for item in result.flags
@@ -1721,7 +1740,12 @@ def test_fat12_fixed_root_recovers_single_and_exact_packed_multicluster_chain(tm
         item.value == "CTF{fat12_packed_chain}" and item.artifact_id == multi_child.id
         for item in result.flags
     )
+    assert any(
+        item.value == "CTF{fat12_subdirectory}" and item.artifact_id == sub_child.id
+        for item in result.flags
+    )
     assert any(item.category == "fat12_deleted_directory_entry" for item in result.findings)
+    assert any(item.category == "fat12_subdirectory_deleted_entry" for item in result.findings)
     recovery = next(item for item in result.findings if item.category == "fat12_deleted_content_recovery")
     assert f"entry_offset:{root_offset}" in recovery.supporting_evidence[0]
     assert f"physical_offset:{content_offset}" in recovery.supporting_evidence[0]
@@ -1730,9 +1754,14 @@ def test_fat12_fixed_root_recovers_single_and_exact_packed_multicluster_chain(tm
     assert f"physical_offset:{multi_first_offset}" in multi_evidence
     assert f"'physical_offset': {multi_second_offset}" in multi_evidence
     assert "'fat_entry_offset': 521" in multi_evidence
-    assert "'fat_entry_raw': '0800'" in multi_evidence
+    assert "'fat_entry_raw': '08f0'" in multi_evidence
     assert "'fat_entry_offset': 524" in multi_evidence
     assert "chain_validation:complete_fat12_chain_eoc" in multi_evidence
+    sub_evidence = next(item for item in recovery.supporting_evidence if sub_child.id in item)
+    assert f"entry_offset:{subdirectory_offset}" in sub_evidence
+    assert "directory_start_cluster:7" in sub_evidence
+    assert "directory_cluster_lineage:[7]" in sub_evidence
+    assert f"directory_source_entry_offset:{active_directory_offset}" in sub_evidence
 
     fat16_sized = bytearray(image)
     fat16_sized[19:21] = (5000).to_bytes(2, "little")
@@ -1760,6 +1789,24 @@ def test_fat12_fixed_root_recovers_single_and_exact_packed_multicluster_chain(tm
     )
     assert any(item.logical_name == "?LAG.TXT" for item in incomplete_result.artifacts)
     assert not any(item.logical_name == "?ULTI.BIN" for item in incomplete_result.artifacts)
+
+    looping_directory = bytearray(image)
+    directory_fat_offset = sector_size + 7 + 7 // 2
+    packed = int.from_bytes(looping_directory[directory_fat_offset:directory_fat_offset + 2], "little")
+    looping_directory[directory_fat_offset:directory_fat_offset + 2] = (
+        (packed & 0x000F) | (7 << 4)
+    ).to_bytes(2, "little")
+    invalid_directory = tmp_path / "fat12-looping-directory.raw"
+    invalid_directory.write_bytes(looping_directory)
+    invalid_directory_result = AnalysisEngine().analyze(
+        invalid_directory, tmp_path / "fat12-directory-cases",
+        mode=AnalysisMode.AUTO, execute=False,
+    )
+    assert not any(item.logical_name == "?UBFLAG.TXT" for item in invalid_directory_result.artifacts)
+    assert any(
+        item.category == "fat12_subdirectory_chain_anomaly"
+        for item in invalid_directory_result.findings
+    )
 
 
 def test_recycle_bin_exact_supplied_content_pair_is_correlated(tmp_path: Path) -> None:
