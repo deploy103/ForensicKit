@@ -112,6 +112,82 @@ class DiskProfile(BaseProfile):
                 evidence=[str(item)[:4_000] for item in partition_boot_geometry_mismatches[:4]],
                 severity="medium",
             ))
+        gpt_partition_filesystems = next(
+            (
+                value for value in context.values("disk.gpt.partition_filesystems")
+                if isinstance(value, list)
+            ),
+            [],
+        )
+        detected_gpt_filesystems = [
+            item for item in gpt_partition_filesystems
+            if isinstance(item, dict) and item.get("detected_filesystem") is not None
+        ]
+        if detected_gpt_filesystems:
+            result.findings.append(self.finding(
+                context,
+                title=f"{len(detected_gpt_filesystems)} GPT partition filesystem boot structure(s) validated",
+                category="gpt_partition_filesystem_inventory", confidence=0.99,
+                explanation=(
+                    "The primary GPT header and complete entry table passed their stored CRC32 values before exact-offset filesystem boot validation began. "
+                    "GUIDs remain type hints, and no partition was mounted or implicitly extracted."
+                ),
+                evidence=[str(item)[:4_000] for item in detected_gpt_filesystems[:32]],
+                severity="info",
+            ))
+        invalid_gpt_boots = [
+            item for item in gpt_partition_filesystems
+            if isinstance(item, dict)
+            and item.get("filesystem_candidate") is not None
+            and item.get("detected_filesystem") is None
+            and isinstance(item.get("validation"), dict)
+            and item["validation"].get("valid") is False
+        ]
+        if invalid_gpt_boots:
+            result.findings.append(self.finding(
+                context,
+                title=f"{len(invalid_gpt_boots)} GPT partition filesystem boot candidate(s) failed validation",
+                category="partition_filesystem_boot_anomaly", confidence=0.97,
+                explanation=(
+                    "A candidate exists at an entry from a CRC-validated GPT table, but its format-specific boot checks failed. "
+                    "The type GUID is retained only as a hint and cannot override malformed on-disk structure."
+                ),
+                evidence=[str(item)[:4_000] for item in invalid_gpt_boots[:32]],
+                severity="medium",
+            ))
+        gpt_type_mismatches = [
+            item for item in detected_gpt_filesystems
+            if item.get("partition_type_matches_detected") is False
+        ]
+        if gpt_type_mismatches:
+            result.findings.append(self.finding(
+                context,
+                title=f"{len(gpt_type_mismatches)} GPT type GUID/filesystem mismatch(es)",
+                category="partition_type_filesystem_mismatch", confidence=0.99,
+                explanation=(
+                    "A validated boot structure falls outside the specific filesystem family expected from its GPT type GUID. "
+                    "The GUID, entry index, LBAs, exact byte offset, and full structural evidence remain independent."
+                ),
+                evidence=[str(item)[:4_000] for item in gpt_type_mismatches[:32]],
+                severity="low",
+            ))
+        gpt_boot_geometry_mismatches = [
+            item for item in detected_gpt_filesystems
+            if item.get("boot_declared_start_lba_matches_gpt") is False
+            or item.get("boot_declared_volume_matches_partition") is False
+        ]
+        if gpt_boot_geometry_mismatches:
+            result.findings.append(self.finding(
+                context,
+                title=f"{len(gpt_boot_geometry_mismatches)} GPT/partition boot geometry mismatch(es)",
+                category="partition_boot_geometry_mismatch", confidence=0.99,
+                explanation=(
+                    "A validated boot sector's embedded start LBA or volume length differs from its containing CRC-validated GPT entry. "
+                    "All independent values and exact field offsets are preserved without silent repair."
+                ),
+                evidence=[str(item)[:4_000] for item in gpt_boot_geometry_mismatches[:32]],
+                severity="medium",
+            ))
         exfat_main_boot = next(
             (value for value in context.values("filesystem.exfat.boot_regions.main") if isinstance(value, dict)), {}
         )
@@ -1055,6 +1131,22 @@ class DiskProfile(BaseProfile):
                     confidence=0.95,
                     explanation="The bounded complete GPT partition entry table was read, but its CRC32 did not match the header. Individual partition entries may be corrupted.",
                     evidence=[f"stored_crc={gpt_header.get('partition_entry_crc32')}"],
+                )
+            )
+        gpt_backup = gpt_header.get("backup")
+        if isinstance(gpt_backup, dict) and gpt_backup.get("valid") is False:
+            result.findings.append(
+                self.finding(
+                    context,
+                    title="GPT backup header or partition entry table is inconsistent",
+                    category="gpt_backup_metadata_anomaly",
+                    confidence=0.98,
+                    explanation=(
+                        "The primary header's declared backup location was checked independently for its signature, layout, header/table CRCs, reciprocal LBAs, shared geometry, and exact partition-entry content. "
+                        "Neither copy is selected or repaired automatically."
+                    ),
+                    evidence=[str(gpt_backup)[:4_000]],
+                    severity="medium",
                 )
             )
         mft_signature = next((value for value in context.values("filesystem.ntfs.mft0_valid_signature") if isinstance(value, bool)), None)
