@@ -23,6 +23,7 @@ Notable user-facing changes are documented here. This project follows Semantic V
 - Active FAT32 root/subdirectory file recovery now masks 28-bit directory clusters and follows only the BPB ExtFlags-selected FAT; deleted multicluster recovery uses the same selected table.
 - FAT32 subdirectory chain records now retain selected-FAT entry offsets/raw values; active subdirectory LFNs preserve either validated lineage or an explicit checksum/ordinal failure record.
 - Deleted FAT32 LFN chains inside validated active subdirectories now use the same missing-short-byte checksum reconstruction and carry directory/FAT provenance into recursive recovery.
+- Deleted FAT32 root cluster fields now preserve raw/masked values and reserved-high bits; malformed entries remain visible but cannot become recursive children.
 
 ## [1.1.0] - 2026-09-04
 

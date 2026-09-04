@@ -1407,6 +1407,12 @@ def test_deleted_fat32_single_and_complete_multi_cluster_files_become_recursive_
     image[active_directory:active_directory + 11] = b"ACTIVE     "
     image[active_directory + 11] = 0x10
     image[active_directory + 26:active_directory + 28] = (3).to_bytes(2, "little")
+    reserved_high_entry = root_entry + 128
+    image[reserved_high_entry:reserved_high_entry + 11] = b"\xe5ESERV  BIN"
+    image[reserved_high_entry + 11] = 0x20
+    image[reserved_high_entry + 20:reserved_high_entry + 22] = (0x1000).to_bytes(2, "little")
+    image[reserved_high_entry + 26:reserved_high_entry + 28] = (5).to_bytes(2, "little")
+    image[reserved_high_entry + 28:reserved_high_entry + 32] = len(payload).to_bytes(4, "little")
     sub_entry = 1536
     image[sub_entry:sub_entry + 11] = b"\xe5UBFLAG TXT"
     image[sub_entry + 11] = 0x20
@@ -1432,9 +1438,26 @@ def test_deleted_fat32_single_and_complete_multi_cluster_files_become_recursive_
     assert recovered.depth == 1
     assert recovered.size == len(payload)
     assert not any(item.logical_name == "?ARGE.BIN" for item in result.artifacts)
+    assert not any(item.logical_name == "?ESERV.BIN" for item in result.artifacts)
     assert recovered_multi.size == len(multi_payload)
     assert recovered_multi.parent_id == result.root_artifact.id
     assert recovered_sub.parent_id == result.root_artifact.id
+    root_observations = {
+        item.key: item.value for item in result.observations
+        if item.artifact_id == result.root_artifact.id
+    }
+    malformed = next(
+        item for item in root_observations["filesystem.fat.deleted_short_entries"]
+        if item["offset"] == reserved_high_entry
+    )
+    assert malformed["first_cluster"] == 5
+    assert malformed["cluster_field_raw"] == "0x10000005"
+    assert malformed["fat32_cluster_high_reserved"] == 1
+    assert any(
+        item.category == "fat32_directory_cluster_field_anomaly"
+        and "0x10000005" in item.supporting_evidence[0]
+        for item in result.findings
+    )
     finding = next(item for item in result.findings if item.category == "fat_deleted_content_recovery")
     assert recovered.id in finding.supporting_evidence[0]
     assert "entry_offset:1024" in finding.supporting_evidence[0]

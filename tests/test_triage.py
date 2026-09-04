@@ -1422,7 +1422,8 @@ def test_fat32_root_deleted_short_entry_keeps_unknown_name_and_offset(tmp_path: 
     assert values["filesystem.fat.deleted_short_entries"] == [{
         "entry_index": 0, "offset": 1024, "short_name": "?LAG.TXT",
         "first_character_unknown": True, "attributes": "0x20",
-        "first_cluster": 5, "size": 123,
+        "first_cluster": 5, "cluster_field_raw": "0x00000005",
+        "fat32_cluster_high_reserved": 0, "size": 123,
         "created": "2026-09-03T12:34:56.500000",
         "accessed": "2026-09-03T00:00:00",
         "modified": "2026-09-03T12:34:56",

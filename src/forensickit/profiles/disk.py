@@ -312,6 +312,24 @@ class DiskProfile(BaseProfile):
                     evidence=[str(item)[:2_000] for item in linked_lfn[:128]],
                     severity="info",
                 ))
+            invalid_deleted_cluster_fields = [
+                item for item in deleted_fat_entries
+                if isinstance(item, dict)
+                and isinstance(item.get("fat32_cluster_high_reserved"), int)
+                and item["fat32_cluster_high_reserved"] != 0
+            ]
+            if invalid_deleted_cluster_fields:
+                result.findings.append(self.finding(
+                    context,
+                    title=f"{len(invalid_deleted_cluster_fields)} deleted FAT32 root entry/entries use reserved cluster bits",
+                    category="fat32_directory_cluster_field_anomaly", confidence=0.96,
+                    explanation=(
+                        "The raw 32-bit directory cluster field has a nonzero reserved high nibble. "
+                        "Its masked 28-bit value remains forensic metadata, but the malformed entry is excluded from native content recovery."
+                    ),
+                    evidence=[str(item)[:2_000] for item in invalid_deleted_cluster_fields[:128]],
+                    severity="low",
+                ))
         subdirectory_deleted = next(
             (
                 value for value in context.values("filesystem.fat.subdirectory_deleted_entries")
@@ -331,6 +349,24 @@ class DiskProfile(BaseProfile):
                 evidence=[str(item)[:2_000] for item in subdirectory_deleted[:128]],
                 severity="info",
             ))
+            invalid_subdirectory_cluster_fields = [
+                item for item in subdirectory_deleted
+                if isinstance(item, dict)
+                and isinstance(item.get("fat32_cluster_high_reserved"), int)
+                and item["fat32_cluster_high_reserved"] != 0
+            ]
+            if invalid_subdirectory_cluster_fields:
+                result.findings.append(self.finding(
+                    context,
+                    title=f"{len(invalid_subdirectory_cluster_fields)} deleted FAT32 subdirectory entry/entries use reserved cluster bits",
+                    category="fat32_directory_cluster_field_anomaly", confidence=0.96,
+                    explanation=(
+                        "A deleted entry inside a validated active directory retains a nonzero reserved high nibble in its raw cluster field. "
+                        "The exact directory and field provenance is retained, but native recovery does not trust the masked cluster alone."
+                    ),
+                    evidence=[str(item)[:2_000] for item in invalid_subdirectory_cluster_fields[:128]],
+                    severity="low",
+                ))
         fat32_fat_copies = next(
             (value for value in context.values("filesystem.fat32.fat_copies") if isinstance(value, dict)),
             {},
