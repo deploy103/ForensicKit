@@ -1,5 +1,17 @@
 # ForensicKit Work Log
 
+## 2026-09-05 00:23 KST
+
+### Nested active FAT directory-LFN validation
+
+- Changed `src/forensickit/triage.py` and `tests/test_triage.py`.
+- FAT12/16/32 subdirectory discovery now links a checksum/ordinal/UTF-16-valid active directory LFN to the exact queued child directory by source-entry offset. Invalid chains and volume-label incompatibilities remain unlinked records with raw slots, physical offsets, parent directory source, and parent cluster lineage.
+- Expanded the valid-class three-variant directory fixture to two levels: valid nested LFNs appear only on their traversed inventory entries, while checksum-invalid nested names stay absent and preserve exact parent provenance. Focused triage regression passed: 92 passed, 0 failed. The full direct synthetic suite passed: 298 passed, 0 failed; compileall and `git diff --check` passed.
+
+### Next
+
+- Propagate the validated containing-directory short/LFN identity into nested active/deleted file records and recursive recovery evidence without fabricating a full path.
+
 ## 2026-09-05 00:17 KST
 
 ### Active FAT root directory-LFN validation

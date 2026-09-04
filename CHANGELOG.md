@@ -29,6 +29,7 @@ Notable user-facing changes are documented here. This project follows Semantic V
 - FAT32 subdirectory LFN slots orphaned by an end marker or followed by an incompatible volume-label entry now remain visible with raw bytes and complete containing-directory provenance.
 - Active LFN slots orphaned by a root-directory end marker are now retained consistently across FAT12/16/32 with exact absolute slot offsets and raw bytes.
 - Active FAT12/16/32 root directory LFNs now undergo the same ordinal/checksum/UTF-16 validation as file LFNs; valid names enrich subdirectory inventory while failures remain unlinked evidence.
+- Nested active FAT12/16/32 directory LFNs now enrich their exact queued inventory records, while invalid chains retain the containing directory source and cluster lineage.
 
 ## [1.1.0] - 2026-09-04
 
