@@ -1384,6 +1384,11 @@ class ExtractionManager:
             for observation in self.workspace.database.observations(artifact.id)
         }
         entries = values.get("filesystem.fat12.root.deleted_entries")
+        subdirectory_entries = values.get("filesystem.fat12.root.subdirectory_deleted_entries")
+        entries = (
+            (entries if isinstance(entries, list) else [])
+            + (subdirectory_entries if isinstance(subdirectory_entries, list) else [])
+        )
         bytes_per_sector = values.get("filesystem.fat.bytes_per_sector")
         sectors_per_cluster = values.get("filesystem.fat.sectors_per_cluster")
         reserved_sectors = values.get("filesystem.fat.reserved_sector_count")
@@ -1556,6 +1561,9 @@ class ExtractionManager:
                     f"name:{logical_name};first_cluster:{first_cluster};"
                     f"physical_offset:{chain[0]['physical_offset']};cluster_chain:{chain};"
                     f"size:{size};attributes:{attributes_text};lfn_slot_offsets:{entry.get('lfn_slot_offsets')};"
+                    f"directory_start_cluster:{entry.get('directory_start_cluster')};"
+                    f"directory_cluster_lineage:{entry.get('directory_cluster_lineage')};"
+                    f"directory_source_entry_offset:{entry.get('directory_source_entry_offset')};"
                     f"raw_entry:{entry.get('raw_hex')};chain_validation:{chain_validation};"
                     "allocation_state:unknown_deleted_cluster_may_be_reused"
                 )
