@@ -750,6 +750,25 @@ class GenericTriageEngine:
         partition_filesystems = self._inspect_mbr_partition_filesystems(
             path, size, mbr_partitions,
         )
+        gpt_filesystem_validation = {
+            "eligible": bool(
+                gpt_details.get("valid") is True
+                and gpt_details.get("header_crc_valid") is True
+                and gpt_details.get("partition_entry_crc_valid") is True
+            ),
+            "header_structurally_valid": gpt_details.get("valid"),
+            "header_crc_valid": gpt_details.get("header_crc_valid"),
+            "partition_entry_crc_valid": gpt_details.get("partition_entry_crc_valid"),
+            "reason": None,
+        }
+        if not gpt_filesystem_validation["eligible"]:
+            gpt_filesystem_validation["reason"] = (
+                "GPT header geometry, header CRC, and complete partition-entry-table CRC must all validate"
+            )
+        gpt_partition_filesystems = (
+            self._inspect_gpt_partition_filesystems(path, size, gpt_partitions)
+            if gpt_filesystem_validation["eligible"] else []
+        )
         return [
             self._observation(artifact, "disk.mbr_signature", mbr),
             self._observation(artifact, "disk.boot_signature", boot_signature),
@@ -761,6 +780,8 @@ class GenericTriageEngine:
             self._observation(artifact, "disk.gpt.header", gpt_details),
             self._observation(artifact, "disk.gpt.partition_count", len(gpt_partitions)),
             self._observation(artifact, "disk.gpt.partitions", gpt_partitions),
+            self._observation(artifact, "disk.gpt.partition_filesystem_validation", gpt_filesystem_validation),
+            self._observation(artifact, "disk.gpt.partition_filesystems", gpt_partition_filesystems),
             self._observation(artifact, "disk.ewf_signature", ewf),
             self._observation(artifact, "disk.qcow2_signature", header.startswith(b"QFI\xfb")),
             self._observation(artifact, "disk.qcow2.header", qcow_header),
@@ -1042,6 +1063,61 @@ class GenericTriageEngine:
             results.append(record)
         return results
 
+    def _inspect_gpt_partition_filesystems(
+        self,
+        path: Path,
+        image_size: int,
+        partitions: list[dict[str, object]],
+    ) -> list[dict[str, object]]:
+        """Apply boot validators only to entries from a CRC-validated GPT table."""
+        expected_by_guid = {
+            "c12a7328-f81f-11d2-ba4b-00a0c93ec93b": ["fat12", "fat16", "fat32"],
+            "ebd0a0a2-b9e5-4433-87c0-68b6b72699c7": [
+                "fat12", "fat16", "fat32", "ntfs", "exfat",
+            ],
+        }
+        results: list[dict[str, object]] = []
+        for partition in partitions[:32]:
+            first_lba = int(partition.get("first_lba", 0))
+            pseudo_partition = {
+                "slot": partition.get("index"),
+                "type_code": "",
+                "type": "GPT",
+                "start_lba": first_lba,
+                "sector_count": partition.get("sector_count", 0),
+                "within_image": partition.get("within_image"),
+            }
+            records = self._inspect_mbr_partition_filesystems(
+                path, image_size, [pseudo_partition],
+            )
+            if not records:
+                continue
+            record = records[0]
+            type_guid = str(partition.get("type_guid", "")).lower()
+            expected = expected_by_guid.get(type_guid, [])
+            record.update({
+                "partition_table": "gpt",
+                "gpt_partition_index": partition.get("index"),
+                "partition_type_guid": partition.get("type_guid"),
+                "partition_unique_guid": partition.get("unique_guid"),
+                "partition_name": partition.get("name"),
+                "last_lba": partition.get("last_lba"),
+                "expected_filesystems_from_type_guid": expected,
+            })
+            record.pop("slot", None)
+            record.pop("partition_type_code", None)
+            record.pop("partition_type", None)
+            record.pop("expected_filesystems_from_type_code", None)
+            record["boot_declared_start_lba_matches_gpt"] = record.pop(
+                "boot_declared_start_lba_matches_mbr", None,
+            )
+            detected = record.get("detected_filesystem")
+            record["partition_type_matches_detected"] = (
+                detected in expected if detected is not None and expected else None
+            )
+            results.append(record)
+        return results
+
     @staticmethod
     def _ntfs_partition_boot_validation(
         boot_sector: bytes, partition_bytes: int,
@@ -1211,6 +1287,7 @@ class GenericTriageEngine:
         revision = int.from_bytes(header[8:12], "little")
         details: dict[str, object] = {
             "valid": valid,
+            "header_offset": 512,
             "revision": f"{revision >> 16}.{revision & 0xffff}",
             "header_size": header_size,
             "header_crc32": f"0x{header_crc_stored:08x}",
@@ -1221,6 +1298,7 @@ class GenericTriageEngine:
             "last_usable_lba": last_usable_lba,
             "disk_guid": str(uuid.UUID(bytes_le=header[56:72])),
             "partition_entry_lba": entry_lba,
+            "partition_entry_offset": entry_lba * 512,
             "partition_entry_count": entry_count,
             "partition_entry_size": entry_size,
             "partition_entry_crc32": f"0x{entry_crc_stored:08x}",
@@ -1228,16 +1306,21 @@ class GenericTriageEngine:
         if not valid:
             return details, []
         entry_bytes = entry_count * entry_size
+        primary_entry_table: bytes | None = None
         if entry_bytes <= 64 * _MIB and entry_lba * 512 + entry_bytes <= image_size:
             try:
                 with path.open("rb") as stream:
                     stream.seek(entry_lba * 512)
                     entry_table = stream.read(entry_bytes)
+                primary_entry_table = entry_table if len(entry_table) == entry_bytes else None
                 details["partition_entry_crc_valid"] = len(entry_table) == entry_bytes and (zlib.crc32(entry_table) & 0xFFFFFFFF) == entry_crc_stored
             except OSError:
                 details["partition_entry_crc_valid"] = None
         else:
             details["partition_entry_crc_valid"] = None
+        details["backup"] = GenericTriageEngine._gpt_backup_validation(
+            path, image_size, details, primary_entry_table,
+        )
         # Only the first 256 entries are required for triage; the bound also
         # prevents a forged GPT header from causing a giant allocation/read.
         read_count = min(entry_count, 256)
@@ -1267,6 +1350,148 @@ class GenericTriageEngine:
                 "within_image": first_lba <= last_lba < image_sectors,
             })
         return details, partitions
+
+    @staticmethod
+    def _gpt_backup_validation(
+        path: Path,
+        image_size: int,
+        primary: dict[str, object],
+        primary_entry_table: bytes | None,
+    ) -> dict[str, object]:
+        """Validate the declared backup GPT header/table without choosing a preferred copy."""
+        backup_lba = int(primary.get("backup_lba", 0))
+        backup_offset = backup_lba * 512
+        result: dict[str, object] = {
+            "expected_header_lba": backup_lba,
+            "header_offset": backup_offset,
+            "available": False,
+            "signature_valid": False,
+            "layout_valid": False,
+            "header_crc_valid": None,
+            "partition_entry_crc_valid": None,
+            "reciprocal_locations_match": None,
+            "shared_geometry_matches": None,
+            "partition_entry_crc_matches_primary": None,
+            "partition_entry_table_matches_primary": None,
+            "first_partition_entry_difference": None,
+            "valid": False,
+        }
+        if backup_offset < 0 or backup_offset + 512 > image_size:
+            result["error"] = "declared backup GPT header is outside supplied image bounds"
+            return result
+        try:
+            with path.open("rb") as stream:
+                stream.seek(backup_offset)
+                header = stream.read(512)
+        except OSError as exc:
+            result["error"] = str(exc)[:2_000]
+            return result
+        if len(header) != 512:
+            result["error"] = "backup GPT header could not be read completely"
+            return result
+        result["available"] = True
+        result["signature_valid"] = header[:8] == b"EFI PART"
+        header_size = int.from_bytes(header[12:16], "little")
+        current_lba = int.from_bytes(header[24:32], "little")
+        reciprocal_lba = int.from_bytes(header[32:40], "little")
+        first_usable_lba = int.from_bytes(header[40:48], "little")
+        last_usable_lba = int.from_bytes(header[48:56], "little")
+        disk_guid = str(uuid.UUID(bytes_le=header[56:72]))
+        entry_lba = int.from_bytes(header[72:80], "little")
+        entry_count = int.from_bytes(header[80:84], "little")
+        entry_size = int.from_bytes(header[84:88], "little")
+        entry_crc_stored = int.from_bytes(header[88:92], "little")
+        entry_bytes = entry_count * entry_size
+        layout_valid = (
+            result["signature_valid"] is True
+            and 92 <= header_size <= 512
+            and current_lba < image_size // 512
+            and reciprocal_lba < image_size // 512
+            and first_usable_lba <= last_usable_lba < image_size // 512
+            and entry_lba < image_size // 512
+            and 0 < entry_count
+            and 128 <= entry_size <= 4096
+            and entry_size % 8 == 0
+            and entry_bytes <= 64 * _MIB
+            and entry_lba * 512 + entry_bytes <= image_size
+        )
+        result.update({
+            "layout_valid": layout_valid,
+            "header_size": header_size,
+            "current_lba": current_lba,
+            "backup_lba": reciprocal_lba,
+            "first_usable_lba": first_usable_lba,
+            "last_usable_lba": last_usable_lba,
+            "disk_guid": disk_guid,
+            "partition_entry_lba": entry_lba,
+            "partition_entry_offset": entry_lba * 512,
+            "partition_entry_count": entry_count,
+            "partition_entry_size": entry_size,
+            "partition_entry_crc32": f"0x{entry_crc_stored:08x}",
+        })
+        if not layout_valid:
+            return result
+        stored_header_crc = int.from_bytes(header[16:20], "little")
+        header_crc_input = bytearray(header[:header_size])
+        header_crc_input[16:20] = b"\x00" * 4
+        header_crc_valid = (
+            zlib.crc32(header_crc_input) & 0xFFFFFFFF
+        ) == stored_header_crc
+        result["header_crc32"] = f"0x{stored_header_crc:08x}"
+        result["header_crc_valid"] = header_crc_valid
+        result["reciprocal_locations_match"] = (
+            current_lba == int(primary.get("backup_lba", -1))
+            and reciprocal_lba == int(primary.get("current_lba", -1))
+        )
+        result["shared_geometry_matches"] = (
+            first_usable_lba == int(primary.get("first_usable_lba", -1))
+            and last_usable_lba == int(primary.get("last_usable_lba", -1))
+            and disk_guid == primary.get("disk_guid")
+            and entry_count == int(primary.get("partition_entry_count", -1))
+            and entry_size == int(primary.get("partition_entry_size", -1))
+        )
+        result["partition_entry_crc_matches_primary"] = (
+            f"0x{entry_crc_stored:08x}" == primary.get("partition_entry_crc32")
+        )
+        try:
+            with path.open("rb") as stream:
+                stream.seek(entry_lba * 512)
+                backup_entry_table = stream.read(entry_bytes)
+        except OSError as exc:
+            result["error"] = str(exc)[:2_000]
+            return result
+        entry_crc_valid = (
+            len(backup_entry_table) == entry_bytes
+            and (zlib.crc32(backup_entry_table) & 0xFFFFFFFF) == entry_crc_stored
+        )
+        result["partition_entry_crc_valid"] = entry_crc_valid
+        if primary_entry_table is not None and len(backup_entry_table) == len(primary_entry_table):
+            difference = next(
+                (
+                    index for index, (primary_byte, backup_byte)
+                    in enumerate(zip(primary_entry_table, backup_entry_table, strict=True))
+                    if primary_byte != backup_byte
+                ),
+                None,
+            )
+            result["partition_entry_table_matches_primary"] = difference is None
+            if difference is not None:
+                result["first_partition_entry_difference"] = {
+                    "relative_offset": difference,
+                    "primary_absolute_offset": int(primary["partition_entry_offset"]) + difference,
+                    "backup_absolute_offset": entry_lba * 512 + difference,
+                    "primary_byte": f"0x{primary_entry_table[difference]:02X}",
+                    "backup_byte": f"0x{backup_entry_table[difference]:02X}",
+                }
+        result["valid"] = all((
+            header_crc_valid,
+            entry_crc_valid,
+            result["reciprocal_locations_match"],
+            result["shared_geometry_matches"],
+            result["partition_entry_crc_matches_primary"],
+            result["partition_entry_table_matches_primary"] is not False,
+        ))
+        return result
 
     def _inspect_sqlite(self, artifact: Artifact, path: Path, size: int) -> list[Observation]:
         try:

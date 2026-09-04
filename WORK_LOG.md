@@ -1,5 +1,18 @@
 # ForensicKit Work Log
 
+## 2026-09-05 02:12 KST
+
+### CRC-gated GPT partition filesystem validation
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/profiles/disk.py`, and `tests/test_triage.py`.
+- A primary GPT must pass bounded header layout, header CRC32, and complete entry-table CRC32 before at most 32 entries can drive exact-offset FAT/NTFS/exFAT boot validation. Each result keeps the entry index, type/unique GUIDs, UTF-16 name, first/last LBA, byte offset, available length, full boot checks, embedded start/length fields, and GUID-family agreement without treating the type GUID as structural truth.
+- The declared backup GPT header and its complete bounded entry table are now independently validated for signature/layout/header CRC/table CRC, reciprocal current/backup LBAs, disk GUID/usable-range/entry geometry, stored entry CRC agreement, and exact table content. A first differing primary/backup entry byte retains both absolute offsets and values; neither copy is selected or repaired.
+- Added GPT filesystem inventory, malformed-boot/type/geometry mismatch paths, primary-CRC gating, and backup-metadata anomaly findings. A two-entry EFI-System fixture validates FAT12 and intentionally mismatched NTFS structures; corrupt primary-entry and backup-header variants prove suppression and isolated backup reporting. Focused triage/profile regression passed: 96 passed, 0 failed. The full direct synthetic suite passed: 302 passed, 0 failed; compileall and `git diff --check` passed.
+
+### Next
+
+- Traverse bounded EBR chains for logical MBR partitions, retaining each EBR/link/partition offset, extended-base semantics, cycle detection, and the same non-mounting filesystem boot validation.
+
 ## 2026-09-05 02:04 KST
 
 ### Exact-offset MBR partition filesystem validation

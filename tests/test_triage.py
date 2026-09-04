@@ -8,6 +8,7 @@ import tarfile
 import io
 import plistlib
 import sqlite3
+import uuid
 import zlib
 from pathlib import Path
 
@@ -1947,6 +1948,162 @@ def test_mbr_partition_boot_filesystems_are_offset_validated_without_trusting_ty
         if item.category == "partition_filesystem_boot_anomaly"
     )
     assert "'boot_sector_offset': 2560" in boot_anomaly.supporting_evidence[0]
+
+
+def test_gpt_partition_filesystems_require_crc_validated_entries_and_keep_guid_provenance(tmp_path: Path) -> None:
+    sector_size = 512
+    image = bytearray(40 * sector_size)
+    image[446 + 4] = 0xEE
+    image[446 + 8:446 + 12] = (1).to_bytes(4, "little")
+    image[446 + 12:446 + 16] = (39).to_bytes(4, "little")
+    image[510:512] = b"\x55\xaa"
+
+    esp_guid = uuid.UUID("c12a7328-f81f-11d2-ba4b-00a0c93ec93b")
+    entries = bytearray(256)
+    for index, first_lba, last_lba, name in (
+        (0, 4, 9, "EFI FAT"),
+        (1, 10, 14, "MISLABELED NTFS"),
+    ):
+        offset = index * 128
+        entries[offset:offset + 16] = esp_guid.bytes_le
+        entries[offset + 16:offset + 32] = uuid.UUID(int=index + 1).bytes_le
+        entries[offset + 32:offset + 40] = first_lba.to_bytes(8, "little")
+        entries[offset + 40:offset + 48] = last_lba.to_bytes(8, "little")
+        encoded_name = name.encode("utf-16le")
+        entries[offset + 56:offset + 56 + len(encoded_name)] = encoded_name
+    image[2 * sector_size:2 * sector_size + len(entries)] = entries
+
+    header = bytearray(sector_size)
+    header[:8] = b"EFI PART"
+    header[8:12] = (0x00010000).to_bytes(4, "little")
+    header[12:16] = (92).to_bytes(4, "little")
+    header[24:32] = (1).to_bytes(8, "little")
+    header[32:40] = (39).to_bytes(8, "little")
+    header[40:48] = (4).to_bytes(8, "little")
+    header[48:56] = (37).to_bytes(8, "little")
+    header[56:72] = uuid.UUID(int=100).bytes_le
+    header[72:80] = (2).to_bytes(8, "little")
+    header[80:84] = (2).to_bytes(4, "little")
+    header[84:88] = (128).to_bytes(4, "little")
+    header[88:92] = (zlib.crc32(entries) & 0xFFFFFFFF).to_bytes(4, "little")
+    crc_input = bytearray(header[:92])
+    crc_input[16:20] = b"\x00" * 4
+    header[16:20] = (zlib.crc32(crc_input) & 0xFFFFFFFF).to_bytes(4, "little")
+    image[sector_size:2 * sector_size] = header
+    image[38 * sector_size:38 * sector_size + len(entries)] = entries
+    backup_header = bytearray(header)
+    backup_header[16:20] = b"\x00" * 4
+    backup_header[24:32] = (39).to_bytes(8, "little")
+    backup_header[32:40] = (1).to_bytes(8, "little")
+    backup_header[72:80] = (38).to_bytes(8, "little")
+    backup_crc_input = bytearray(backup_header[:92])
+    backup_crc_input[16:20] = b"\x00" * 4
+    backup_header[16:20] = (
+        zlib.crc32(backup_crc_input) & 0xFFFFFFFF
+    ).to_bytes(4, "little")
+    image[39 * sector_size:40 * sector_size] = backup_header
+
+    fat = 4 * sector_size
+    image[fat:fat + 3] = b"\xeb\x3c\x90"
+    image[fat + 11:fat + 13] = sector_size.to_bytes(2, "little")
+    image[fat + 13] = 1
+    image[fat + 14:fat + 16] = (1).to_bytes(2, "little")
+    image[fat + 16] = 1
+    image[fat + 17:fat + 19] = (16).to_bytes(2, "little")
+    image[fat + 19:fat + 21] = (100).to_bytes(2, "little")
+    image[fat + 21] = 0xF8
+    image[fat + 22:fat + 24] = (1).to_bytes(2, "little")
+    image[fat + 28:fat + 32] = (4).to_bytes(4, "little")
+    image[fat + 510:fat + 512] = b"\x55\xaa"
+
+    ntfs = 10 * sector_size
+    image[ntfs:ntfs + 3] = b"\xeb\x52\x90"
+    image[ntfs + 3:ntfs + 11] = b"NTFS    "
+    image[ntfs + 11:ntfs + 13] = sector_size.to_bytes(2, "little")
+    image[ntfs + 13] = 1
+    image[ntfs + 21] = 0xF8
+    image[ntfs + 28:ntfs + 32] = (10).to_bytes(4, "little")
+    image[ntfs + 40:ntfs + 48] = (5).to_bytes(8, "little")
+    image[ntfs + 48:ntfs + 56] = (1).to_bytes(8, "little")
+    image[ntfs + 56:ntfs + 64] = (2).to_bytes(8, "little")
+    image[ntfs + 64] = 0xF6
+    image[ntfs + 68] = 0xF6
+    image[ntfs + 510:ntfs + 512] = b"\x55\xaa"
+
+    evidence = tmp_path / "gpt-partition-filesystems.raw"
+    evidence.write_bytes(image)
+    artifact = _artifact(evidence)
+    observations = GenericTriageEngine().analyze(artifact, evidence)
+    values = _values(observations)
+    assert values["disk.gpt.header"]["header_crc_valid"] is True
+    assert values["disk.gpt.header"]["partition_entry_crc_valid"] is True
+    assert values["disk.gpt.header"]["backup"]["valid"] is True
+    assert values["disk.gpt.header"]["backup"]["header_offset"] == 39 * sector_size
+    assert values["disk.gpt.header"]["backup"]["partition_entry_offset"] == 38 * sector_size
+    assert values["disk.gpt.header"]["backup"]["reciprocal_locations_match"] is True
+    assert values["disk.gpt.header"]["backup"]["partition_entry_table_matches_primary"] is True
+    assert values["disk.gpt.partition_filesystem_validation"]["eligible"] is True
+    filesystems = values["disk.gpt.partition_filesystems"]
+    assert len(filesystems) == 2
+    assert filesystems[0]["partition_table"] == "gpt"
+    assert filesystems[0]["gpt_partition_index"] == 1
+    assert filesystems[0]["partition_type_guid"] == str(esp_guid)
+    assert filesystems[0]["partition_unique_guid"] == str(uuid.UUID(int=1))
+    assert filesystems[0]["partition_name"] == "EFI FAT"
+    assert filesystems[0]["partition_offset"] == fat
+    assert filesystems[0]["detected_filesystem"] == "fat12"
+    assert filesystems[0]["expected_filesystems_from_type_guid"] == ["fat12", "fat16", "fat32"]
+    assert filesystems[0]["partition_type_matches_detected"] is True
+    assert filesystems[0]["boot_declared_start_lba_matches_gpt"] is True
+    assert filesystems[1]["gpt_partition_index"] == 2
+    assert filesystems[1]["partition_offset"] == ntfs
+    assert filesystems[1]["detected_filesystem"] == "ntfs"
+    assert filesystems[1]["partition_type_matches_detected"] is False
+    assert filesystems[1]["boot_declared_volume_matches_partition"] is True
+
+    profile = ProfileEngine().evaluate(artifact, observations)
+    inventory = next(
+        item for item in profile.findings
+        if item.category == "gpt_partition_filesystem_inventory"
+    )
+    mismatch = next(
+        item for item in profile.findings
+        if item.category == "partition_type_filesystem_mismatch"
+    )
+    assert "'gpt_partition_index': 1" in inventory.supporting_evidence[0]
+    assert str(esp_guid) in mismatch.supporting_evidence[0]
+    assert not any(
+        item.category == "gpt_backup_metadata_anomaly" for item in profile.findings
+    )
+
+    corrupt = bytearray(image)
+    corrupt[2 * sector_size + 56] ^= 1
+    corrupt_path = tmp_path / "gpt-corrupt-entry-table.raw"
+    corrupt_path.write_bytes(corrupt)
+    corrupt_observations = GenericTriageEngine().analyze(_artifact(corrupt_path), corrupt_path)
+    corrupt_values = _values(corrupt_observations)
+    assert corrupt_values["disk.gpt.header"]["partition_entry_crc_valid"] is False
+    assert corrupt_values["disk.gpt.partition_filesystem_validation"]["eligible"] is False
+    assert corrupt_values["disk.gpt.partition_filesystems"] == []
+
+    backup_corrupt = bytearray(image)
+    backup_corrupt[39 * sector_size + 16] ^= 1
+    backup_corrupt_path = tmp_path / "gpt-corrupt-backup-header.raw"
+    backup_corrupt_path.write_bytes(backup_corrupt)
+    backup_artifact = _artifact(backup_corrupt_path)
+    backup_observations = GenericTriageEngine().analyze(
+        backup_artifact, backup_corrupt_path,
+    )
+    backup_values = _values(backup_observations)
+    assert backup_values["disk.gpt.partition_filesystem_validation"]["eligible"] is True
+    assert backup_values["disk.gpt.header"]["backup"]["header_crc_valid"] is False
+    assert backup_values["disk.gpt.header"]["backup"]["valid"] is False
+    backup_profile = ProfileEngine().evaluate(backup_artifact, backup_observations)
+    backup_anomaly = next(
+        item for item in backup_profile.findings
+        if item.category == "gpt_backup_metadata_anomaly"
+    )
+    assert "'header_offset': 19968" in backup_anomaly.supporting_evidence[0]
 
 
 def test_fat32_extflags_control_copy_consistency_and_active_chain_traversal(tmp_path: Path) -> None:
