@@ -4010,11 +4010,15 @@ class GenericTriageEngine:
         for index in range(scan_limit):
             entry = data[index * 32:(index + 1) * 32]
             if entry[0] == 0:
-                if pending_lfn and any(slot[0] == 0xE5 for _, slot in pending_lfn):
+                if pending_lfn:
+                    deleted_slots = all(slot[0] == 0xE5 for _, slot in pending_lfn)
                     unlinked_lfn_slots.append({
                         "short_entry_index": None, "short_entry_offset": None,
                         "slot_offsets": [entry_offsets[slot_index] for slot_index, _ in pending_lfn],
-                        "reason": "deleted LFN slots are not followed by a deleted short entry",
+                        "reason": (
+                            "deleted LFN slots are not followed by a deleted short entry"
+                            if deleted_slots else "LFN slots are not followed by a short entry"
+                        ),
                         "raw_hex": [slot.hex() for _, slot in pending_lfn],
                     })
                 break
@@ -4887,12 +4891,16 @@ class GenericTriageEngine:
         for index in range(limit):
             entry = data[index * 32:(index + 1) * 32]
             if entry[0] == 0x00:
-                if pending_lfn and any(slot[0] == 0xE5 for _, slot in pending_lfn):
+                if pending_lfn:
+                    deleted_slots = all(slot[0] == 0xE5 for _, slot in pending_lfn)
                     unlinked_lfn_slots.append({
                         "short_entry_index": None,
                         "short_entry_offset": None,
                         "slot_offsets": [entry_offsets[slot_index] for slot_index, _ in pending_lfn],
-                        "reason": "deleted LFN slots are not followed by a deleted short entry",
+                        "reason": (
+                            "deleted LFN slots are not followed by a deleted short entry"
+                            if deleted_slots else "LFN slots are not followed by a short entry"
+                        ),
                         "raw_hex": [slot.hex() for _, slot in pending_lfn],
                     })
                 break

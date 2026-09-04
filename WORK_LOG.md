@@ -1,5 +1,17 @@
 # ForensicKit Work Log
 
+## 2026-09-05 00:12 KST
+
+### Active FAT root orphan-LFN provenance
+
+- Changed `src/forensickit/triage.py` and `tests/test_triage.py`.
+- FAT12, FAT16, and FAT32 root scanners now retain active or mixed pending LFN slots when the next directory entry is an end marker. Existing all-deleted orphan wording remains distinct; active names are not decoded or trusted without an adjacent short entry.
+- Added valid-class synthetic geometries for all three FAT variants and required exact root slot offsets/raw bytes, explicit null short-entry state, and the corresponding profile finding. Focused triage regression passed: 91 passed, 0 failed. The full direct synthetic suite passed: 297 passed, 0 failed; compileall and `git diff --check` passed.
+
+### Next
+
+- Validate pending active LFNs before root directory entries, preserving invalid chains while recognizing a valid directory LFN as linked rather than anomalous.
+
 ## 2026-09-05 00:08 KST
 
 ### FAT32 orphaned/incompatible subdirectory LFN provenance

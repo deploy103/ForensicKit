@@ -1917,6 +1917,84 @@ def test_fat12_subdirectory_invalid_active_and_deleted_lfns_keep_lineage(tmp_pat
     assert any(item.category == "fat12_unlinked_lfn_slots" for item in profile.findings)
 
 
+def test_active_fat_root_lfn_orphans_keep_exact_slot_provenance(tmp_path: Path) -> None:
+    sector_size = 512
+    slot = bytearray(32)
+    slot[0] = 0x41
+    slot[11] = 0x0F
+    encoded_name = "Orphan.txt".encode("utf-16le") + b"\x00\x00" + b"\xff\xff" * 3
+    slot[1:11] = encoded_name[:10]
+    slot[14:26] = encoded_name[10:22]
+    slot[28:32] = encoded_name[22:26]
+
+    fixed_variants = (
+        (12, 1, 100, b"FAT12   ", b"\xf0\xff\xff", 2 * sector_size),
+        (16, 17, 4_119, b"FAT16   ", b"\xf8\xff\xff\xff", 18 * sector_size),
+    )
+    for fat_bits, fat_size, total_sectors, label, fat_header, root_offset in fixed_variants:
+        image = bytearray(root_offset + sector_size)
+        image[11:13] = sector_size.to_bytes(2, "little")
+        image[13] = 1
+        image[14:16] = (1).to_bytes(2, "little")
+        image[16] = 1
+        image[17:19] = (16).to_bytes(2, "little")
+        image[19:21] = total_sectors.to_bytes(2, "little")
+        image[21] = 0xF0 if fat_bits == 12 else 0xF8
+        image[22:24] = fat_size.to_bytes(2, "little")
+        image[54:62] = label
+        image[510:512] = b"\x55\xaa"
+        image[sector_size:sector_size + len(fat_header)] = fat_header
+        image[root_offset:root_offset + 32] = slot
+        evidence = tmp_path / f"fat{fat_bits}-root-orphan-lfn.raw"
+        evidence.write_bytes(image)
+
+        artifact = _artifact(evidence)
+        observations = GenericTriageEngine().analyze(artifact, evidence)
+        values = _values(observations)
+        assert values[f"filesystem.fat{fat_bits}.root.unlinked_lfn_slots"] == [{
+            "short_entry_index": None,
+            "short_entry_offset": None,
+            "slot_offsets": [root_offset],
+            "reason": "LFN slots are not followed by a short entry",
+            "raw_hex": [slot.hex()],
+        }]
+        assert any(
+            item.category == f"fat{fat_bits}_unlinked_lfn_slots"
+            for item in ProfileEngine().evaluate(artifact, observations).findings
+        )
+
+    fat32 = bytearray(4 * sector_size)
+    fat32[11:13] = sector_size.to_bytes(2, "little")
+    fat32[13] = 1
+    fat32[14:16] = (1).to_bytes(2, "little")
+    fat32[16] = 1
+    fat32[32:36] = (8).to_bytes(4, "little")
+    fat32[36:40] = (1).to_bytes(4, "little")
+    fat32[44:48] = (2).to_bytes(4, "little")
+    fat32[82:90] = b"FAT32   "
+    fat32[510:512] = b"\x55\xaa"
+    fat32[sector_size:sector_size + 8] = b"\xf8\xff\xff\x0f\xff\xff\xff\x0f"
+    fat32[sector_size + 8:sector_size + 12] = (0x0FFFFFFF).to_bytes(4, "little")
+    fat32_root_offset = 2 * sector_size
+    fat32[fat32_root_offset:fat32_root_offset + 32] = slot
+    fat32_path = tmp_path / "fat32-root-orphan-lfn.raw"
+    fat32_path.write_bytes(fat32)
+    fat32_artifact = _artifact(fat32_path)
+    fat32_observations = GenericTriageEngine().analyze(fat32_artifact, fat32_path)
+    fat32_values = _values(fat32_observations)
+    assert fat32_values["filesystem.fat.unlinked_lfn_slots"] == [{
+        "short_entry_index": None,
+        "short_entry_offset": None,
+        "slot_offsets": [fat32_root_offset],
+        "reason": "LFN slots are not followed by a short entry",
+        "raw_hex": [slot.hex()],
+    }]
+    assert any(
+        item.category == "fat32_unlinked_lfn_slots"
+        for item in ProfileEngine().evaluate(fat32_artifact, fat32_observations).findings
+    )
+
+
 def test_fat32_deleted_lfn_chain_requires_checksum_and_terminal_validation(tmp_path: Path) -> None:
     image = bytearray(4096)
     image[11:13] = (512).to_bytes(2, "little")
