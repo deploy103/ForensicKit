@@ -36,6 +36,82 @@ class DiskProfile(BaseProfile):
 
     def analyze(self, context: ProfileContext) -> ProfileResult:
         result = ProfileResult(profile=self.name, matched=True)
+        partition_filesystems = next(
+            (
+                value for value in context.values("disk.mbr.partition_filesystems")
+                if isinstance(value, list)
+            ),
+            [],
+        )
+        detected_partition_filesystems = [
+            item for item in partition_filesystems
+            if isinstance(item, dict) and item.get("detected_filesystem") is not None
+        ]
+        if detected_partition_filesystems:
+            result.findings.append(self.finding(
+                context,
+                title=f"{len(detected_partition_filesystems)} MBR partition filesystem boot structure(s) validated",
+                category="mbr_partition_filesystem_inventory", confidence=0.98,
+                explanation=(
+                    "Each filesystem was validated from a complete boot sector at the exact primary-partition start LBA. "
+                    "FAT uses cluster-count and capacity relationships, while NTFS/exFAT use format-specific identifiers and geometry; no partition was mounted or implicitly extracted."
+                ),
+                evidence=[str(item)[:4_000] for item in detected_partition_filesystems[:4]],
+                severity="info",
+            ))
+        invalid_partition_boots = [
+            item for item in partition_filesystems
+            if isinstance(item, dict)
+            and item.get("filesystem_candidate") is not None
+            and item.get("detected_filesystem") is None
+            and isinstance(item.get("validation"), dict)
+            and item["validation"].get("valid") is False
+        ]
+        if invalid_partition_boots:
+            result.findings.append(self.finding(
+                context,
+                title=f"{len(invalid_partition_boots)} MBR partition filesystem boot candidate(s) failed validation",
+                category="partition_filesystem_boot_anomaly", confidence=0.97,
+                explanation=(
+                    "A format-specific identifier or FAT geometry candidate exists at a declared primary-partition offset, but its bounded boot-sector checks failed. "
+                    "The MBR type code is retained only as a hint and does not override malformed on-disk structure."
+                ),
+                evidence=[str(item)[:4_000] for item in invalid_partition_boots[:4]],
+                severity="medium",
+            ))
+        partition_type_mismatches = [
+            item for item in detected_partition_filesystems
+            if item.get("partition_type_matches_detected") is False
+        ]
+        if partition_type_mismatches:
+            result.findings.append(self.finding(
+                context,
+                title=f"{len(partition_type_mismatches)} MBR type code/filesystem mismatch(es)",
+                category="partition_type_filesystem_mismatch", confidence=0.99,
+                explanation=(
+                    "The complete structure at a declared partition start validates as a filesystem outside the MBR type code's specific expected family. "
+                    "Exact entry, LBA, byte-offset, expected-family, and validated boot evidence is retained without changing the partition table."
+                ),
+                evidence=[str(item)[:4_000] for item in partition_type_mismatches[:4]],
+                severity="low",
+            ))
+        partition_boot_geometry_mismatches = [
+            item for item in detected_partition_filesystems
+            if item.get("boot_declared_start_lba_matches_mbr") is False
+            or item.get("boot_declared_volume_matches_partition") is False
+        ]
+        if partition_boot_geometry_mismatches:
+            result.findings.append(self.finding(
+                context,
+                title=f"{len(partition_boot_geometry_mismatches)} MBR/partition boot geometry mismatch(es)",
+                category="partition_boot_geometry_mismatch", confidence=0.99,
+                explanation=(
+                    "A validated filesystem boot sector's embedded partition-start LBA or declared volume length differs from its containing primary MBR entry. "
+                    "Both independent values and the exact boot-field byte offset are retained; the mismatch is not silently reconciled."
+                ),
+                evidence=[str(item)[:4_000] for item in partition_boot_geometry_mismatches[:4]],
+                severity="medium",
+            ))
         exfat_main_boot = next(
             (value for value in context.values("filesystem.exfat.boot_regions.main") if isinstance(value, dict)), {}
         )
