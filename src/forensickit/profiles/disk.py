@@ -331,6 +331,75 @@ class DiskProfile(BaseProfile):
                 evidence=[str(item)[:2_000] for item in subdirectory_deleted[:128]],
                 severity="info",
             ))
+        fat32_fsinfo = next(
+            (value for value in context.values("filesystem.fat32.fsinfo") if isinstance(value, dict)),
+            {},
+        )
+        if fat32_fsinfo.get("available"):
+            result.findings.append(self.finding(
+                context,
+                title="FAT32 FSInfo allocation hints inventoried",
+                category="fat32_fsinfo_inventory", confidence=0.94,
+                explanation=(
+                    "The BPB-referenced reserved sector was parsed with lead, structure, and trail signature checks. "
+                    "Free-cluster count and next-free values are allocation hints only and are range-checked against BPB-derived cluster geometry."
+                ),
+                evidence=[str(fat32_fsinfo)[:2_000]], severity="info",
+            ))
+            if (
+                not fat32_fsinfo.get("valid")
+                or fat32_fsinfo.get("free_cluster_count_in_range") is False
+                or fat32_fsinfo.get("next_free_cluster_in_range") is False
+            ):
+                result.findings.append(self.finding(
+                    context,
+                    title="FAT32 FSInfo metadata is inconsistent",
+                    category="fat32_fsinfo_anomaly", confidence=0.96,
+                    explanation=(
+                        "One or more FSInfo signatures failed or a declared allocation hint falls outside the BPB-derived data-cluster range. "
+                        "The values are preserved as metadata and are not trusted as authoritative allocation state."
+                    ),
+                    evidence=[str(fat32_fsinfo)[:2_000]], severity="low",
+                ))
+        fat32_backup_boot = next(
+            (value for value in context.values("filesystem.fat32.backup_boot") if isinstance(value, dict)),
+            {},
+        )
+        if fat32_backup_boot.get("available") and (
+            not fat32_backup_boot.get("signature_valid")
+            or not fat32_backup_boot.get("fat32_label_valid")
+            or fat32_backup_boot.get("primary_match") is False
+        ):
+            result.findings.append(self.finding(
+                context,
+                title="FAT32 primary and backup boot sectors are inconsistent",
+                category="fat32_backup_boot_mismatch", confidence=0.97,
+                explanation=(
+                    "The BPB-referenced backup boot sector has an invalid signature/label or differs byte-for-byte from the supplied primary sector. "
+                    "No copy is selected as authoritative; the exact backup and first differing offsets are retained for verification."
+                ),
+                evidence=[str(fat32_backup_boot)[:2_000]], severity="low",
+            ))
+        fat32_backup_fsinfo = next(
+            (value for value in context.values("filesystem.fat32.backup_fsinfo") if isinstance(value, dict)),
+            {},
+        )
+        if fat32_backup_fsinfo.get("available") and (
+            not fat32_backup_fsinfo.get("valid")
+            or fat32_backup_fsinfo.get("primary_match") is False
+            or fat32_backup_fsinfo.get("free_cluster_count_in_range") is False
+            or fat32_backup_fsinfo.get("next_free_cluster_in_range") is False
+        ):
+            result.findings.append(self.finding(
+                context,
+                title="FAT32 primary and backup FSInfo sectors are inconsistent",
+                category="fat32_backup_fsinfo_mismatch", confidence=0.96,
+                explanation=(
+                    "The conventional backup-FSInfo location inside the reserved region is invalid, out of range, or differs from the primary FSInfo sector. "
+                    "Both copies and their exact first differing byte are retained without treating either allocation hint as authoritative."
+                ),
+                evidence=[str(fat32_backup_fsinfo)[:2_000]], severity="low",
+            ))
         fat16_deleted = next(
             (
                 value for value in context.values("filesystem.fat16.root.deleted_entries")
