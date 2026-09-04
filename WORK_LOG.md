@@ -1,5 +1,17 @@
 # ForensicKit Work Log
 
+## 2026-09-05 00:08 KST
+
+### FAT32 orphaned/incompatible subdirectory LFN provenance
+
+- Changed `src/forensickit/triage.py` and `tests/test_engine_pipeline.py`.
+- The bounded FAT32 subdirectory scanner now retains pending LFN slots when an end marker appears without a short entry or an incompatible volume-label entry follows. It also validates pending LFNs before active directory entries and retains failures while allowing valid directory-name chains without a false anomaly.
+- Every failure record keeps raw slots, physical slot/short-entry offsets or explicit null short-entry state, source directory entry, and complete cluster lineage. The ExtFlags-selected noncontiguous Engine E2E now requires both failure modes and their JSON report evidence. Engine regression passed: 45 passed, 0 failed. The full direct synthetic suite passed: 296 passed, 0 failed; compileall and `git diff --check` passed.
+
+### Next
+
+- Preserve active LFN slots orphaned by root-directory end markers across FAT12/16/32 with exact root offsets and cautious findings.
+
 ## 2026-09-04 23:58 KST
 
 ### FAT32 unlinked-LFN report finding

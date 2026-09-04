@@ -2176,6 +2176,13 @@ def test_fat32_noncontiguous_subdirectory_lfn_file_keeps_selected_fat_lineage(tm
     image[deleted_short_offset + 28:deleted_short_offset + 32] = len(deleted_payload).to_bytes(4, "little")
     deleted_content_offset = (first_data_sector + 6) * sector_size
     image[deleted_content_offset:deleted_content_offset + len(deleted_payload)] = deleted_payload
+    incompatible_slot_offset = second_directory_offset + 128
+    image[incompatible_slot_offset:incompatible_slot_offset + 32] = slot
+    volume_label_offset = second_directory_offset + 160
+    image[volume_label_offset:volume_label_offset + 11] = b"VOLUME     "
+    image[volume_label_offset + 11] = 0x08
+    orphan_slot_offset = second_directory_offset + 192
+    image[orphan_slot_offset:orphan_slot_offset + 32] = slot
     evidence = tmp_path / "fat32-subdirectory-active-lfn.raw"
     evidence.write_bytes(image)
 
@@ -2258,16 +2265,38 @@ def test_fat32_noncontiguous_subdirectory_lfn_file_keeps_selected_fat_lineage(tm
         if observation.artifact_id == bad_result.root_artifact.id
         and observation.key == "filesystem.fat.unlinked_lfn_slots"
     )
-    assert unlinked == [{
-        "directory_start_cluster": 5,
-        "directory_cluster_lineage": [5, 9],
-        "directory_source_entry_offset": root_offset,
-        "short_entry_index": 17,
-        "short_entry_offset": short_offset,
-        "slot_offsets": [second_directory_offset],
-        "reason": "active LFN checksum does not match the short entry",
-        "raw_hex": [bytes(bad_lfn[second_directory_offset:second_directory_offset + 32]).hex()],
-    }]
+    assert unlinked == [
+        {
+            "directory_start_cluster": 5,
+            "directory_cluster_lineage": [5, 9],
+            "directory_source_entry_offset": root_offset,
+            "short_entry_index": 17,
+            "short_entry_offset": short_offset,
+            "slot_offsets": [second_directory_offset],
+            "reason": "active LFN checksum does not match the short entry",
+            "raw_hex": [bytes(bad_lfn[second_directory_offset:second_directory_offset + 32]).hex()],
+        },
+        {
+            "directory_start_cluster": 5,
+            "directory_cluster_lineage": [5, 9],
+            "directory_source_entry_offset": root_offset,
+            "short_entry_index": 21,
+            "short_entry_offset": volume_label_offset,
+            "slot_offsets": [incompatible_slot_offset],
+            "reason": "LFN slots are followed by an incompatible volume-label entry",
+            "raw_hex": [slot.hex()],
+        },
+        {
+            "directory_start_cluster": 5,
+            "directory_cluster_lineage": [5, 9],
+            "directory_source_entry_offset": root_offset,
+            "short_entry_index": None,
+            "short_entry_offset": None,
+            "slot_offsets": [orphan_slot_offset],
+            "reason": "LFN slots are not followed by a short entry",
+            "raw_hex": [slot.hex()],
+        },
+    ]
     unlinked_finding = next(
         item for item in bad_result.findings
         if item.category == "fat32_unlinked_lfn_slots"
@@ -2278,6 +2307,8 @@ def test_fat32_noncontiguous_subdirectory_lfn_file_keeps_selected_fat_lineage(tm
     report = Path(bad_result.case.workspace, "reports", "report.json").read_text(encoding="utf-8")
     assert "fat32_unlinked_lfn_slots" in report
     assert "active LFN checksum does not match the short entry" in report
+    assert "LFN slots are followed by an incompatible volume-label entry" in report
+    assert "LFN slots are not followed by a short entry" in report
 
 
 def test_recycle_bin_exact_supplied_content_pair_is_correlated(tmp_path: Path) -> None:
