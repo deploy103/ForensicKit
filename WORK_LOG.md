@@ -1,5 +1,18 @@
 # ForensicKit Work Log
 
+## 2026-09-04 23:14 KST
+
+### ExtFlags-aware active FAT32 file recursion
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/extraction.py`, `src/forensickit/profiles/disk.py`, and `tests/test_engine_pipeline.py`.
+- Active FAT32 regular entries in bounded root/subdirectory data now retain exact entry/directory lineage, short/validated LFN names, raw 32-bit cluster fields, masked 28-bit cluster numbers, reserved-high-nibble validation, size, and raw bytes. Directory discovery likewise masks to 28 bits and rejects nonzero reserved high nibbles.
+- The shared active FAT extractor now supports FAT32 using four-byte masked entries, the BPB-derived FAT32 cluster range, and the exact active-FAT offset emitted by ExtFlags-aware triage. Existing FAT32 deleted multicluster recovery now consumes that selected offset too instead of assuming FAT zero.
+- Added a FAT32-sized non-mirrored E2E where FAT zero ends root cluster 2 but ExtFlags-selected FAT one maps `2 -> 5 -> EOC` and marks active file cluster 7 EOC. `ACTIVE.TXT` is recovered only through FAT one, its flag is attributed to the child, and entry/FAT/data offsets survive finding provenance. Combined Engine/triage regression: 133 passed after the focused rerun (44 Engine tests, 0 failed).
+
+### Next
+
+- Exercise active FAT32 LFN recovery from a noncontiguous active subdirectory under mirroring-disabled ExtFlags, verifying directory source/cluster lineage and active-table file-chain offsets in the Engine report.
+
 ## 2026-09-04 23:04 KST
 
 ### Active FAT12/16 named-file recursion

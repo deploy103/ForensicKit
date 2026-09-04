@@ -674,12 +674,16 @@ class DiskProfile(BaseProfile):
                     ),
                     evidence=[str(lost_chain_inventory)[:4_000]], severity="low",
                 ))
-        for fat_bits in (12, 16):
+        for fat_bits in (12, 16, 32):
+            active_file_key = (
+                "filesystem.fat.root.recoverable_regular_files"
+                if fat_bits == 32
+                else f"filesystem.fat{fat_bits}.root.recoverable_regular_files"
+            )
             active_fat_files = next(
                 (
-                    value for value in context.values(
-                        f"filesystem.fat{fat_bits}.root.recoverable_regular_files"
-                    ) if isinstance(value, list)
+                    value for value in context.values(active_file_key)
+                    if isinstance(value, list)
                 ),
                 [],
             )
