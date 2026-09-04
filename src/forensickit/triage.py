@@ -2079,6 +2079,11 @@ class GenericTriageEngine:
                 self._observation(artifact, "filesystem.fat.volume_label", (header[71:82] if fat32 else header[43:54]).decode("ascii", errors="replace").strip()),
             ))
             if fat32:
+                observations.extend(self._inspect_fat_duplicate_tables(
+                    artifact, path, size, header, bytes_per_sector,
+                    sectors_per_cluster, int.from_bytes(header[14:16], "little"),
+                    header[16], int.from_bytes(header[36:40], "little"), fat_bits=32,
+                ))
                 observations.extend(self._inspect_fat32_metadata_sectors(
                     artifact, path, size, header, bytes_per_sector,
                     sectors_per_cluster, int.from_bytes(header[14:16], "little"),
@@ -3642,7 +3647,7 @@ class GenericTriageEngine:
         *,
         fat_bits: int,
     ) -> list[Observation]:
-        """Compare declared FAT12/16 tables without selecting an authoritative copy."""
+        """Compare declared FAT tables without inferring an authoritative copy."""
         variant = f"fat{fat_bits}"
         prefix = f"filesystem.{variant}.fat_copies"
         root_entries = int.from_bytes(header[17:19], "little")
@@ -3652,14 +3657,15 @@ class GenericTriageEngine:
         )
         root_sectors = (
             (root_entries * 32 + bytes_per_sector - 1) // bytes_per_sector
-            if bytes_per_sector else 0
+            if bytes_per_sector and fat_bits != 32 else 0
         )
         first_data_sector = reserved_sectors + fat_count * fat_size + root_sectors
         data_sectors = total_sectors - first_data_sector
         cluster_count = data_sectors // sectors_per_cluster if sectors_per_cluster else 0
         fat_size_bytes = fat_size * bytes_per_sector
         fat_entry_capacity = (
-            fat_size_bytes // 2 if fat_bits == 16
+            fat_size_bytes // 4 if fat_bits == 32
+            else fat_size_bytes // 2 if fat_bits == 16
             else fat_size_bytes * 2 // 3 if fat_bits == 12
             else 0
         )
@@ -3669,9 +3675,11 @@ class GenericTriageEngine:
             and sectors_per_cluster & (sectors_per_cluster - 1) == 0
             and sectors_per_cluster <= 128 and reserved_sectors > 0
             and 1 <= fat_count <= 4 and fat_size > 0
-            and 0 < root_entries <= 65_535 and total_sectors > first_data_sector
+            and (fat_bits == 32 or 0 < root_entries <= 65_535)
+            and total_sectors > first_data_sector
             and (
-                (fat_bits == 16 and 4_085 <= cluster_count < 65_525)
+                (fat_bits == 32 and cluster_count >= 65_525)
+                or (fat_bits == 16 and 4_085 <= cluster_count < 65_525)
                 or (fat_bits == 12 and 0 < cluster_count < 4_085)
             )
             and fat_entry_capacity >= cluster_count + 2
@@ -3691,6 +3699,22 @@ class GenericTriageEngine:
             "comparisons": [],
             "all_copies_match": None,
         }
+        if fat_bits == 32:
+            ext_flags = int.from_bytes(header[40:42], "little") if len(header) >= 42 else 0
+            mirroring_enabled = not bool(ext_flags & 0x0080)
+            active_copy_index = 0 if mirroring_enabled else ext_flags & 0x000F
+            inventory.update({
+                "ext_flags": f"0x{ext_flags:04X}",
+                "mirroring_enabled": mirroring_enabled,
+                "copies_expected_to_match": mirroring_enabled,
+                "active_copy_index": active_copy_index,
+                "active_copy_index_valid": active_copy_index < fat_count,
+                "ext_flags_reserved_bits_zero": not bool(ext_flags & 0xFF70),
+                "selection_basis": (
+                    "mirroring_enabled_reference_copy_zero"
+                    if mirroring_enabled else "bpb_extflags_active_copy"
+                ),
+            })
         if not geometry_valid:
             inventory["reason"] = f"invalid {variant.upper()} allocation-table geometry"
             return [self._observation(artifact, prefix, inventory)]
@@ -3717,6 +3741,13 @@ class GenericTriageEngine:
                 copy_record["reason"] = "declared FAT range exceeds supplied image"
             copies.append(copy_record)
         inventory["copies"] = copies
+        if fat_bits == 32:
+            active_copy_index = inventory["active_copy_index"]
+            inventory["active_copy_available"] = (
+                isinstance(active_copy_index, int)
+                and active_copy_index < len(copies)
+                and copies[active_copy_index]["available"] is True
+            )
         if fat_count < 2:
             inventory["reason"] = "fewer than two FAT copies are declared"
             return [self._observation(artifact, prefix, inventory)]
@@ -4328,12 +4359,16 @@ class GenericTriageEngine:
     ) -> list[Observation]:
         prefix = "filesystem.fat.root"
         root_cluster = int.from_bytes(header[44:48], "little") if len(header) >= 48 else 0
+        ext_flags = int.from_bytes(header[40:42], "little") if len(header) >= 42 else 0
+        fat_mirroring_enabled = not bool(ext_flags & 0x0080)
+        active_fat_index = 0 if fat_mirroring_enabled else ext_flags & 0x000F
         cluster_size = bytes_per_sector * sectors_per_cluster
         valid_geometry = (
             bytes_per_sector in {512, 1024, 2048, 4096}
             and sectors_per_cluster > 0 and sectors_per_cluster & (sectors_per_cluster - 1) == 0
             and sectors_per_cluster <= 128 and reserved_sectors > 0
-            and 1 <= fat_count <= 4 and fat_size > 0 and root_cluster >= 2
+            and 1 <= fat_count <= 4 and active_fat_index < fat_count
+            and fat_size > 0 and root_cluster >= 2
             and 0 < cluster_size <= 2 * _MIB
         )
         first_data_sector = reserved_sectors + fat_count * fat_size
@@ -4344,8 +4379,10 @@ class GenericTriageEngine:
                 self._observation(artifact, f"{prefix}.available", False),
                 self._observation(artifact, f"{prefix}.cluster", root_cluster),
                 self._observation(artifact, f"{prefix}.offset", root_offset if valid_geometry else None),
+                self._observation(artifact, f"{prefix}.fat_mirroring_enabled", fat_mirroring_enabled),
+                self._observation(artifact, f"{prefix}.active_fat_index", active_fat_index),
             ]
-        fat_offset = reserved_sectors * bytes_per_sector
+        fat_offset = (reserved_sectors + active_fat_index * fat_size) * bytes_per_sector
         fat_end = fat_offset + fat_size * bytes_per_sector
         cluster_limit = max(1, min(64, (8 * _MIB) // cluster_size))
         cluster_segments: list[dict[str, int]] = []
@@ -4493,6 +4530,9 @@ class GenericTriageEngine:
             self._observation(artifact, f"{prefix}.available", True),
             self._observation(artifact, f"{prefix}.cluster", root_cluster),
             self._observation(artifact, f"{prefix}.offset", root_offset),
+            self._observation(artifact, f"{prefix}.fat_mirroring_enabled", fat_mirroring_enabled),
+            self._observation(artifact, f"{prefix}.active_fat_index", active_fat_index),
+            self._observation(artifact, f"{prefix}.active_fat_offset", fat_offset),
             self._observation(artifact, f"{prefix}.cluster_segments", cluster_segments),
             self._observation(artifact, f"{prefix}.chain_termination", chain_termination),
             self._observation(artifact, f"{prefix}.chain_errors", chain_errors),

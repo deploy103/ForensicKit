@@ -1606,6 +1606,100 @@ def test_fat12_and_fat16_duplicate_tables_preserve_match_divergence_and_truncati
     assert any(item.category == "fat16_fat_copy_anomaly" for item in truncated_profile.findings)
 
 
+def test_fat32_extflags_control_copy_consistency_and_active_chain_traversal(tmp_path: Path) -> None:
+    sector_size = 512
+    reserved = 1
+    fat_size = 600
+    fat_count = 2
+    first_data_sector = reserved + fat_count * fat_size
+    total_sectors = 70_000
+    image = bytearray((first_data_sector + 6) * sector_size)
+    image[11:13] = sector_size.to_bytes(2, "little")
+    image[13] = 1
+    image[14:16] = reserved.to_bytes(2, "little")
+    image[16] = fat_count
+    image[32:36] = total_sectors.to_bytes(4, "little")
+    image[36:40] = fat_size.to_bytes(4, "little")
+    image[40:42] = (0x0081).to_bytes(2, "little")  # mirroring disabled, FAT 1 active
+    image[44:48] = (2).to_bytes(4, "little")
+    image[82:90] = b"FAT32   "
+    image[510:512] = b"\x55\xaa"
+    fat0_offset = reserved * sector_size
+    fat1_offset = (reserved + fat_size) * sector_size
+    image[fat0_offset + 2 * 4:fat0_offset + 2 * 4 + 4] = (0x0FFFFFFF).to_bytes(4, "little")
+    image[fat1_offset + 2 * 4:fat1_offset + 2 * 4 + 4] = (5).to_bytes(4, "little")
+    image[fat1_offset + 5 * 4:fat1_offset + 5 * 4 + 4] = (0x0FFFFFFF).to_bytes(4, "little")
+    root = first_data_sector * sector_size
+    for index in range(sector_size // 32):
+        offset = root + index * 32
+        image[offset:offset + 11] = b"ACTIVE  TXT"
+        image[offset + 11] = 0x20
+    second_root_cluster = (first_data_sector + 3) * sector_size
+    image[second_root_cluster:second_root_cluster + 11] = b"\xe5LAG    TXT"
+    image[second_root_cluster + 11] = 0x20
+    image[second_root_cluster + 26:second_root_cluster + 28] = (7).to_bytes(2, "little")
+    image[second_root_cluster + 28:second_root_cluster + 32] = (12).to_bytes(4, "little")
+    evidence = tmp_path / "fat32-active-copy-one.raw"
+    evidence.write_bytes(image)
+    artifact = _artifact(evidence)
+
+    observations = GenericTriageEngine().analyze(artifact, evidence)
+    values = _values(observations)
+    copies = values["filesystem.fat32.fat_copies"]
+    assert copies["available"] is True
+    assert copies["ext_flags"] == "0x0081"
+    assert copies["mirroring_enabled"] is False
+    assert copies["copies_expected_to_match"] is False
+    assert copies["active_copy_index"] == 1
+    assert copies["active_copy_index_valid"] is True
+    assert copies["active_copy_available"] is True
+    assert copies["selection_basis"] == "bpb_extflags_active_copy"
+    assert copies["all_copies_match"] is False
+    difference = copies["comparisons"][0]["first_difference"]
+    assert difference["relative_offset"] == 8
+    assert difference["reference_absolute_offset"] == fat0_offset + 8
+    assert difference["compared_absolute_offset"] == fat1_offset + 8
+    assert values["filesystem.fat.root.fat_mirroring_enabled"] is False
+    assert values["filesystem.fat.root.active_fat_index"] == 1
+    assert values["filesystem.fat.root.active_fat_offset"] == fat1_offset
+    assert values["filesystem.fat.root.cluster_segments"] == [
+        {"cluster": 2, "offset": root, "length": sector_size},
+        {"cluster": 5, "offset": second_root_cluster, "length": sector_size},
+    ]
+    assert values["filesystem.fat.deleted_short_entries"][0]["offset"] == second_root_cluster
+    profile = ProfileEngine().evaluate(artifact, observations)
+    categories = {item.category for item in profile.findings}
+    assert "fat32_fat_copy_inventory" in categories
+    assert "fat32_fat_copy_anomaly" not in categories
+
+    mirrored = bytearray(image)
+    mirrored[40:42] = (0).to_bytes(2, "little")
+    mirrored_path = tmp_path / "fat32-mirrored-divergence.raw"
+    mirrored_path.write_bytes(mirrored)
+    mirrored_observations = GenericTriageEngine().analyze(_artifact(mirrored_path), mirrored_path)
+    mirrored_values = _values(mirrored_observations)
+    assert mirrored_values["filesystem.fat32.fat_copies"]["mirroring_enabled"] is True
+    assert mirrored_values["filesystem.fat32.fat_copies"]["all_copies_match"] is False
+    assert mirrored_values["filesystem.fat.root.active_fat_index"] == 0
+    assert mirrored_values["filesystem.fat.root.cluster_segments"] == [
+        {"cluster": 2, "offset": root, "length": sector_size},
+    ]
+    mirrored_profile = ProfileEngine().evaluate(_artifact(mirrored_path), mirrored_observations)
+    assert any(item.category == "fat32_fat_copy_anomaly" for item in mirrored_profile.findings)
+
+    invalid_active = bytearray(image)
+    invalid_active[40:42] = (0x0083).to_bytes(2, "little")
+    invalid_active_path = tmp_path / "fat32-invalid-active-copy.raw"
+    invalid_active_path.write_bytes(invalid_active)
+    invalid_observations = GenericTriageEngine().analyze(_artifact(invalid_active_path), invalid_active_path)
+    invalid_values = _values(invalid_observations)
+    assert invalid_values["filesystem.fat32.fat_copies"]["active_copy_index_valid"] is False
+    assert invalid_values["filesystem.fat32.fat_copies"]["active_copy_available"] is False
+    assert invalid_values["filesystem.fat.root.available"] is False
+    invalid_profile = ProfileEngine().evaluate(_artifact(invalid_active_path), invalid_observations)
+    assert any(item.category == "fat32_fat_copy_anomaly" for item in invalid_profile.findings)
+
+
 def test_fat32_deleted_lfn_chain_requires_checksum_and_terminal_validation(tmp_path: Path) -> None:
     image = bytearray(4096)
     image[11:13] = (512).to_bytes(2, "little")
