@@ -1,5 +1,18 @@
 # ForensicKit Work Log
 
+## 2026-09-07 14:19 KST
+
+### Bounded zisofs block decompression
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/extraction.py`, `src/forensickit/profiles/archive.py`, `tests/test_triage.py`, and `tests/test_engine_pipeline.py`.
+- A valid single-extent zisofs stream now has a distinct decompression-eligibility verdict, separate from raw ISO extent extraction. Eligibility excludes unsafe names, SUSP/continuation/type/relocation/layout anomalies, configured uncompressed-size violations, and malformed headers/tables. PX hard-link reconciliation now includes the exact ZF semantic identity, selects one eligible canonical representation, and never equates compressed and uncompressed aliases solely because their stored extent matches.
+- Before writing output, the extractor rereads and matches the directory record and any CE areas, locates the unique raw 16-byte ZF entry inside that proven source, rechecks the stored/declared-volume range, claim/header/table fields, full metadata and pointer hashes, every pointer and deflate-bound range, and the triage-derived block inventory. Each nonempty block is independently zlib-decoded with a one-byte overrun sentinel and must consume exactly one stream with no trailing/unconsumed data and produce its exact declared block length; equal pointers produce an exact bounded zero-fill block. The declared output is preflighted against recursion/count/single/cumulative limits, partial files are deleted on any failure, and success evidence retains raw/compressed/uncompressed hashes plus a bounded per-block preview and complete verification-chain digest.
+- Synthetic coverage proves a two-block stream decompresses to one 600-byte child and recursively exposes its flag, while retaining a zero-fill tail and exact source/hash provenance. Separate AUTO cases reject a corrupt zlib stream and a valid stream expanding one byte beyond its block declaration without registering a partial child. A direct extractor regression mutates the stored triage metadata hash and proves immutable-byte revalidation stops it. Focused triage/Engine regressions passed: 182 passed, 0 failed. The full direct synthetic suite passed: 343 passed, 0 failed. `python -m compileall -q src tests scripts` and `git diff --check` passed.
+
+### Next
+
+- Parse nonzero ISO 9660 extended-attribute-record areas under explicit byte bounds and retain exact provenance before deciding whether those extents remain eligible for native copying.
+
 ## 2026-09-07 13:38 KST
 
 ### Rock Ridge ZF / zisofs metadata validation

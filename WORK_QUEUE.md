@@ -1,10 +1,10 @@
 # ForensicKit Work Queue
 
-Last reviewed: 2026-09-07 13:38 KST
+Last reviewed: 2026-09-07 14:19 KST
 
 ## Post-v1.1 backlog
 
-- [ ] Decompress fully validated zisofs block streams under exact per-block/total output bounds and immutable-metadata revalidation.
+- [ ] Parse and validate ISO 9660 extended-attribute-record areas for extents with nonzero extended-attribute block counts.
 
 ## v1.1.0 release gate
 
@@ -17,6 +17,7 @@ Last reviewed: 2026-09-07 13:38 KST
 
 ## Completed this session
 
+- [x] Exact bounded zisofs block decompression with immutable ZF/header/table revalidation, zero-fill handling, output limits, and recursive child provenance.
 - [x] Bounded RRIP `ZF` and zisofs header/block-pointer metadata validation without decompression or child materialization.
 - [x] Metadata-only El Torito hard-disk-emulation MBR and partition-range validation.
 - [x] Evidence-only Rock Ridge `PX` hard-link identity grouping with exact-extent alias deduplication.

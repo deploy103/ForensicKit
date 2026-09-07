@@ -15,6 +15,7 @@ from email import policy
 from email.parser import BytesParser
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
+from typing import BinaryIO
 
 from .config import AnalysisLimits
 from .models import Artifact, Finding, ToolRun, new_id
@@ -489,6 +490,324 @@ class ExtractionManager:
             ))
         return result
 
+    def _copy_iso9660_zisofs(
+        self,
+        source_stream: BinaryIO,
+        writer: BinaryIO,
+        record: dict[str, object],
+        *,
+        artifact_size: int,
+        declared_volume_bytes: int,
+    ) -> tuple[int, dict[str, object]]:
+        """Revalidate and decompress one bounded single-extent zisofs stream."""
+        validation = record.get("rock_ridge_zisofs_validation")
+        claim = record.get("rock_ridge_zisofs_claim")
+        zf_entries = record.get("rock_ridge_zisofs_entries")
+        if (
+            not isinstance(validation, dict)
+            or validation.get("valid") is not True
+            or validation.get("decompression_eligible") is not True
+            or validation.get("decompression_performed") is not False
+            or validation.get("extraction_eligible") is not False
+            or validation.get("failed_checks") != []
+            or record.get("rock_ridge_zisofs_decompression_eligible") is not True
+            or not isinstance(claim, dict)
+            or not isinstance(zf_entries, list)
+            or len(zf_entries) != 1
+            or not isinstance(zf_entries[0], dict)
+            or zf_entries[0].get("valid") is not True
+        ):
+            raise RuntimeError("zisofs triage eligibility no longer validates")
+
+        data_offset = record.get("data_offset")
+        stored_length = record.get("data_length")
+        uncompressed_size = claim.get("uncompressed_size")
+        header_size_words = claim.get("header_size_words")
+        block_shift = claim.get("block_shift")
+        if (
+            not isinstance(data_offset, int) or isinstance(data_offset, bool)
+            or not isinstance(stored_length, int) or isinstance(stored_length, bool)
+            or not isinstance(uncompressed_size, int)
+            or isinstance(uncompressed_size, bool)
+            or not isinstance(header_size_words, int)
+            or isinstance(header_size_words, bool)
+            or not isinstance(block_shift, int) or isinstance(block_shift, bool)
+            or data_offset < 0
+            or stored_length < 20
+            or data_offset + stored_length > artifact_size
+            or data_offset + stored_length > declared_volume_bytes
+            or uncompressed_size < 0
+            or uncompressed_size > self.limits.max_single_artifact_size
+            or not 4 <= header_size_words <= 255
+            or not 9 <= block_shift <= 17
+            or claim.get("algorithm") != "pz"
+            or claim.get("algorithm_raw_hex") != "707a"
+            or claim.get("header_size_bytes") != header_size_words * 4
+            or claim.get("block_size") != 1 << block_shift
+        ):
+            raise RuntimeError("zisofs claim or stored range no longer validates")
+
+        zf_entry = zf_entries[0]
+        zf_offset = zf_entry.get("absolute_offset")
+        zf_raw_hex = zf_entry.get("raw_hex")
+        if (
+            not isinstance(zf_offset, int) or isinstance(zf_offset, bool)
+            or zf_offset < 0 or zf_offset + 16 > artifact_size
+            or not isinstance(zf_raw_hex, str)
+            or claim.get("source_absolute_offset") != zf_offset
+        ):
+            raise RuntimeError("zisofs ZF provenance no longer validates")
+        try:
+            expected_zf_raw = bytes.fromhex(zf_raw_hex)
+        except ValueError as exc:
+            raise RuntimeError("zisofs ZF raw provenance is invalid") from exc
+        continuation_area_offset = zf_entry.get("continuation_area_offset")
+        if isinstance(continuation_area_offset, int):
+            continuation_areas = record.get("susp_continuation_areas")
+            matching_areas = [
+                area for area in continuation_areas
+                if isinstance(area, dict)
+                and area.get("absolute_offset") == continuation_area_offset
+                and isinstance(area.get("length"), int)
+                and continuation_area_offset <= zf_offset
+                and zf_offset + 16 <= continuation_area_offset + int(area["length"])
+                and area.get("source_ce_absolute_offset")
+                == zf_entry.get("source_ce_absolute_offset")
+            ] if isinstance(continuation_areas, list) else []
+            if len(matching_areas) != 1:
+                raise RuntimeError(
+                    "zisofs continued ZF source area no longer validates"
+                )
+        else:
+            record_offset = record.get("record_offset")
+            zf_record_relative_offset = zf_entry.get("record_relative_offset")
+            if (
+                not isinstance(record_offset, int)
+                or isinstance(record_offset, bool)
+                or not isinstance(zf_record_relative_offset, int)
+                or isinstance(zf_record_relative_offset, bool)
+                or record_offset + zf_record_relative_offset != zf_offset
+            ):
+                raise RuntimeError("zisofs inline ZF source no longer validates")
+        source_stream.seek(zf_offset)
+        zf_raw = source_stream.read(16)
+        if (
+            len(zf_raw) != 16
+            or zf_raw != expected_zf_raw
+            or zf_raw[:4] != b"ZF\x10\x01"
+            or zf_raw[4:6] != b"pz"
+            or zf_raw[6] != header_size_words
+            or zf_raw[7] != block_shift
+            or int.from_bytes(zf_raw[8:12], "little") != uncompressed_size
+            or int.from_bytes(zf_raw[12:16], "big") != uncompressed_size
+        ):
+            raise RuntimeError("zisofs ZF bytes no longer match triage provenance")
+
+        source_stream.seek(data_offset)
+        header = source_stream.read(16)
+        if len(header) != 16:
+            raise RuntimeError("zisofs header read ended early")
+        block_size = 1 << block_shift
+        if (
+            header[:8] != bytes.fromhex("37e45396c9dbd607")
+            or int.from_bytes(header[8:12], "little") != uncompressed_size
+            or header[12] != header_size_words
+            or header[13] != block_shift
+            or header[14:16] != b"\x00\x00"
+        ):
+            raise RuntimeError("zisofs header no longer matches the validated ZF claim")
+
+        block_count = (uncompressed_size + block_size - 1) // block_size
+        pointer_count = block_count + 1
+        header_size_bytes = header_size_words * 4
+        pointer_table_length = pointer_count * 4
+        metadata_length = header_size_bytes + pointer_table_length
+        metadata_limit = min(self.limits.signature_scan_bytes, 1024 * 1024)
+        if (
+            pointer_count > 65_536
+            or metadata_length > metadata_limit
+            or metadata_length > stored_length
+        ):
+            raise RuntimeError("zisofs pointer table exceeds extraction bounds")
+        source_stream.seek(data_offset)
+        metadata = source_stream.read(metadata_length)
+        if len(metadata) != metadata_length or metadata[:16] != header:
+            raise RuntimeError("zisofs metadata read ended early")
+        header_extension = metadata[16:header_size_bytes]
+        pointer_raw = metadata[header_size_bytes:]
+        pointers = [
+            int.from_bytes(pointer_raw[offset:offset + 4], "little")
+            for offset in range(0, len(pointer_raw), 4)
+        ]
+        if (
+            len(pointers) != pointer_count
+            or pointers[0] < metadata_length
+            or any(left > right for left, right in zip(pointers, pointers[1:]))
+            or any(pointer > stored_length for pointer in pointers)
+            or pointers[-1] != stored_length
+        ):
+            raise RuntimeError("zisofs pointer table no longer validates")
+
+        compressed_blocks: list[dict[str, object]] = []
+        for block_index, (start, end) in enumerate(zip(pointers, pointers[1:])):
+            expected_length = min(
+                block_size,
+                max(0, uncompressed_size - block_index * block_size),
+            )
+            compressed_length = end - start
+            compressed_bound = (
+                expected_length
+                + (expected_length >> 12)
+                + (expected_length >> 14)
+                + (expected_length >> 25)
+                + 13
+            )
+            if compressed_length < 0 or compressed_length > compressed_bound:
+                raise RuntimeError(
+                    f"zisofs block {block_index} compressed length is invalid"
+                )
+            compressed_blocks.append({
+                "index": block_index,
+                "pointer_entry_offset": data_offset + header_size_bytes + block_index * 4,
+                "start_relative_offset": start,
+                "end_relative_offset": end,
+                "data_offset": data_offset + start,
+                "data_end_offset": data_offset + end,
+                "compressed_length": compressed_length,
+                "expected_uncompressed_length": expected_length,
+                "zero_fill": start == end,
+                "compressed_length_within_bound": True,
+            })
+
+        expected_validation = {
+            "record_offset": record.get("record_offset"),
+            "archive_path": record.get("archive_path"),
+            "data_offset": data_offset,
+            "stored_length": stored_length,
+            "stored_end_offset": data_offset + stored_length,
+            "claim": claim,
+            "pointer_limit": 65_536,
+            "metadata_byte_limit": metadata_limit,
+            "header_offset": data_offset,
+            "header_length": 16,
+            "header_end_offset": data_offset + 16,
+            "header_raw_hex": header.hex(),
+            "magic_raw_hex": header[:8].hex(),
+            "magic_valid": True,
+            "uncompressed_size": uncompressed_size,
+            "header_size_words": header_size_words,
+            "header_size_bytes": header_size_bytes,
+            "block_shift": block_shift,
+            "block_size": block_size,
+            "reserved_raw_hex": header[14:16].hex(),
+            "block_count": block_count,
+            "pointer_count": pointer_count,
+            "pointer_table_offset": data_offset + header_size_bytes,
+            "pointer_table_length": pointer_table_length,
+            "pointer_table_end_offset": data_offset + metadata_length,
+            "pointer_table_end_relative": metadata_length,
+            "metadata_offset": data_offset,
+            "metadata_length": metadata_length,
+            "metadata_end_offset": data_offset + metadata_length,
+            "header_extension_raw_hex": header_extension.hex(),
+            "metadata_raw_sha256": hashlib.sha256(metadata).hexdigest(),
+            "pointer_table_preview_hex": pointer_raw[:256].hex(),
+            "pointer_table_raw_sha256": hashlib.sha256(pointer_raw).hexdigest(),
+            "pointers": pointers,
+            "compressed_blocks": compressed_blocks,
+        }
+        for key, expected_value in expected_validation.items():
+            if validation.get(key) != expected_value:
+                raise RuntimeError(
+                    f"zisofs {key} no longer matches triage provenance"
+                )
+
+        written = 0
+        output_digest = hashlib.sha256()
+        block_verification_digest = hashlib.sha256()
+        block_evidence_preview: list[dict[str, object]] = []
+        last_block_evidence: dict[str, object] | None = None
+        for block in compressed_blocks:
+            block_index = int(block["index"])
+            compressed_length = int(block["compressed_length"])
+            expected_length = int(block["expected_uncompressed_length"])
+            if compressed_length == 0:
+                compressed = b""
+                decoded = b"\x00" * expected_length
+            else:
+                source_stream.seek(int(block["data_offset"]))
+                compressed = source_stream.read(compressed_length)
+                if len(compressed) != compressed_length:
+                    raise RuntimeError(
+                        f"zisofs block {block_index} compressed read ended early"
+                    )
+                try:
+                    decoder = zlib.decompressobj()
+                    decoded = decoder.decompress(compressed, expected_length + 1)
+                    if len(decoded) > expected_length or decoder.unconsumed_tail:
+                        raise RuntimeError(
+                            f"zisofs block {block_index} exceeds its output bound"
+                        )
+                    decoded += decoder.flush()
+                except zlib.error as exc:
+                    raise RuntimeError(
+                        f"zisofs block {block_index} deflate stream is invalid: {exc}"
+                    ) from exc
+                if (
+                    not decoder.eof
+                    or decoder.unused_data
+                    or decoder.unconsumed_tail
+                    or len(decoded) != expected_length
+                ):
+                    raise RuntimeError(
+                        f"zisofs block {block_index} did not produce its exact output"
+                    )
+            writer.write(decoded)
+            written += len(decoded)
+            if written > uncompressed_size:
+                raise RuntimeError("zisofs output exceeds its declared size")
+            output_digest.update(decoded)
+            compressed_sha256 = hashlib.sha256(compressed).hexdigest()
+            uncompressed_sha256 = hashlib.sha256(decoded).hexdigest()
+            block_record = {
+                "index": block_index,
+                "compressed_offset": block["data_offset"],
+                "compressed_length": compressed_length,
+                "compressed_sha256": compressed_sha256,
+                "uncompressed_length": len(decoded),
+                "uncompressed_sha256": uncompressed_sha256,
+                "zero_fill": compressed_length == 0,
+            }
+            block_verification_digest.update(block_index.to_bytes(8, "little"))
+            block_verification_digest.update(
+                int(block["data_offset"]).to_bytes(8, "little")
+            )
+            block_verification_digest.update(compressed_length.to_bytes(8, "little"))
+            block_verification_digest.update(bytes.fromhex(compressed_sha256))
+            block_verification_digest.update(len(decoded).to_bytes(8, "little"))
+            block_verification_digest.update(bytes.fromhex(uncompressed_sha256))
+            if len(block_evidence_preview) < 64:
+                block_evidence_preview.append(block_record)
+            last_block_evidence = block_record
+        if written != uncompressed_size:
+            raise RuntimeError("zisofs output length does not match its declaration")
+        return written, {
+            "zf_offset": zf_offset,
+            "zf_raw_sha256": hashlib.sha256(zf_raw).hexdigest(),
+            "metadata_offset": data_offset,
+            "metadata_length": metadata_length,
+            "metadata_raw_sha256": hashlib.sha256(metadata).hexdigest(),
+            "stored_length": stored_length,
+            "uncompressed_length": written,
+            "uncompressed_sha256": output_digest.hexdigest(),
+            "block_count": block_count,
+            "blocks_verified": block_count,
+            "block_verification_sha256": block_verification_digest.hexdigest(),
+            "block_evidence_preview": block_evidence_preview,
+            "block_evidence_preview_truncated": block_count > 64,
+            "last_block_evidence": last_block_evidence,
+        }
+
     def extract_iso9660(self, artifact: Artifact) -> ExtractionResult:
         """Copy validated regular files from bounded active ISO directory traversal."""
         result = ExtractionResult()
@@ -517,6 +836,19 @@ class ExtractionManager:
             result.errors.append("skipped ISO extraction: primary volume descriptor did not validate")
             return result
         pvd_block_size = pvd_observation.value.get("logical_block_size")
+        pvd_declared_volume_bytes = pvd_observation.value.get(
+            "declared_volume_bytes"
+        )
+        if (
+            not isinstance(pvd_declared_volume_bytes, int)
+            or isinstance(pvd_declared_volume_bytes, bool)
+            or pvd_declared_volume_bytes <= 0
+            or pvd_declared_volume_bytes > artifact.size
+        ):
+            result.errors.append(
+                "skipped ISO extraction: declared volume range did not validate"
+            )
+            return result
         source = self.workspace.resolve_stored_path(artifact.path)
         target_root = self.workspace.path("extracted", artifact.id, "builtin_iso9660")
         evidence: list[str] = []
@@ -533,7 +865,28 @@ class ExtractionManager:
                 if not isinstance(name, str) or not name or self._unsafe_name(name):
                     result.errors.append(f"skipped ISO member {name!r}: unsafe path")
                     continue
-                if record.get("extraction_eligible") is not True:
+                zisofs = record.get("rock_ridge_zisofs") is True
+                zisofs_validation = record.get("rock_ridge_zisofs_validation")
+                zisofs_eligible = bool(
+                    zisofs
+                    and isinstance(zisofs_validation, dict)
+                    and zisofs_validation.get("valid") is True
+                    and zisofs_validation.get("decompression_eligible") is True
+                    and record.get(
+                        "rock_ridge_zisofs_decompression_eligible"
+                    ) is True
+                )
+                if zisofs and not zisofs_eligible:
+                    if record.get(
+                        "extraction_reconciled_to_rock_ridge_hard_link"
+                    ) is True:
+                        continue
+                    result.errors.append(
+                        f"skipped ISO member {name!r}: zisofs metadata did not "
+                        "validate for decompression"
+                    )
+                    continue
+                if not zisofs and record.get("extraction_eligible") is not True:
                     if record.get(
                         "extraction_reconciled_to_rock_ridge_hard_link"
                     ) is True:
@@ -541,10 +894,6 @@ class ExtractionManager:
                     if record.get("rock_ridge_symlink") is True:
                         result.errors.append(
                             f"skipped ISO member {name!r}: Rock Ridge symbolic link is metadata-only"
-                        )
-                    elif record.get("rock_ridge_zisofs") is True:
-                        result.errors.append(
-                            f"skipped ISO member {name!r}: zisofs compressed stream is metadata-only"
                         )
                     elif record.get("rock_ridge_non_regular") is True:
                         result.errors.append(
@@ -596,7 +945,21 @@ class ExtractionManager:
                 if not isinstance(data_length, int) or isinstance(data_length, bool):
                     result.errors.append(f"skipped ISO member {name!r}: invalid observed byte range")
                     continue
-                reason = self.can_register(artifact, data_length)
+                output_data_length = (
+                    zisofs_validation.get("uncompressed_size")
+                    if zisofs and isinstance(zisofs_validation, dict)
+                    else data_length
+                )
+                if (
+                    not isinstance(output_data_length, int)
+                    or isinstance(output_data_length, bool)
+                    or output_data_length < 0
+                ):
+                    result.errors.append(
+                        f"skipped ISO member {name!r}: invalid output byte length"
+                    )
+                    continue
+                reason = self.can_register(artifact, output_data_length)
                 if reason:
                     result.errors.append(f"skipped ISO member {name!r}: {reason}")
                     continue
@@ -727,25 +1090,59 @@ class ExtractionManager:
                 target_root.mkdir(parents=True, exist_ok=True)
                 output = target_root / f"{record_index:05d}_{safe_name(name)}"
                 written = 0
+                zisofs_revalidation: dict[str, object] | None = None
                 try:
                     with output.open("xb") as writer:
-                        for segment in validated_segments:
-                            source_stream.seek(segment["data_offset"])
-                            remaining = segment["data_length"]
-                            while remaining:
-                                chunk = source_stream.read(min(1024 * 1024, remaining))
-                                if not chunk:
-                                    raise RuntimeError(
-                                        "file extent read ended before declared length"
+                        if zisofs:
+                            written, zisofs_revalidation = (
+                                self._copy_iso9660_zisofs(
+                                    source_stream,
+                                    writer,
+                                    record,
+                                    artifact_size=artifact.size,
+                                    declared_volume_bytes=pvd_declared_volume_bytes,
+                                )
+                            )
+                        else:
+                            for segment in validated_segments:
+                                source_stream.seek(segment["data_offset"])
+                                remaining = segment["data_length"]
+                                while remaining:
+                                    chunk = source_stream.read(
+                                        min(1024 * 1024, remaining)
                                     )
-                                writer.write(chunk)
-                                written += len(chunk)
-                                remaining -= len(chunk)
-                    if written != data_length:
-                        raise RuntimeError("file extent length mismatch")
+                                    if not chunk:
+                                        raise RuntimeError(
+                                            "file extent read ended before declared length"
+                                        )
+                                    writer.write(chunk)
+                                    written += len(chunk)
+                                    remaining -= len(chunk)
+                    if written != output_data_length:
+                        raise RuntimeError("file output length mismatch")
                 except (OSError, RuntimeError) as exc:
                     output.unlink(missing_ok=True)
                     result.errors.append(f"failed ISO member {name!r}: {exc}")
+                    if zisofs:
+                        result.findings.append(Finding(
+                            artifact_id=artifact.id,
+                            title="Rock Ridge zisofs decompression failed validation",
+                            category="iso9660_zisofs_decompression_anomaly",
+                            severity="medium",
+                            confidence=0.99,
+                            explanation=(
+                                "The stored zisofs stream passed bounded metadata triage but "
+                                "failed immutable-metadata revalidation or exact per-block "
+                                "deflate output checks during extraction. No partial child was "
+                                "registered."
+                            ),
+                            source="builtin_iso9660_extractor",
+                            supporting_evidence=[
+                                f"archive_path:{name};error:{exc};"
+                                f"record_offset:{record.get('record_offset')};"
+                                f"zisofs_validation:{zisofs_validation}"
+                            ],
+                        ))
                     continue
                 child = self.register_file(output, artifact, name)
                 if child is None:
@@ -766,7 +1163,11 @@ class ExtractionManager:
                     f"logical_block_size:{record.get('logical_block_size')};"
                     f"extent_block:{record.get('extent_block')};"
                     f"extended_attribute_blocks:{record.get('extended_attribute_blocks')};"
-                    f"data_offset:{record.get('data_offset')};data_length:{data_length};"
+                    f"data_offset:{record.get('data_offset')};"
+                    f"data_length:{data_length};"
+                    f"stored_data_length:{data_length};"
+                    f"output_data_length:{output_data_length};zisofs:{zisofs};"
+                    f"zisofs_revalidation:{zisofs_revalidation};"
                     f"multi_extent:{multi_extent};segments:{validated_segments};"
                     f"archive_path:{name};"
                     f"containing_directory_identity:{record.get('containing_directory_identity')};"
@@ -792,7 +1193,9 @@ class ExtractionManager:
                     "Only regular files reached through bounded primary-volume directory traversal, "
                     "with matching both-endian extent/length fields, safe paths, and complete "
                     "image-bounded ranges were copied. Valid adjacent multi-extent chains are "
-                    "assembled in record order; interleaved or incomplete layouts remain metadata-only."
+                    "assembled in record order. Valid single-extent zisofs streams are independently "
+                    "revalidated and decompressed one exact bounded block at a time; interleaved, "
+                    "incomplete, or inconsistent layouts remain metadata-only."
                 ),
                 source="builtin_iso9660_extractor",
                 supporting_evidence=evidence[:128],

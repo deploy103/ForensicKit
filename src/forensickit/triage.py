@@ -2453,10 +2453,22 @@ class GenericTriageEngine:
             })
             member_details: list[dict[str, object]] = []
             identities: list[tuple[tuple[int, int], ...] | None] = []
+            zisofs_identities: list[tuple[object, ...] | None] = []
             for record in records:
                 identity = self._iso9660_logical_extent_identity(record)
                 identities.append(identity)
                 posix = record.get("rock_ridge_posix", {})
+                zisofs_claim = record.get("rock_ridge_zisofs_claim")
+                zisofs_identity = (
+                    (
+                        zisofs_claim.get("algorithm"),
+                        zisofs_claim.get("header_size_words"),
+                        zisofs_claim.get("block_shift"),
+                        zisofs_claim.get("uncompressed_size"),
+                    )
+                    if isinstance(zisofs_claim, dict) else None
+                )
+                zisofs_identities.append(zisofs_identity)
                 member_details.append({
                     "record_offset": record.get("record_offset"),
                     "file_identifier": record.get("file_identifier"),
@@ -2476,8 +2488,12 @@ class GenericTriageEngine:
                         ]
                         if identity is not None else None
                     ),
+                    "zisofs_claim": zisofs_claim,
                     "extraction_eligible_before_reconciliation": record.get(
                         "extraction_eligible"
+                    ),
+                    "zisofs_decompression_eligible_before_reconciliation": (
+                        record.get("rock_ridge_zisofs_decompression_eligible")
                     ),
                 })
 
@@ -2499,6 +2515,8 @@ class GenericTriageEngine:
             })
             if len(records) > 1 and not same_extent:
                 failed_checks.append("logical_extent_mismatch")
+            if len(set(zisofs_identities)) > 1:
+                failed_checks.append("zisofs_semantics_mismatch")
 
             failed_checks = list(dict.fromkeys(failed_checks))
             verified = len(records) >= 2 and same_extent and not failed_checks
@@ -2509,7 +2527,12 @@ class GenericTriageEngine:
             )
             eligible_records = [
                 record for record in records
-                if record.get("extraction_eligible") is True
+                if (
+                    record.get("extraction_eligible") is True
+                    or record.get(
+                        "rock_ridge_zisofs_decompression_eligible"
+                    ) is True
+                )
             ]
             canonical = eligible_records[0] if verified and eligible_records else None
             group: dict[str, object] = {
@@ -2568,6 +2591,19 @@ class GenericTriageEngine:
                             "extraction_reconciled_to_rock_ridge_hard_link"
                         ] = True
                         suppressed += 1
+                    elif record.get(
+                        "rock_ridge_zisofs_decompression_eligible"
+                    ) is True:
+                        record[
+                            "rock_ridge_zisofs_decompression_eligible"
+                        ] = False
+                        validation = record.get("rock_ridge_zisofs_validation")
+                        if isinstance(validation, dict):
+                            validation["decompression_eligible"] = False
+                        record[
+                            "extraction_reconciled_to_rock_ridge_hard_link"
+                        ] = True
+                        suppressed += 1
             if canonical is not None:
                 group["duplicate_extraction_suppressed_count"] = suppressed
                 canonical["rock_ridge_hard_link_group"] = group
@@ -2611,12 +2647,14 @@ class GenericTriageEngine:
                 "pointer_limit": pointer_limit,
                 "metadata_byte_limit": metadata_byte_limit,
                 "decompression_performed": False,
+                "decompression_eligible": False,
                 "extraction_eligible": False,
                 "failed_checks": failed_checks,
                 "valid": False,
             }
             records.append(record)
             file_record["rock_ridge_zisofs_validation"] = record
+            file_record["rock_ridge_zisofs_decompression_eligible"] = False
             if not isinstance(claim, dict):
                 failed_checks.append("unique_valid_zf_claim")
             if file_record.get("multi_extent") is True:
@@ -2819,12 +2857,33 @@ class GenericTriageEngine:
                         "compressed_length_within_bound": length_valid,
                     })
             failed_checks = list(dict.fromkeys(failed_checks))
+            decompression_eligible = bool(
+                not failed_checks
+                and file_record.get("valid") is True
+                and file_record.get("path_safe") is True
+                and file_record.get("rock_ridge_name_usable") is not False
+                and file_record.get("rock_ridge_symlink") is not True
+                and file_record.get("rock_ridge_non_regular") is not True
+                and file_record.get("rock_ridge_type_mismatch") is not True
+                and not file_record.get("susp_error")
+                and file_record.get("susp_continuation_unparsed") is not True
+                and file_record.get(
+                    "rock_ridge_relocation_traversal_suppressed"
+                ) is not True
+                and file_record.get("multi_extent") is not True
+                and file_record.get("file_unit_size") in {0, None}
+                and file_record.get("interleave_gap_size") in {0, None}
+            )
             record.update({
                 "compressed_blocks": compressed_blocks,
                 "failed_checks": failed_checks,
+                "decompression_eligible": decompression_eligible,
                 "valid": not failed_checks,
             })
             file_record["rock_ridge_zisofs_validation"] = record
+            file_record[
+                "rock_ridge_zisofs_decompression_eligible"
+            ] = decompression_eligible
             if failed_checks:
                 errors.append({
                     "reason": "invalid_zisofs_metadata",

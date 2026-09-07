@@ -15,6 +15,7 @@ from zipfile import ZipFile
 from forensickit.engine import AnalysisEngine
 from forensickit.config import ForensicKitConfig
 from forensickit.evidence import EvidenceManager
+from forensickit.extraction import ExtractionManager
 from forensickit.models import AnalysisMode, AnalysisResult, Artifact, Observation
 from forensickit.tools import ToolDefinition, ToolRegistry
 from forensickit.triage import GenericTriageEngine
@@ -150,7 +151,10 @@ def _rrip_zf(uncompressed_size: int) -> bytes:
     return _susp_entry(b"ZF", data)
 
 
-def _zisofs_stream(payload: bytes) -> bytes:
+def _zisofs_stream(
+    payload: bytes, *, corrupt_compressed: bool = False,
+    oversized_first_block: bool = False,
+) -> bytes:
     block_shift = 9
     blocks = [
         payload[offset:offset + (1 << block_shift)]
@@ -159,10 +163,15 @@ def _zisofs_stream(payload: bytes) -> bytes:
     pointer_table_end = 16 + 4 * (len(blocks) + 1)
     pointers = [pointer_table_end]
     compressed_blocks: list[bytes] = []
-    for block in blocks:
+    for block_index, block in enumerate(blocks):
         if any(block):
-            compressor = zlib.compressobj(level=9, wbits=-15)
-            compressed = compressor.compress(block) + compressor.flush()
+            compressed = zlib.compress(
+                block + (b"X" if oversized_first_block and block_index == 0 else b""),
+                level=9,
+            )
+            if corrupt_compressed:
+                compressed = b"\x00" + compressed[1:]
+                corrupt_compressed = False
         else:
             compressed = b""
         compressed_blocks.append(compressed)
@@ -257,6 +266,8 @@ def _iso9660_with_nested_file(
     path_tables: bool = False, rock_ridge_continuation: bool = False,
     rock_ridge_relocation: bool = False, hard_links: bool = False,
     hard_link_extent_mismatch: bool = False, zisofs: bool = False,
+    corrupt_zisofs_data: bool = False,
+    oversized_zisofs_block: bool = False,
 ) -> bytes:
     block_size = 2_048
     image = bytearray(25 * block_size)
@@ -345,7 +356,14 @@ def _iso9660_with_nested_file(
     root = root_self + parent + directory
     image[20 * block_size:20 * block_size + len(root)] = root
     if rock_ridge:
-        stored_payload = _zisofs_stream(payload) if zisofs else payload
+        stored_payload = (
+            _zisofs_stream(
+                payload,
+                corrupt_compressed=corrupt_zisofs_data,
+                oversized_first_block=oversized_zisofs_block,
+            )
+            if zisofs else payload
+        )
         continuation_area = (
             _susp_entry(b"NM", b"\x00Evidence.txt") + _susp_entry(b"ST")
         )
@@ -1166,10 +1184,11 @@ def test_iso9660_rock_ridge_hard_link_alias_extracts_one_canonical_child(
     assert "archive_hard_link_metadata" in report
 
 
-def test_iso9660_zisofs_remains_metadata_only_in_auto_analysis(
+def test_iso9660_zisofs_decompresses_exact_blocks_in_auto_analysis(
     tmp_path: Path,
 ) -> None:
-    logical_payload = b"A" * 512 + b"\x00" * 88
+    flag = b"CTF{zisofs_bounded_decompression}"
+    logical_payload = flag.ljust(512, b"A") + b"\x00" * 88
     evidence = tmp_path / "zisofs.iso"
     evidence.write_bytes(_iso9660_with_nested_file(
         b"ZISOFS.BIN;1", logical_payload, rock_ridge=True, zisofs=True,
@@ -1180,9 +1199,20 @@ def test_iso9660_zisofs_remains_metadata_only_in_auto_analysis(
         execute=False,
     )
 
-    assert [item.logical_name for item in result.artifacts] == ["zisofs.iso"]
+    assert [item.logical_name for item in result.artifacts] == [
+        "zisofs.iso", "Evidence Directory/Flag Evidence.txt",
+    ]
+    child = result.artifacts[1]
+    assert child.parent_id == result.artifacts[0].id
+    assert child.size == len(logical_payload)
+    assert child.sha256 == hashlib.sha256(logical_payload).hexdigest()
     assert any(
-        "zisofs compressed stream is metadata-only" in error
+        candidate.value == "CTF{zisofs_bounded_decompression}"
+        and candidate.artifact_id == child.id
+        for candidate in result.flags
+    )
+    assert not any(
+        "failed ISO member 'Evidence Directory/Flag Evidence.txt'" in error
         for error in result.errors
     )
     records = next(
@@ -1193,6 +1223,7 @@ def test_iso9660_zisofs_remains_metadata_only_in_auto_analysis(
     assert len(records) == 1
     assert records[0]["valid"] is True
     assert records[0]["decompression_performed"] is False
+    assert records[0]["decompression_eligible"] is True
     assert records[0]["extraction_eligible"] is False
     assert records[0]["compressed_blocks"][1]["zero_fill"] is True
     assert any(
@@ -1200,10 +1231,17 @@ def test_iso9660_zisofs_remains_metadata_only_in_auto_analysis(
         and item.severity == "info"
         for item in result.findings
     )
-    assert not any(
-        item.source == "builtin_iso9660_extractor"
-        for item in result.findings
+    recovery = next(
+        item for item in result.findings
+        if item.source == "builtin_iso9660_extractor"
+        and item.category == "archive_extraction"
     )
+    evidence_line = recovery.supporting_evidence[0]
+    assert "zisofs:True" in evidence_line
+    assert "stored_data_length:" in evidence_line
+    assert "output_data_length:600" in evidence_line
+    assert "zisofs_revalidation:" in evidence_line
+    assert hashlib.sha256(logical_payload).hexdigest() in evidence_line
     report = next(
         (tmp_path / "zisofs-cases").glob("*/reports/report.json")
     ).read_text(encoding="utf-8")
@@ -1211,6 +1249,125 @@ def test_iso9660_zisofs_remains_metadata_only_in_auto_analysis(
     assert "rock_ridge_zisofs_validation" in report
     assert '"decompression_performed": false' in report
     assert "archive_compression_metadata" in report
+    assert "CTF{zisofs_bounded_decompression}" in report
+
+
+def test_iso9660_zisofs_corrupt_deflate_block_never_registers_partial_child(
+    tmp_path: Path,
+) -> None:
+    logical_payload = b"B" * 512 + b"\x00" * 88
+    evidence = tmp_path / "bad-zisofs-data.iso"
+    evidence.write_bytes(_iso9660_with_nested_file(
+        b"ZISOFS.BIN;1", logical_payload, rock_ridge=True, zisofs=True,
+        corrupt_zisofs_data=True,
+    ))
+
+    result = AnalysisEngine().analyze(
+        evidence, tmp_path / "bad-zisofs-cases", mode=AnalysisMode.AUTO,
+        execute=False,
+    )
+
+    assert [item.logical_name for item in result.artifacts] == [
+        "bad-zisofs-data.iso"
+    ]
+    assert any(
+        "zisofs block 0 deflate stream is invalid" in error
+        for error in result.errors
+    )
+    records = next(
+        item.value for item in result.observations
+        if item.key == "archive.iso9660.rock_ridge_zisofs"
+    )
+    assert records[0]["valid"] is True
+    assert records[0]["decompression_eligible"] is True
+    failure = next(
+        item for item in result.findings
+        if item.category == "iso9660_zisofs_decompression_anomaly"
+    )
+    assert failure.severity == "medium"
+    assert "No partial child was registered" in failure.explanation
+    assert not any(
+        item.category == "archive_extraction"
+        and item.source == "builtin_iso9660_extractor"
+        for item in result.findings
+    )
+    report = next(
+        (tmp_path / "bad-zisofs-cases").glob("*/reports/report.json")
+    ).read_text(encoding="utf-8")
+    assert "iso9660_zisofs_decompression_anomaly" in report
+    assert "deflate stream is invalid" in report
+
+
+def test_iso9660_zisofs_rejects_block_output_beyond_declared_size(
+    tmp_path: Path,
+) -> None:
+    logical_payload = b"C" * 512 + b"\x00" * 88
+    evidence = tmp_path / "oversized-zisofs-block.iso"
+    evidence.write_bytes(_iso9660_with_nested_file(
+        b"ZISOFS.BIN;1", logical_payload, rock_ridge=True, zisofs=True,
+        oversized_zisofs_block=True,
+    ))
+
+    result = AnalysisEngine().analyze(
+        evidence, tmp_path / "oversized-zisofs-cases", mode=AnalysisMode.AUTO,
+        execute=False,
+    )
+
+    assert [item.logical_name for item in result.artifacts] == [
+        "oversized-zisofs-block.iso"
+    ]
+    assert any(
+        "zisofs block 0 exceeds its output bound" in error
+        for error in result.errors
+    )
+    assert any(
+        item.category == "iso9660_zisofs_decompression_anomaly"
+        for item in result.findings
+    )
+
+
+def test_iso9660_zisofs_extractor_revalidates_triage_metadata_hash(
+    tmp_path: Path,
+) -> None:
+    logical_payload = b"D" * 512 + b"\x00" * 88
+    source = tmp_path / "zisofs-provenance.iso"
+    source.write_bytes(_iso9660_with_nested_file(
+        b"ZISOFS.BIN;1", logical_payload, rock_ridge=True, zisofs=True,
+    ))
+    config = ForensicKitConfig()
+    with CaseWorkspace.create(
+        tmp_path / "zisofs-provenance-cases", "zisofs-provenance", config,
+    ) as workspace:
+        root = EvidenceManager(workspace).ingest(source)
+        stored = workspace.resolve_stored_path(root.path)
+        observations = GenericTriageEngine(config.limits).analyze(root, stored)
+        files = next(
+            item.value for item in observations
+            if item.key == "archive.iso9660.regular_files"
+        )
+        zisofs_record = next(
+            item for item in files
+            if item.get("rock_ridge_zisofs") is True
+        )
+        zisofs_record["rock_ridge_zisofs_validation"][
+            "metadata_raw_sha256"
+        ] = "0" * 64
+        workspace.database.add_observations(observations)
+
+        result = ExtractionManager(
+            workspace, config.limits,
+        ).extract_iso9660(root)
+
+        assert result.artifacts == []
+        assert any(
+            "zisofs metadata_raw_sha256 no longer matches triage provenance"
+            in error
+            for error in result.errors
+        )
+        assert any(
+            item.category == "iso9660_zisofs_decompression_anomaly"
+            for item in result.findings
+        )
 
 
 def test_iso9660_joliet_extent_alias_recurses_once_with_ucs2_lineage(
