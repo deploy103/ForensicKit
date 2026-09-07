@@ -490,14 +490,14 @@ class ExtractionManager:
         return result
 
     def extract_iso9660(self, artifact: Artifact) -> ExtractionResult:
-        """Copy validated single-extent regular files from the ISO primary root."""
+        """Copy validated regular files from bounded active ISO directory traversal."""
         result = ExtractionResult()
         observations = self.workspace.database.observations(artifact.id)
         entry_observation = next(
             (
                 observation
                 for observation in observations
-                if observation.key == "archive.iso9660.root_directory_entries"
+                if observation.key == "archive.iso9660.regular_files"
                 and isinstance(observation.value, list)
             ),
             None,
@@ -529,9 +529,9 @@ class ExtractionManager:
             for record_index, record in enumerate(entry_observation.value):
                 if not isinstance(record, dict) or record.get("file_type") != "regular":
                     continue
-                name = record.get("logical_name")
+                name = record.get("archive_path")
                 if not isinstance(name, str) or not name or self._unsafe_name(name):
-                    result.errors.append(f"skipped ISO root member {name!r}: unsafe path")
+                    result.errors.append(f"skipped ISO member {name!r}: unsafe path")
                     continue
                 if record.get("extraction_eligible") is not True:
                     if (
@@ -540,11 +540,11 @@ class ExtractionManager:
                         or record.get("interleave_gap_size") not in {0, None}
                     ):
                         result.errors.append(
-                            f"skipped ISO root member {name!r}: unsupported multi-extent/interleaved layout"
+                            f"skipped ISO member {name!r}: unsupported multi-extent/interleaved layout"
                         )
                     else:
                         result.errors.append(
-                            f"skipped ISO root member {name!r}: directory record did not validate"
+                            f"skipped ISO member {name!r}: directory record did not validate"
                         )
                     continue
                 record_offset = record.get("record_offset")
@@ -571,11 +571,11 @@ class ExtractionManager:
                     or data_offset != (extent_block + extended_attribute_blocks) * block_size
                     or data_length < 0 or data_offset + data_length > artifact.size
                 ):
-                    result.errors.append(f"skipped ISO root member {name!r}: invalid observed byte range")
+                    result.errors.append(f"skipped ISO member {name!r}: invalid observed byte range")
                     continue
                 reason = self.can_register(artifact, data_length)
                 if reason:
-                    result.errors.append(f"skipped ISO root member {name!r}: {reason}")
+                    result.errors.append(f"skipped ISO member {name!r}: {reason}")
                     continue
                 try:
                     source_stream.seek(record_offset)
@@ -598,7 +598,7 @@ class ExtractionManager:
                     ):
                         raise RuntimeError("directory record no longer matches triage provenance")
                 except (OSError, RuntimeError) as exc:
-                    result.errors.append(f"skipped ISO root member {name!r}: {exc}")
+                    result.errors.append(f"skipped ISO member {name!r}: {exc}")
                     continue
                 target_root.mkdir(parents=True, exist_ok=True)
                 output = target_root / f"{record_index:05d}_{safe_name(name)}"
@@ -618,12 +618,12 @@ class ExtractionManager:
                         raise RuntimeError("file extent length mismatch")
                 except (OSError, RuntimeError) as exc:
                     output.unlink(missing_ok=True)
-                    result.errors.append(f"failed ISO root member {name!r}: {exc}")
+                    result.errors.append(f"failed ISO member {name!r}: {exc}")
                     continue
                 child = self.register_file(output, artifact, name)
                 if child is None:
                     result.errors.append(
-                        f"skipped ISO root member {name!r}: duplicate or extraction limit"
+                        f"skipped ISO member {name!r}: duplicate or extraction limit"
                     )
                     continue
                 result.artifacts.append(child)
@@ -638,19 +638,23 @@ class ExtractionManager:
                     f"logical_block_size:{block_size};extent_block:{extent_block};"
                     f"extended_attribute_blocks:{extended_attribute_blocks};"
                     f"data_offset:{data_offset};data_length:{data_length};"
+                    f"archive_path:{name};"
+                    f"containing_directory_identity:{record.get('containing_directory_identity')};"
+                    f"directory_identity_lineage:{record.get('directory_identity_lineage')};"
                     f"directory_record:{record}"
                 )
         if result.artifacts:
             result.findings.append(Finding(
                 artifact_id=artifact.id,
-                title=f"Extracted {len(result.artifacts)} ISO 9660 root file(s)",
+                title=f"Extracted {len(result.artifacts)} ISO 9660 regular file(s)",
                 category="archive_extraction",
                 severity="info",
                 confidence=0.99,
                 explanation=(
-                    "Only primary-volume root regular files with matching both-endian extent/length "
-                    "fields, one non-interleaved extent, safe identifiers, and complete image-bounded "
-                    "ranges were copied. Directory and unsupported layouts remain metadata-only."
+                    "Only regular files reached through bounded primary-volume directory traversal, "
+                    "with matching both-endian extent/length fields, one non-interleaved extent, safe "
+                    "paths, and complete image-bounded ranges were copied. Unsupported layouts remain "
+                    "metadata-only."
                 ),
                 source="builtin_iso9660_extractor",
                 supporting_evidence=evidence[:128],

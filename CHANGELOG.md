@@ -40,7 +40,7 @@ Notable user-facing changes are documented here. This project follows Semantic V
 - Complete small partitions with structurally valid table entries and boot sectors can now become immutable child artifacts under extraction limits, recursively activating the existing filesystem parsers and FlagHunter with exact source-observation and byte-range lineage.
 - Primary MBR, EBR logical, and CRC-eligible GPT data extents now receive bounded cross-table duplicate/overlap analysis; every competing entry retains exact range provenance and is barred from recursive copying, while extended/protective MBR containers are inventoried but excluded from expected-containment conflicts.
 - Portable ASCII `odc` and SVR4 CPIO `newc`/CRC archives now receive bounded native format-specific entry/trailer/path/checksum inventory and regular-file extraction with exact byte-range provenance; links, special files, and unsafe names remain metadata-only.
-- ISO 9660 images now receive bounded descriptor/PVD/root-directory parsing with both-endian and extent validation; safe single-extent root files can recursively re-enter analysis with exact descriptor, record, and byte-range lineage.
+- ISO 9660 images now receive bounded descriptor/PVD/root and active-subdirectory parsing with both-endian, block-boundary, dot/dotdot, and shared/cyclic-extent validation; safe single-extent files can recursively re-enter analysis with exact descriptor, record, byte-range, archive-path, and directory-identity lineage.
 
 ## [1.1.0] - 2026-09-04
 
