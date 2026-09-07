@@ -1369,6 +1369,8 @@ class GenericTriageEngine:
                     })
 
         all_directory_entries = list(root_entries)
+        multi_extent_chains: list[dict[str, object]] = []
+        multi_extent_errors: list[dict[str, object]] = []
         directory_inventory: list[dict[str, object]] = []
         directory_traversal_errors: list[dict[str, object]] = []
         directory_scan_bytes = root_scan_bytes
@@ -1403,6 +1405,11 @@ class GenericTriageEngine:
                         entry["archive_path"] = entry.get(
                             "archive_name", entry.get("logical_name")
                         )
+                root_chains, root_chain_errors = self._iso9660_assemble_multi_extents(
+                    root_entries, namespace="primary",
+                )
+                multi_extent_chains.extend(root_chains)
+                multi_extent_errors.extend(root_chain_errors)
 
                 queue: list[
                     tuple[
@@ -1605,6 +1612,11 @@ class GenericTriageEngine:
                                     )),
                                 ]
                             )
+                    child_chains, child_chain_errors = self._iso9660_assemble_multi_extents(
+                        child_entries, namespace="primary",
+                    )
+                    multi_extent_chains.extend(child_chains)
+                    multi_extent_errors.extend(child_chain_errors)
                     all_directory_entries.extend(child_entries)
                     dot_entry = next(
                         (entry for entry in child_entries if entry.get("logical_name") == "."),
@@ -1740,6 +1752,9 @@ class GenericTriageEngine:
             entry for entry in all_directory_entries
             if entry.get("file_type") == "regular"
             and entry.get("logical_name") not in {".", ".."}
+            and entry.get("multi_extent_chain_role") not in {
+                "continuation", "tail", "overflow",
+            }
         ]
         valid_joliet_descriptors = [
             descriptor for descriptor in joliet_descriptors
@@ -1770,29 +1785,41 @@ class GenericTriageEngine:
             )
         joliet_entries = joliet_walk.get("entries", [])
         joliet_regular_files = joliet_walk.get("regular_files", [])
+        joliet_multi_extent_chains = joliet_walk.get("multi_extent_chains", [])
+        joliet_multi_extent_errors = joliet_walk.get("multi_extent_errors", [])
+        if isinstance(joliet_multi_extent_chains, list):
+            multi_extent_chains.extend(joliet_multi_extent_chains)
+        if isinstance(joliet_multi_extent_errors, list):
+            multi_extent_errors.extend(joliet_multi_extent_errors)
         joliet_aliases: list[dict[str, object]] = []
         joliet_reconciliation_errors: list[dict[str, object]] = []
         if isinstance(joliet_regular_files, list):
             for joliet_entry in joliet_regular_files:
                 if not isinstance(joliet_entry, dict):
                     continue
-                extent = (
-                    joliet_entry.get("data_offset"), joliet_entry.get("data_length"),
-                )
+                extent = self._iso9660_logical_extent_identity(joliet_entry)
+                if extent is None:
+                    joliet_entry["extraction_eligible"] = False
+                    joliet_entry["extraction_reconciliation_ambiguous"] = True
+                    joliet_reconciliation_errors.append({
+                        "reason": "invalid_logical_extent_identity",
+                        "joliet_entry": joliet_entry,
+                    })
+                    continue
                 primary_matches = [
                     entry for entry in regular_files
-                    if (entry.get("data_offset"), entry.get("data_length")) == extent
+                    if self._iso9660_logical_extent_identity(entry) == extent
                 ]
                 joliet_matches = [
                     entry for entry in joliet_regular_files
                     if isinstance(entry, dict)
-                    and (entry.get("data_offset"), entry.get("data_length")) == extent
+                    and self._iso9660_logical_extent_identity(entry) == extent
                 ]
                 if len(primary_matches) == 1 and len(joliet_matches) == 1:
                     primary_entry = primary_matches[0]
                     alias = {
-                        "data_offset": extent[0],
-                        "data_length": extent[1],
+                        "data_offset": extent[0][0] if len(extent) == 1 else None,
+                        "data_length": extent[0][1] if len(extent) == 1 else None,
                         "primary_record_offset": primary_entry.get("record_offset"),
                         "primary_archive_path": primary_entry.get("archive_path"),
                         "joliet_record_offset": joliet_entry.get("record_offset"),
@@ -1801,6 +1828,14 @@ class GenericTriageEngine:
                             "descriptor_offset"
                         ) if active_joliet_descriptor else None,
                     }
+                    if len(extent) > 1:
+                        alias["logical_extent_segments"] = [
+                            {"data_offset": segment[0], "data_length": segment[1]}
+                            for segment in extent
+                        ]
+                        alias["assembled_data_length"] = sum(
+                            segment[1] for segment in extent
+                        )
                     joliet_aliases.append(alias)
                     primary_entry["joliet_alias"] = alias
                     primary_entry["joliet_archive_path"] = joliet_entry.get("archive_path")
@@ -1854,6 +1889,8 @@ class GenericTriageEngine:
             self._observation(artifact, "archive.iso9660.directory_entries", all_directory_entries),
             self._observation(artifact, "archive.iso9660.regular_files", regular_files),
             self._observation(artifact, "archive.iso9660.regular_file_count", len(regular_files)),
+            self._observation(artifact, "archive.iso9660.multi_extent_chains", multi_extent_chains),
+            self._observation(artifact, "archive.iso9660.multi_extent_errors", multi_extent_errors),
             self._observation(artifact, "archive.iso9660.subdirectory_inventory", directory_inventory),
             self._observation(artifact, "archive.iso9660.subdirectory_count", len(directory_inventory)),
             self._observation(artifact, "archive.iso9660.directory_scan_bytes", directory_scan_bytes),
@@ -1956,6 +1993,309 @@ class GenericTriageEngine:
                 first_error = record_error
             cursor += record_length
         return entries, first_error, entry_limit_reached
+
+    def _iso9660_assemble_multi_extents(
+        self,
+        entries: list[dict[str, object]],
+        *,
+        namespace: str,
+    ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+        """Validate adjacent ISO multi-extent record chains without reading payloads."""
+        chains: list[dict[str, object]] = []
+        errors: list[dict[str, object]] = []
+        segment_limit = 128
+        byte_limit = self.limits.max_single_artifact_size
+
+        def identifier_key(record: dict[str, object]) -> tuple[object, ...]:
+            return (
+                record.get("identifier_encoding"),
+                record.get("identifier_raw_hex"),
+                record.get("file_identifier"),
+                record.get("version"),
+                record.get("volume_sequence_number"),
+            )
+
+        index = 0
+        while index < len(entries):
+            leader = entries[index]
+            if (
+                leader.get("file_type") != "regular"
+                or leader.get("logical_name") in {".", ".."}
+                or leader.get("multi_extent") is not True
+                or leader.get("multi_extent_chain_role") is not None
+            ):
+                index += 1
+                continue
+
+            expected_identifier = identifier_key(leader)
+            segments = [leader]
+            next_index = index + 1
+            termination_reason: str | None = None
+            termination_record: dict[str, object] | None = None
+            final_seen = False
+            overflow_segments: list[dict[str, object]] = []
+            while len(segments) < segment_limit:
+                if next_index >= len(entries):
+                    termination_reason = "missing_final_record"
+                    break
+                candidate = entries[next_index]
+                if identifier_key(candidate) != expected_identifier:
+                    termination_reason = "next_record_identifier_mismatch"
+                    termination_record = candidate
+                    break
+                if (
+                    candidate.get("file_type") != "regular"
+                    or candidate.get("logical_name") in {".", ".."}
+                ):
+                    termination_reason = "next_record_not_regular"
+                    termination_record = candidate
+                    break
+                segments.append(candidate)
+                next_index += 1
+                if candidate.get("multi_extent") is not True:
+                    final_seen = True
+                    break
+            if not final_seen and termination_reason is None:
+                termination_reason = "segment_limit"
+                while next_index < len(entries):
+                    candidate = entries[next_index]
+                    if (
+                        identifier_key(candidate) != expected_identifier
+                        or candidate.get("file_type") != "regular"
+                        or candidate.get("logical_name") in {".", ".."}
+                    ):
+                        break
+                    overflow_segments.append(candidate)
+                    next_index += 1
+                    if candidate.get("multi_extent") is not True:
+                        break
+
+            failed_checks: list[str] = []
+            if not final_seen:
+                failed_checks.append(str(termination_reason or "missing_final_record"))
+            if len(segments) < 2:
+                failed_checks.append("segment_count")
+
+            total_data_length = 0
+            ranges: list[tuple[int, int]] = []
+            record_offsets: set[int] = set()
+            first_block_size = leader.get("logical_block_size")
+            for segment_index, segment in enumerate(segments):
+                if segment.get("valid") is not True:
+                    failed_checks.append(f"segment_{segment_index}_record_invalid")
+                if segment.get("file_type") != "regular":
+                    failed_checks.append(f"segment_{segment_index}_not_regular")
+                if segment.get("path_safe") is not True:
+                    failed_checks.append(f"segment_{segment_index}_unsafe_identifier")
+                if segment.get("file_unit_size") != 0 or segment.get("interleave_gap_size") != 0:
+                    failed_checks.append(f"segment_{segment_index}_interleaved")
+                if segment.get("logical_block_size") != first_block_size:
+                    failed_checks.append(f"segment_{segment_index}_block_size_mismatch")
+                if identifier_key(segment) != expected_identifier:
+                    failed_checks.append(f"segment_{segment_index}_identifier_mismatch")
+                if (
+                    segment.get("rock_ridge_symlink") is True
+                    or segment.get("rock_ridge_non_regular") is True
+                    or segment.get("rock_ridge_type_mismatch") is True
+                    or segment.get("rock_ridge_name_usable") is False
+                    or segment.get("susp_error")
+                    or segment.get("susp_continuation_unparsed") is True
+                    or segment.get("rock_ridge_relocation_traversal_suppressed") is True
+                ):
+                    failed_checks.append(f"segment_{segment_index}_metadata_unsafe")
+                data_offset = segment.get("data_offset")
+                data_length = segment.get("data_length")
+                record_offset = segment.get("record_offset")
+                if (
+                    not isinstance(data_offset, int)
+                    or isinstance(data_offset, bool)
+                    or not isinstance(data_length, int)
+                    or isinstance(data_length, bool)
+                    or data_offset < 0
+                    or data_length <= 0
+                ):
+                    failed_checks.append(f"segment_{segment_index}_range_invalid")
+                else:
+                    total_data_length += data_length
+                    end_offset = data_offset + data_length
+                    if any(
+                        data_offset < prior_end and prior_start < end_offset
+                        for prior_start, prior_end in ranges
+                    ):
+                        failed_checks.append(f"segment_{segment_index}_range_overlap")
+                    ranges.append((data_offset, end_offset))
+                    if (
+                        segment_index < len(segments) - 1
+                        and isinstance(first_block_size, int)
+                        and data_length % first_block_size != 0
+                    ):
+                        failed_checks.append(
+                            f"segment_{segment_index}_nonfinal_length_not_block_aligned"
+                        )
+                if not isinstance(record_offset, int) or isinstance(record_offset, bool):
+                    failed_checks.append(f"segment_{segment_index}_record_offset_invalid")
+                elif record_offset in record_offsets:
+                    failed_checks.append(f"segment_{segment_index}_record_offset_duplicate")
+                else:
+                    record_offsets.add(record_offset)
+                expected_multi_extent = segment_index < len(segments) - 1 or not final_seen
+                if segment.get("multi_extent") is not expected_multi_extent:
+                    failed_checks.append(f"segment_{segment_index}_multi_extent_flag")
+
+            if total_data_length > byte_limit:
+                failed_checks.append("assembled_size_limit")
+            failed_checks = list(dict.fromkeys(failed_checks))
+            complete = final_seen and not failed_checks
+            chain_id = (
+                f"{namespace}:{leader.get('record_offset')}:"
+                f"{leader.get('identifier_raw_hex')}"
+            )
+            segment_provenance = [{
+                **{
+                    key: segment.get(key)
+                    for key in (
+                        "record_offset", "record_length", "record_raw_hex",
+                        "identifier_length", "identifier_raw_hex",
+                        "identifier_encoding", "file_identifier", "logical_name",
+                        "version", "extended_attribute_blocks",
+                        "logical_block_size", "extent_block",
+                        "extent_block_big_endian", "extent_both_endian_match",
+                        "data_offset", "data_length", "data_length_big_endian",
+                        "data_length_both_endian_match", "data_end_offset",
+                        "flags_raw", "multi_extent", "file_unit_size",
+                        "interleave_gap_size", "volume_sequence_number",
+                        "volume_sequence_number_big_endian", "valid",
+                        "failed_checks",
+                    )
+                },
+                "susp_continuation_areas": (
+                    segment.get("susp_continuation_areas") or []
+                ),
+            } for segment in segments]
+            chain: dict[str, object] = {
+                "chain_id": chain_id,
+                "namespace": namespace,
+                "archive_path": leader.get("archive_path"),
+                "file_identifier": leader.get("file_identifier"),
+                "identifier_raw_hex": leader.get("identifier_raw_hex"),
+                "version": leader.get("version"),
+                "containing_directory_identity": leader.get(
+                    "containing_directory_identity"
+                ),
+                "first_record_offset": leader.get("record_offset"),
+                "last_record_offset": segments[-1].get("record_offset"),
+                "segment_count": len(segments),
+                "segment_limit": segment_limit,
+                "total_data_length": total_data_length,
+                "byte_limit": byte_limit,
+                "complete": complete,
+                "extraction_eligible": complete,
+                "termination_reason": termination_reason,
+                "termination_record_offset": (
+                    termination_record.get("record_offset")
+                    if termination_record is not None else None
+                ),
+                "termination_file_identifier": (
+                    termination_record.get("file_identifier")
+                    if termination_record is not None else None
+                ),
+                "overflow_segment_count": len(overflow_segments),
+                "overflow_record_offsets": [
+                    segment.get("record_offset") for segment in overflow_segments
+                ],
+                "failed_checks": failed_checks,
+                "segments": segment_provenance,
+            }
+            chains.append(chain)
+            if failed_checks:
+                errors.append({
+                    "reason": "invalid_multi_extent_chain",
+                    "chain_id": chain_id,
+                    "namespace": namespace,
+                    "archive_path": leader.get("archive_path"),
+                    "first_record_offset": leader.get("record_offset"),
+                    "failed_checks": failed_checks,
+                    "termination_record_offset": chain["termination_record_offset"],
+                    "termination_file_identifier": chain["termination_file_identifier"],
+                })
+
+            for segment_index, segment in enumerate(segments):
+                role = (
+                    "head" if segment_index == 0
+                    else "tail" if final_seen and segment_index == len(segments) - 1
+                    else "continuation"
+                )
+                segment.update({
+                    "multi_extent_chain_id": chain_id,
+                    "multi_extent_chain_role": role,
+                    "multi_extent_segment_index": segment_index,
+                    "multi_extent_chain_complete": complete,
+                    "extraction_eligible": False,
+                })
+            for overflow_index, segment in enumerate(overflow_segments):
+                segment.update({
+                    "multi_extent_chain_id": chain_id,
+                    "multi_extent_chain_role": "overflow",
+                    "multi_extent_segment_index": segment_limit + overflow_index,
+                    "multi_extent_chain_complete": False,
+                    "extraction_eligible": False,
+                })
+            leader.update({
+                "multi_extent_chain": chain,
+                "multi_extent_segments": segment_provenance,
+                "multi_extent_assembled": complete,
+                "assembled_data_length": total_data_length,
+                "logical_extent_identity": {
+                    "kind": "multi_extent",
+                    "segments": [
+                        {"data_offset": start, "data_length": end - start}
+                        for start, end in ranges
+                    ],
+                    "total_data_length": total_data_length,
+                },
+                "extraction_eligible": complete,
+            })
+            index += len(segments) + len(overflow_segments)
+        return chains, errors
+
+    @staticmethod
+    def _iso9660_logical_extent_identity(
+        record: dict[str, object],
+    ) -> tuple[tuple[int, int], ...] | None:
+        """Return an exact ordered byte-range identity for one logical ISO file."""
+        if record.get("multi_extent_chain_role") in {
+            "continuation", "tail", "overflow",
+        }:
+            return None
+        if record.get("multi_extent") is True:
+            if record.get("multi_extent_assembled") is not True:
+                return None
+            raw_segments = record.get("multi_extent_segments")
+            if not isinstance(raw_segments, list) or not 2 <= len(raw_segments) <= 128:
+                return None
+            identity: list[tuple[int, int]] = []
+            for segment in raw_segments:
+                if not isinstance(segment, dict):
+                    return None
+                offset = segment.get("data_offset")
+                length = segment.get("data_length")
+                if (
+                    not isinstance(offset, int) or isinstance(offset, bool)
+                    or not isinstance(length, int) or isinstance(length, bool)
+                    or offset < 0 or length <= 0
+                ):
+                    return None
+                identity.append((offset, length))
+            return tuple(identity)
+        offset = record.get("data_offset")
+        length = record.get("data_length")
+        if (
+            not isinstance(offset, int) or isinstance(offset, bool)
+            or not isinstance(length, int) or isinstance(length, bool)
+            or offset < 0 or length < 0
+        ):
+            return None
+        return ((offset, length),)
 
     @staticmethod
     def _iso9660_el_torito_catalogs(
@@ -2660,6 +3000,8 @@ class GenericTriageEngine:
         entries: list[dict[str, object]] = []
         inventory: list[dict[str, object]] = []
         errors: list[dict[str, object]] = []
+        multi_extent_chains: list[dict[str, object]] = []
+        multi_extent_errors: list[dict[str, object]] = []
         byte_limit = min(self.limits.signature_scan_bytes, 8 * _MIB)
         entry_limit = min(self.limits.max_artifact_count + 64, 4_096)
         directory_limit = 32
@@ -2759,6 +3101,11 @@ class GenericTriageEngine:
             entry["directory_identity_lineage"] = []
             if entry.get("logical_name") not in {".", ".."}:
                 entry["archive_path"] = entry.get("logical_name")
+        root_chains, root_chain_errors = self._iso9660_assemble_multi_extents(
+            root_entries, namespace=namespace,
+        )
+        multi_extent_chains.extend(root_chains)
+        multi_extent_errors.extend(root_chain_errors)
         if root_error or root_entry_limit:
             errors.append({
                 "reason": "root_directory_consistency",
@@ -2884,6 +3231,11 @@ class GenericTriageEngine:
                         *[str(identity.get("logical_name")) for identity in lineage],
                         str(entry.get("logical_name")),
                     ])
+            child_chains, child_chain_errors = self._iso9660_assemble_multi_extents(
+                child_entries, namespace=namespace,
+            )
+            multi_extent_chains.extend(child_chains)
+            multi_extent_errors.extend(child_chain_errors)
             entries.extend(child_entries)
             dot = next((entry for entry in child_entries if entry.get("logical_name") == "."), None)
             dotdot = next((entry for entry in child_entries if entry.get("logical_name") == ".."), None)
@@ -2928,7 +3280,12 @@ class GenericTriageEngine:
                 entry for entry in entries
                 if entry.get("file_type") == "regular"
                 and entry.get("logical_name") not in {".", ".."}
+                and entry.get("multi_extent_chain_role") not in {
+                    "continuation", "tail", "overflow",
+                }
             ],
+            "multi_extent_chains": multi_extent_chains,
+            "multi_extent_errors": multi_extent_errors,
             "inventory": inventory,
             "errors": errors,
             "bytes_read": bytes_read,

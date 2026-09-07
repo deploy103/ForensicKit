@@ -1,5 +1,18 @@
 # ForensicKit Work Log
 
+## 2026-09-07 12:18 KST
+
+### ISO 9660 multi-extent regular-file assembly
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/extraction.py`, `src/forensickit/profiles/archive.py`, `tests/test_triage.py`, and `tests/test_engine_pipeline.py`.
+- Consecutive ISO regular-file records now form one logical file only when raw identifier/encoding, version, and volume sequence agree, every record and payload range validates, non-final lengths are logical-block aligned, payload ranges do not overlap, interleaving is absent, and a matching final record appears. Chains are capped at 128 segments and the configured single-artifact byte limit; overflow tails are tagged and suppressed rather than reinterpreted as independent files.
+- Complete chains retain ordered copies of every directory record and exact extent range. Primary and Joliet aliases now reconcile either one exact range or an identical ordered range sequence. The extractor re-reads every raw record, checks adjacent record offsets or zero block padding, revalidates multi-extent flags/lengths/SUSP continuation hashes, and concatenates segments directly from immutable evidence into one bounded child.
+- Synthetic triage covers valid assembly, identifier mismatch, 128-segment overflow suppression, and exact primary/Joliet multi-extent aliases. AUTO E2E covers one-child ordered assembly with hash/flag lineage and confirms an unterminated chain never yields a partial child. Focused triage/Engine regressions passed: 170 passed, 0 failed. The full direct synthetic suite passed: 331 passed, 0 failed. `python -m compileall -q src tests scripts` and `git diff --check` passed.
+
+### Next
+
+- Decode bounded Joliet Type-L/Type-M path-table copies with strict UCS-2BE names, cross-endian semantic comparison, and active-directory reconciliation.
+
 ## 2026-09-07 11:47 KST
 
 ### Rock Ridge relocated-directory metadata

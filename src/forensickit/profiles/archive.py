@@ -547,12 +547,69 @@ class ArchiveProfile(BaseProfile):
                     severity="medium" if unresolved_relocations else "info",
                 )
             )
+        multi_extent_chains = next(
+            (
+                value for value in context.values(
+                    "archive.iso9660.multi_extent_chains"
+                )
+                if isinstance(value, list)
+            ),
+            [],
+        )
+        multi_extent_errors = next(
+            (
+                value for value in context.values(
+                    "archive.iso9660.multi_extent_errors"
+                )
+                if isinstance(value, list)
+            ),
+            [],
+        )
+        assembled_multi_extents = [
+            item for item in multi_extent_chains
+            if isinstance(item, dict) and item.get("complete") is True
+        ]
+        if assembled_multi_extents:
+            result.findings.append(
+                self.finding(
+                    context,
+                    title="ISO 9660 multi-extent files validated for ordered assembly",
+                    category="archive_multi_extent_metadata",
+                    confidence=0.99,
+                    explanation=(
+                        "Adjacent, identifier/version-consistent regular-file records form complete "
+                        "non-interleaved chains. Each image-bounded extent retains its directory-record "
+                        "provenance and may be copied only in recorded order."
+                    ),
+                    evidence=[str(item)[:2_000] for item in assembled_multi_extents[:16]],
+                    severity="info",
+                )
+            )
+        if multi_extent_errors:
+            result.findings.append(
+                self.finding(
+                    context,
+                    title="ISO 9660 multi-extent chain is incomplete or inconsistent",
+                    category="iso9660_multi_extent_anomaly",
+                    confidence=0.98,
+                    explanation=(
+                        "A multi-extent leader was not followed by a bounded, adjacent, matching final "
+                        "record, or a segment failed range/layout validation. The chain remains "
+                        "metadata-only and is never partially materialized."
+                    ),
+                    evidence=[str(item)[:2_000] for item in multi_extent_errors[:16]],
+                    severity="medium",
+                )
+            )
         unsupported_iso_entries = [
             item for item in iso_entries
             if isinstance(item, dict)
             and item.get("file_type") == "regular"
             and (
-                item.get("multi_extent") is True
+                (
+                    item.get("multi_extent") is True
+                    and item.get("multi_extent_assembled") is not True
+                )
                 or item.get("file_unit_size") not in {0, None}
                 or item.get("interleave_gap_size") not in {0, None}
             )
@@ -561,12 +618,13 @@ class ArchiveProfile(BaseProfile):
             result.findings.append(
                 self.finding(
                     context,
-                    title="ISO 9660 file uses an unsupported multi-extent/interleaved layout",
+                    title="ISO 9660 file uses an unsupported incomplete/interleaved layout",
                     category="archive_unsupported_layout",
                     confidence=0.99,
                     explanation=(
-                        "The entry remains fully inventoried, but the native extractor requires one "
-                        "non-interleaved extent and will not infer missing extent joins."
+                        "The entry remains fully inventoried, but the native extractor requires either "
+                        "one non-interleaved extent or a complete adjacent multi-extent chain and will "
+                        "not infer missing joins."
                     ),
                     evidence=[str(item)[:2_000] for item in unsupported_iso_entries[:16]],
                     severity="info",

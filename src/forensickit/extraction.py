@@ -555,87 +555,164 @@ class ExtractionManager:
                             f"skipped ISO member {name!r}: directory record did not validate"
                         )
                     continue
-                record_offset = record.get("record_offset")
-                record_length = record.get("record_length")
-                block_size = record.get("logical_block_size")
-                extent_block = record.get("extent_block")
-                extended_attribute_blocks = record.get("extended_attribute_blocks")
-                data_offset = record.get("data_offset")
-                data_length = record.get("data_length")
-                identifier_raw_hex = record.get("identifier_raw_hex")
-                record_raw_hex = record.get("record_raw_hex")
-                if (
-                    isinstance(record_offset, bool) or not isinstance(record_offset, int)
-                    or isinstance(record_length, bool) or not isinstance(record_length, int)
-                    or isinstance(block_size, bool) or not isinstance(block_size, int)
-                    or isinstance(extent_block, bool) or not isinstance(extent_block, int)
-                    or isinstance(extended_attribute_blocks, bool)
-                    or not isinstance(extended_attribute_blocks, int)
-                    or isinstance(data_offset, bool) or not isinstance(data_offset, int)
-                    or isinstance(data_length, bool) or not isinstance(data_length, int)
-                    or not isinstance(identifier_raw_hex, str)
-                    or not isinstance(record_raw_hex, str)
-                    or record_offset < 0 or not 34 <= record_length <= 255
-                    or block_size < 512 or block_size > 32_768
-                    or block_size != pvd_block_size
-                    or data_offset != (extent_block + extended_attribute_blocks) * block_size
-                    or data_length < 0 or data_offset + data_length > artifact.size
-                ):
+                multi_extent = record.get("multi_extent") is True
+                if multi_extent:
+                    raw_segments = record.get("multi_extent_segments")
+                    chain = record.get("multi_extent_chain")
+                    if (
+                        record.get("multi_extent_assembled") is not True
+                        or not isinstance(chain, dict)
+                        or chain.get("complete") is not True
+                        or chain.get("extraction_eligible") is not True
+                        or not isinstance(raw_segments, list)
+                        or not 2 <= len(raw_segments) <= 128
+                    ):
+                        result.errors.append(
+                            f"skipped ISO member {name!r}: invalid multi-extent chain provenance"
+                        )
+                        continue
+                    segment_records = raw_segments
+                    data_length = record.get("assembled_data_length")
+                    if (
+                        not isinstance(data_length, int) or isinstance(data_length, bool)
+                        or data_length <= 0
+                        or chain.get("total_data_length") != data_length
+                    ):
+                        result.errors.append(
+                            f"skipped ISO member {name!r}: invalid assembled byte length"
+                        )
+                        continue
+                else:
+                    segment_records = [record]
+                    data_length = record.get("data_length")
+                if not isinstance(data_length, int) or isinstance(data_length, bool):
                     result.errors.append(f"skipped ISO member {name!r}: invalid observed byte range")
                     continue
                 reason = self.can_register(artifact, data_length)
                 if reason:
                     result.errors.append(f"skipped ISO member {name!r}: {reason}")
                     continue
+                validated_segments: list[dict[str, int]] = []
                 try:
-                    source_stream.seek(record_offset)
-                    raw_record = source_stream.read(record_length)
-                    identifier_length = raw_record[32] if len(raw_record) >= 33 else 0
-                    raw_identifier = raw_record[33:33 + identifier_length]
-                    if (
-                        len(raw_record) != record_length
-                        or raw_record[0] != record_length
-                        or raw_record.hex() != record_raw_hex
-                        or raw_record[1] != extended_attribute_blocks
-                        or 33 + identifier_length > record_length
-                        or raw_identifier.hex() != identifier_raw_hex
-                        or int.from_bytes(raw_record[2:6], "little") != extent_block
-                        or int.from_bytes(raw_record[6:10], "big") != extent_block
-                        or int.from_bytes(raw_record[10:14], "little") != data_length
-                        or int.from_bytes(raw_record[14:18], "big") != data_length
-                        or raw_record[25] & 0x82
-                        or raw_record[26] != 0
-                        or raw_record[27] != 0
-                    ):
-                        raise RuntimeError("directory record no longer matches triage provenance")
-                    continuation_areas = record.get("susp_continuation_areas", [])
-                    if not isinstance(continuation_areas, list):
-                        raise RuntimeError("invalid SUSP continuation provenance")
-                    for continuation_area in continuation_areas:
-                        if not isinstance(continuation_area, dict):
-                            raise RuntimeError("invalid SUSP continuation record")
-                        continuation_offset = continuation_area.get("absolute_offset")
-                        continuation_length = continuation_area.get("length")
-                        continuation_sha256 = continuation_area.get("raw_sha256")
+                    expected_identifier = record.get("identifier_raw_hex")
+                    previous_record_end: int | None = None
+                    for segment_index, segment in enumerate(segment_records):
+                        if not isinstance(segment, dict):
+                            raise RuntimeError("invalid multi-extent segment provenance")
+                        record_offset = segment.get("record_offset")
+                        record_length = segment.get("record_length")
+                        block_size = segment.get("logical_block_size")
+                        extent_block = segment.get("extent_block")
+                        extended_attribute_blocks = segment.get("extended_attribute_blocks")
+                        data_offset = segment.get("data_offset")
+                        segment_length = segment.get("data_length")
+                        identifier_raw_hex = segment.get("identifier_raw_hex")
+                        record_raw_hex = segment.get("record_raw_hex")
                         if (
-                            not isinstance(continuation_offset, int)
-                            or not isinstance(continuation_length, int)
-                            or continuation_length <= 0
-                            or continuation_offset < 0
-                            or continuation_offset + continuation_length > artifact.size
-                            or not isinstance(continuation_sha256, str)
+                            isinstance(record_offset, bool) or not isinstance(record_offset, int)
+                            or isinstance(record_length, bool) or not isinstance(record_length, int)
+                            or isinstance(block_size, bool) or not isinstance(block_size, int)
+                            or isinstance(extent_block, bool) or not isinstance(extent_block, int)
+                            or isinstance(extended_attribute_blocks, bool)
+                            or not isinstance(extended_attribute_blocks, int)
+                            or isinstance(data_offset, bool) or not isinstance(data_offset, int)
+                            or isinstance(segment_length, bool) or not isinstance(segment_length, int)
+                            or not isinstance(identifier_raw_hex, str)
+                            or not isinstance(record_raw_hex, str)
+                            or record_offset < 0 or not 34 <= record_length <= 255
+                            or block_size < 512 or block_size > 32_768
+                            or block_size != pvd_block_size
+                            or data_offset != (
+                                extent_block + extended_attribute_blocks
+                            ) * block_size
+                            or segment_length <= 0
+                            or data_offset + segment_length > artifact.size
+                            or identifier_raw_hex != expected_identifier
                         ):
-                            raise RuntimeError("invalid SUSP continuation byte range")
-                        source_stream.seek(continuation_offset)
-                        continuation_raw = source_stream.read(continuation_length)
+                            raise RuntimeError("invalid observed segment byte range")
+                        if previous_record_end is not None:
+                            next_block = (
+                                (previous_record_end + block_size - 1) // block_size
+                            ) * block_size
+                            if record_offset not in {previous_record_end, next_block}:
+                                raise RuntimeError(
+                                    "multi-extent directory records are no longer adjacent"
+                                )
+                            if record_offset > previous_record_end:
+                                source_stream.seek(previous_record_end)
+                                padding = source_stream.read(
+                                    record_offset - previous_record_end
+                                )
+                                if len(padding) != record_offset - previous_record_end or any(padding):
+                                    raise RuntimeError(
+                                        "multi-extent directory padding no longer validates"
+                                    )
+                        previous_record_end = record_offset + record_length
+                        source_stream.seek(record_offset)
+                        raw_record = source_stream.read(record_length)
+                        identifier_length = raw_record[32] if len(raw_record) >= 33 else 0
+                        raw_identifier = raw_record[33:33 + identifier_length]
+                        expected_multi_extent = (
+                            multi_extent and segment_index < len(segment_records) - 1
+                        )
                         if (
-                            len(continuation_raw) != continuation_length
-                            or hashlib.sha256(continuation_raw).hexdigest()
-                            != continuation_sha256
-                        ):
-                            raise RuntimeError(
-                                "SUSP continuation area no longer matches triage provenance"
+                            len(raw_record) != record_length
+                            or raw_record[0] != record_length
+                            or raw_record.hex() != record_raw_hex
+                            or raw_record[1] != extended_attribute_blocks
+                            or 33 + identifier_length > record_length
+                            or raw_identifier.hex() != identifier_raw_hex
+                            or int.from_bytes(raw_record[2:6], "little") != extent_block
+                            or int.from_bytes(raw_record[6:10], "big") != extent_block
+                            or int.from_bytes(raw_record[10:14], "little") != segment_length
+                            or int.from_bytes(raw_record[14:18], "big") != segment_length
+                            or bool(raw_record[25] & 0x80) is not expected_multi_extent
+                            or raw_record[25] & 0x02
+                            or raw_record[26] != 0
+                            or raw_record[27] != 0
+                            or (
+                                expected_multi_extent
+                                and segment_length % block_size != 0
                             )
+                        ):
+                            raise RuntimeError("directory record no longer matches triage provenance")
+                        continuation_areas = segment.get("susp_continuation_areas", [])
+                        if not isinstance(continuation_areas, list):
+                            raise RuntimeError("invalid SUSP continuation provenance")
+                        for continuation_area in continuation_areas:
+                            if not isinstance(continuation_area, dict):
+                                raise RuntimeError("invalid SUSP continuation record")
+                            continuation_offset = continuation_area.get("absolute_offset")
+                            continuation_length = continuation_area.get("length")
+                            continuation_sha256 = continuation_area.get("raw_sha256")
+                            if (
+                                not isinstance(continuation_offset, int)
+                                or not isinstance(continuation_length, int)
+                                or continuation_length <= 0
+                                or continuation_offset < 0
+                                or continuation_offset + continuation_length > artifact.size
+                                or not isinstance(continuation_sha256, str)
+                            ):
+                                raise RuntimeError("invalid SUSP continuation byte range")
+                            source_stream.seek(continuation_offset)
+                            continuation_raw = source_stream.read(continuation_length)
+                            if (
+                                len(continuation_raw) != continuation_length
+                                or hashlib.sha256(continuation_raw).hexdigest()
+                                != continuation_sha256
+                            ):
+                                raise RuntimeError(
+                                    "SUSP continuation area no longer matches triage provenance"
+                                )
+                        validated_segments.append({
+                            "record_offset": record_offset,
+                            "record_length": record_length,
+                            "extent_block": extent_block,
+                            "data_offset": data_offset,
+                            "data_length": segment_length,
+                        })
+                    if sum(segment["data_length"] for segment in validated_segments) != data_length:
+                        raise RuntimeError("assembled extent length no longer matches triage provenance")
                 except (OSError, RuntimeError) as exc:
                     result.errors.append(f"skipped ISO member {name!r}: {exc}")
                     continue
@@ -643,16 +720,19 @@ class ExtractionManager:
                 output = target_root / f"{record_index:05d}_{safe_name(name)}"
                 written = 0
                 try:
-                    source_stream.seek(data_offset)
                     with output.open("xb") as writer:
-                        remaining = data_length
-                        while remaining:
-                            chunk = source_stream.read(min(1024 * 1024, remaining))
-                            if not chunk:
-                                raise RuntimeError("file extent read ended before declared length")
-                            writer.write(chunk)
-                            written += len(chunk)
-                            remaining -= len(chunk)
+                        for segment in validated_segments:
+                            source_stream.seek(segment["data_offset"])
+                            remaining = segment["data_length"]
+                            while remaining:
+                                chunk = source_stream.read(min(1024 * 1024, remaining))
+                                if not chunk:
+                                    raise RuntimeError(
+                                        "file extent read ended before declared length"
+                                    )
+                                writer.write(chunk)
+                                written += len(chunk)
+                                remaining -= len(chunk)
                     if written != data_length:
                         raise RuntimeError("file extent length mismatch")
                 except (OSError, RuntimeError) as exc:
@@ -673,10 +753,13 @@ class ExtractionManager:
                     f"pvd_observation_id:{pvd_observation.id};"
                     f"pvd_observation_key:{pvd_observation.key};"
                     f"pvd_descriptor_offset:{pvd_observation.value.get('descriptor_offset')};"
-                    f"record_offset:{record_offset};record_length:{record_length};"
-                    f"logical_block_size:{block_size};extent_block:{extent_block};"
-                    f"extended_attribute_blocks:{extended_attribute_blocks};"
-                    f"data_offset:{data_offset};data_length:{data_length};"
+                    f"record_offset:{record.get('record_offset')};"
+                    f"record_length:{record.get('record_length')};"
+                    f"logical_block_size:{record.get('logical_block_size')};"
+                    f"extent_block:{record.get('extent_block')};"
+                    f"extended_attribute_blocks:{record.get('extended_attribute_blocks')};"
+                    f"data_offset:{record.get('data_offset')};data_length:{data_length};"
+                    f"multi_extent:{multi_extent};segments:{validated_segments};"
                     f"archive_path:{name};"
                     f"containing_directory_identity:{record.get('containing_directory_identity')};"
                     f"directory_identity_lineage:{record.get('directory_identity_lineage')};"
@@ -697,9 +780,9 @@ class ExtractionManager:
                 confidence=0.99,
                 explanation=(
                     "Only regular files reached through bounded primary-volume directory traversal, "
-                    "with matching both-endian extent/length fields, one non-interleaved extent, safe "
-                    "paths, and complete image-bounded ranges were copied. Unsupported layouts remain "
-                    "metadata-only."
+                    "with matching both-endian extent/length fields, safe paths, and complete "
+                    "image-bounded ranges were copied. Valid adjacent multi-extent chains are "
+                    "assembled in record order; interleaved or incomplete layouts remain metadata-only."
                 ),
                 source="builtin_iso9660_extractor",
                 supporting_evidence=evidence[:128],

@@ -157,6 +157,45 @@ def _iso_directory_record(
     return bytes(record)
 
 
+def _iso9660_with_multi_extent_file(
+    *, final_identifier: bytes = b"SPLIT.BIN;1",
+) -> tuple[bytes, bytes]:
+    block_size = 2_048
+    first_payload = b"A" * block_size
+    final_payload = b"CTF{iso9660_multi_extent_tail}"
+    image = bytearray(24 * block_size)
+    pvd_offset = 16 * block_size
+    pvd = memoryview(image)[pvd_offset:pvd_offset + block_size]
+    pvd[0] = 1
+    pvd[1:6] = b"CD001"
+    pvd[6] = 1
+    pvd[8:40] = b"FORENSICKIT".ljust(32, b" ")
+    pvd[40:72] = b"MULTI_EXTENT".ljust(32, b" ")
+    pvd[80:88] = _iso_both32(24)
+    pvd[120:124] = _iso_both16(1)
+    pvd[124:128] = _iso_both16(1)
+    pvd[128:132] = _iso_both16(block_size)
+    pvd[132:140] = _iso_both32(0)
+    root_record = _iso_directory_record(b"\x00", 20, block_size, flags=0x02)
+    pvd[156:156 + len(root_record)] = root_record
+    terminator = 17 * block_size
+    image[terminator] = 255
+    image[terminator + 1:terminator + 6] = b"CD001"
+    image[terminator + 6] = 1
+    root = (
+        root_record
+        + _iso_directory_record(b"\x01", 20, block_size, flags=0x02)
+        + _iso_directory_record(
+            b"SPLIT.BIN;1", 21, len(first_payload), flags=0x80,
+        )
+        + _iso_directory_record(final_identifier, 22, len(final_payload))
+    )
+    image[20 * block_size:20 * block_size + len(root)] = root
+    image[21 * block_size:21 * block_size + len(first_payload)] = first_payload
+    image[22 * block_size:22 * block_size + len(final_payload)] = final_payload
+    return bytes(image), first_payload + final_payload
+
+
 def _susp_entry(signature: bytes, data: bytes = b"") -> bytes:
     length = 4 + len(data)
     assert len(signature) == 2 and length <= 255
@@ -322,7 +361,9 @@ def _iso9660_with_rock_ridge(
     return bytes(image), payload
 
 
-def _iso9660_with_joliet_alias() -> tuple[bytes, bytes]:
+def _iso9660_with_joliet_alias(
+    *, multi_extent: bool = False,
+) -> tuple[bytes, bytes]:
     block_size = 2_048
     image = bytearray(25 * block_size)
     pvd_offset = 16 * block_size
@@ -365,11 +406,21 @@ def _iso9660_with_joliet_alias() -> tuple[bytes, bytes]:
     image[terminator + 1:terminator + 6] = b"CD001"
     image[terminator + 6] = 1
 
-    payload = b"CTF{joliet_extent_alias}"
+    final_payload = b"CTF{joliet_extent_alias}"
+    first_payload = b"A" * block_size if multi_extent else b""
+    payload = first_payload + final_payload
+    primary_file_records = (
+        _iso_directory_record(
+            b"FILE000.TXT;1", 23, len(first_payload), flags=0x80,
+        )
+        + _iso_directory_record(b"FILE000.TXT;1", 24, len(final_payload))
+        if multi_extent
+        else _iso_directory_record(b"FILE000.TXT;1", 24, len(final_payload))
+    )
     primary_root = (
         primary_root_record
         + _iso_directory_record(b"\x01", 20, block_size, flags=0x02)
-        + _iso_directory_record(b"FILE000.TXT;1", 24, len(payload))
+        + primary_file_records
     )
     image[20 * block_size:20 * block_size + len(primary_root)] = primary_root
     joliet_root = (
@@ -378,13 +429,24 @@ def _iso9660_with_joliet_alias() -> tuple[bytes, bytes]:
         + _iso_directory_record("증거".encode("utf-16-be"), 22, block_size, flags=0x02)
     )
     image[21 * block_size:21 * block_size + len(joliet_root)] = joliet_root
+    joliet_name = "깃발.txt;1".encode("utf-16-be")
+    joliet_file_records = (
+        _iso_directory_record(
+            joliet_name, 23, len(first_payload), flags=0x80,
+        )
+        + _iso_directory_record(joliet_name, 24, len(final_payload))
+        if multi_extent
+        else _iso_directory_record(joliet_name, 24, len(final_payload))
+    )
     joliet_directory = (
         _iso_directory_record(b"\x00", 22, block_size, flags=0x02)
         + _iso_directory_record(b"\x01", 21, block_size, flags=0x02)
-        + _iso_directory_record("깃발.txt;1".encode("utf-16-be"), 24, len(payload))
+        + joliet_file_records
     )
     image[22 * block_size:22 * block_size + len(joliet_directory)] = joliet_directory
-    image[24 * block_size:24 * block_size + len(payload)] = payload
+    if multi_extent:
+        image[23 * block_size:23 * block_size + len(first_payload)] = first_payload
+    image[24 * block_size:24 * block_size + len(final_payload)] = final_payload
     return bytes(image), payload
 
 
@@ -1748,6 +1810,123 @@ def test_iso9660_primary_volume_and_root_records_preserve_both_endian_extents(tm
     )
 
 
+def test_iso9660_multi_extent_chains_require_adjacent_matching_final_records(
+    tmp_path: Path,
+) -> None:
+    image, assembled = _iso9660_with_multi_extent_file()
+    evidence = tmp_path / "multi-extent.iso"
+    evidence.write_bytes(image)
+    artifact = _artifact(evidence)
+
+    observations = GenericTriageEngine().analyze(artifact, evidence)
+    values = _values(observations)
+    entries = values["archive.iso9660.root_directory_entries"]
+    head, tail = entries[2:4]
+    assert head["multi_extent"] is True
+    assert head["multi_extent_chain_role"] == "head"
+    assert head["multi_extent_chain_complete"] is True
+    assert head["multi_extent_assembled"] is True
+    assert head["assembled_data_length"] == len(assembled)
+    assert head["extraction_eligible"] is True
+    assert tail["multi_extent"] is False
+    assert tail["multi_extent_chain_role"] == "tail"
+    assert tail["multi_extent_segment_index"] == 1
+    assert tail["extraction_eligible"] is False
+    assert values["archive.iso9660.regular_files"] == [head]
+    chains = values["archive.iso9660.multi_extent_chains"]
+    assert len(chains) == 1
+    assert chains[0]["namespace"] == "primary"
+    assert chains[0]["complete"] is True
+    assert chains[0]["segment_count"] == 2
+    assert chains[0]["total_data_length"] == len(assembled)
+    assert [item["record_offset"] for item in chains[0]["segments"]] == [
+        head["record_offset"], tail["record_offset"],
+    ]
+    assert [item["data_offset"] for item in chains[0]["segments"]] == [
+        21 * 2_048, 22 * 2_048,
+    ]
+    assert values["archive.iso9660.multi_extent_errors"] == []
+    profile = ProfileEngine().evaluate(artifact, observations)
+    assert any(
+        item.category == "archive_multi_extent_metadata"
+        for item in profile.findings
+    )
+    assert not any(
+        item.category in {"archive_unsupported_layout", "iso9660_multi_extent_anomaly"}
+        for item in profile.findings
+    )
+
+    mismatch_image, _ = _iso9660_with_multi_extent_file(
+        final_identifier=b"OTHER.BIN;1",
+    )
+    mismatch_path = tmp_path / "multi-extent-mismatch.iso"
+    mismatch_path.write_bytes(mismatch_image)
+    mismatch_artifact = _artifact(mismatch_path)
+    mismatch_observations = GenericTriageEngine().analyze(
+        mismatch_artifact, mismatch_path,
+    )
+    mismatch_values = _values(mismatch_observations)
+    mismatch_head = mismatch_values["archive.iso9660.root_directory_entries"][2]
+    assert mismatch_head["multi_extent_chain_complete"] is False
+    assert mismatch_head["multi_extent_assembled"] is False
+    assert mismatch_head["extraction_eligible"] is False
+    error = mismatch_values["archive.iso9660.multi_extent_errors"][0]
+    assert "next_record_identifier_mismatch" in error["failed_checks"]
+    assert error["termination_record_offset"] == (
+        mismatch_values["archive.iso9660.root_directory_entries"][3]["record_offset"]
+    )
+    mismatch_profile = ProfileEngine().evaluate(
+        mismatch_artifact, mismatch_observations,
+    )
+    assert any(
+        item.category == "iso9660_multi_extent_anomaly"
+        for item in mismatch_profile.findings
+    )
+    assert any(
+        item.category == "archive_unsupported_layout"
+        for item in mismatch_profile.findings
+    )
+
+
+def test_iso9660_multi_extent_segment_limit_suppresses_overflow_tail() -> None:
+    block_size = 2_048
+    records: list[dict[str, object]] = []
+    directory_record_offset = 20 * block_size
+    for index in range(129):
+        raw = _iso_directory_record(
+            b"HUGE.BIN;1", 1_000 + index,
+            block_size if index < 128 else 1,
+            flags=0x80 if index < 128 else 0,
+        )
+        record, error = GenericTriageEngine._iso9660_directory_record(
+            raw,
+            record_offset=directory_record_offset,
+            logical_block_size=block_size,
+            evidence_size=2_000 * block_size,
+            declared_volume_bytes=2_000 * block_size,
+        )
+        assert error is None
+        record["archive_path"] = "HUGE.BIN"
+        records.append(record)
+        directory_record_offset += len(raw)
+
+    chains, errors = GenericTriageEngine()._iso9660_assemble_multi_extents(
+        records, namespace="primary",
+    )
+
+    assert len(chains) == 1
+    assert chains[0]["complete"] is False
+    assert chains[0]["segment_count"] == 128
+    assert chains[0]["termination_reason"] == "segment_limit"
+    assert chains[0]["overflow_segment_count"] == 1
+    assert chains[0]["overflow_record_offsets"] == [records[-1]["record_offset"]]
+    assert errors[0]["failed_checks"] == ["segment_limit"]
+    assert records[0]["multi_extent_chain_role"] == "head"
+    assert records[0]["extraction_eligible"] is False
+    assert records[-1]["multi_extent_chain_role"] == "overflow"
+    assert records[-1]["extraction_eligible"] is False
+
+
 def test_iso9660_subdirectory_traversal_preserves_paths_and_rejects_shared_extents(
     tmp_path: Path,
 ) -> None:
@@ -2225,6 +2404,45 @@ def test_iso9660_joliet_tree_reconciles_ucs2_path_to_primary_extent(
         item.category == "iso9660_joliet_anomaly"
         for item in profile.findings
     )
+
+
+def test_iso9660_joliet_multi_extent_alias_requires_identical_ordered_ranges(
+    tmp_path: Path,
+) -> None:
+    block_size = 2_048
+    image, payload = _iso9660_with_joliet_alias(multi_extent=True)
+    evidence = tmp_path / "joliet-multi-extent.iso"
+    evidence.write_bytes(image)
+    artifact = _artifact(evidence)
+
+    observations = GenericTriageEngine().analyze(artifact, evidence)
+    values = _values(observations)
+    assert values["archive.iso9660.multi_extent_errors"] == []
+    chains = values["archive.iso9660.multi_extent_chains"]
+    assert [item["namespace"] for item in chains] == ["primary", "joliet"]
+    assert all(item["complete"] is True for item in chains)
+    aliases = values["archive.iso9660.joliet_extent_aliases"]
+    assert len(aliases) == 1
+    assert aliases[0]["data_offset"] is None
+    assert aliases[0]["data_length"] is None
+    assert aliases[0]["logical_extent_segments"] == [
+        {"data_offset": 23 * block_size, "data_length": block_size},
+        {
+            "data_offset": 24 * block_size,
+            "data_length": len(b"CTF{joliet_extent_alias}"),
+        },
+    ]
+    assert aliases[0]["assembled_data_length"] == len(payload)
+    primary_files = values["archive.iso9660.regular_files"]
+    joliet_files = values["archive.iso9660.joliet_regular_files"]
+    assert len(primary_files) == 1
+    assert len(joliet_files) == 1
+    assert primary_files[0]["archive_path"] == "증거/깃발.txt"
+    assert primary_files[0]["archive_name_source"] == "joliet_extent_alias"
+    assert primary_files[0]["extraction_eligible"] is True
+    assert joliet_files[0]["extraction_reconciled_to_primary"] is True
+    assert joliet_files[0]["extraction_eligible"] is False
+    assert values["archive.iso9660.joliet_reconciliation_errors"] == []
 
 
 def test_iso9660_el_torito_catalog_validates_declared_boot_image_range(

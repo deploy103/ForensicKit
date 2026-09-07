@@ -49,6 +49,7 @@ Notable user-facing changes are documented here. This project follows Semantic V
 - Rock Ridge `CE` continuation areas now resolve under global byte/count/depth and overlap bounds; continued names retain exact source/hash provenance and are revalidated before extraction, while cycles or partial continuations remain metadata-only.
 - Rock Ridge short/long `TF` timestamps now retain raw offsets and normalized UTC, while both-endian `PN` device numbers are reported without ever materializing device nodes.
 - Rock Ridge `CL`/`PL`/`RE` relocation roles and target blocks are validated and reconciled to known directory extents, but remain deliberately non-traversing metadata to avoid inferred paths and cycles.
+- Adjacent ISO 9660 multi-extent regular-file records can now form one bounded child after identifier/version, non-final alignment, range, overlap, terminator, and per-record provenance validation; primary/Joliet aliases require the same ordered extent sequence, while incomplete or over-limit chains remain wholly metadata-only.
 
 ## [1.1.0] - 2026-09-04
 
