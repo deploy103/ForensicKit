@@ -230,6 +230,110 @@ def _rrip_link(signature: bytes, block: int) -> bytes:
     return _susp_entry(signature, _iso_both32(block))
 
 
+def _rrip_zf(
+    uncompressed_size: int, *, header_size_words: int = 4, block_shift: int = 9,
+) -> bytes:
+    return _susp_entry(
+        b"ZF",
+        b"pz" + bytes((header_size_words, block_shift))
+        + _iso_both32(uncompressed_size),
+    )
+
+
+def _zisofs_stream(
+    payload: bytes, *, corrupt_pointer_order: bool = False,
+) -> bytes:
+    block_shift = 9
+    blocks = [
+        payload[offset:offset + (1 << block_shift)]
+        for offset in range(0, len(payload), 1 << block_shift)
+    ]
+    pointer_table_end = 16 + 4 * (len(blocks) + 1)
+    pointers = [pointer_table_end]
+    compressed_blocks: list[bytes] = []
+    for block in blocks:
+        if any(block):
+            compressor = zlib.compressobj(level=9, wbits=-15)
+            compressed = compressor.compress(block) + compressor.flush()
+        else:
+            compressed = b""
+        compressed_blocks.append(compressed)
+        pointers.append(pointers[-1] + len(compressed))
+    if corrupt_pointer_order:
+        assert len(pointers) >= 3
+        pointers[-2] = pointers[-1] + 1
+    header = (
+        bytes.fromhex("37e45396c9dbd607")
+        + len(payload).to_bytes(4, "little")
+        + bytes((4, block_shift, 0, 0))
+    )
+    return (
+        header
+        + b"".join(pointer.to_bytes(4, "little") for pointer in pointers)
+        + b"".join(compressed_blocks)
+    )
+
+
+def _iso9660_with_zisofs(
+    *, corrupt_pointer_order: bool = False, duplicate_claim: bool = False,
+) -> tuple[bytes, bytes, bytes]:
+    block_size = 2_048
+    logical_payload = b"A" * 512 + b"\x00" * 88
+    stored_payload = _zisofs_stream(
+        logical_payload, corrupt_pointer_order=corrupt_pointer_order,
+    )
+    image = bytearray(23 * block_size)
+    pvd_offset = 16 * block_size
+    pvd = memoryview(image)[pvd_offset:pvd_offset + block_size]
+    pvd[0] = 1
+    pvd[1:6] = b"CD001"
+    pvd[6] = 1
+    pvd[8:40] = b"FORENSICKIT".ljust(32, b" ")
+    pvd[40:72] = b"ZISOFS_METADATA".ljust(32, b" ")
+    pvd[80:88] = _iso_both32(23)
+    pvd[120:124] = _iso_both16(1)
+    pvd[124:128] = _iso_both16(1)
+    pvd[128:132] = _iso_both16(block_size)
+    pvd[132:140] = _iso_both32(0)
+    root_record = _iso_directory_record(b"\x00", 20, block_size, flags=0x02)
+    pvd[156:156 + len(root_record)] = root_record
+    terminator = 17 * block_size
+    image[terminator] = 255
+    image[terminator + 1:terminator + 6] = b"CD001"
+    image[terminator + 6] = 1
+
+    skip_prefix = b"\x00\x00"
+    rrip_identifier = b"RRIP_1991A"
+    root_system_use = (
+        skip_prefix
+        + _susp_entry(b"SP", b"\xbe\xef\x02")
+        + _susp_entry(
+            b"ER", bytes((len(rrip_identifier), 0, 0, 1)) + rrip_identifier,
+        )
+        + _rrip_px(0o040755, links=2, uid=0, gid=0)
+        + _susp_entry(b"ST")
+    )
+    file_system_use = (
+        skip_prefix
+        + _rrip_px(0o100644)
+        + _susp_entry(b"NM", b"\x00Compressed Evidence.bin")
+        + _rrip_zf(len(logical_payload)) * (2 if duplicate_claim else 1)
+        + _susp_entry(b"ST")
+    )
+    root = (
+        _iso_directory_record(
+            b"\x00", 20, block_size, flags=0x02, system_use=root_system_use,
+        )
+        + _iso_directory_record(b"\x01", 20, block_size, flags=0x02)
+        + _iso_directory_record(
+            b"ZISOFS.BIN;1", 21, len(stored_payload), system_use=file_system_use,
+        )
+    )
+    image[20 * block_size:20 * block_size + len(root)] = root
+    image[21 * block_size:21 * block_size + len(stored_payload)] = stored_payload
+    return bytes(image), logical_payload, stored_payload
+
+
 def _iso9660_with_rock_ridge(
     *, unsafe_file_name: bool = False, continued_name: bool = False,
     continuation_cycle: bool = False,
@@ -2502,6 +2606,146 @@ def test_iso9660_rock_ridge_px_hard_links_require_exact_shared_extents(
         item.category == "iso9660_rock_ridge_hard_link_anomaly"
         for item in mismatch_profile.findings
     )
+
+
+def test_iso9660_rock_ridge_zisofs_metadata_is_validated_without_decompression(
+    tmp_path: Path,
+) -> None:
+    image, logical_payload, stored_payload = _iso9660_with_zisofs()
+    evidence = tmp_path / "zisofs.iso"
+    evidence.write_bytes(image)
+    artifact = _artifact(evidence)
+    observations = GenericTriageEngine().analyze(artifact, evidence)
+    values = _values(observations)
+
+    regular = values["archive.iso9660.regular_files"][0]
+    assert regular["archive_path"] == "Compressed Evidence.bin"
+    assert regular["rock_ridge_zisofs"] is True
+    assert regular["extraction_eligible"] is False
+    claim = regular["rock_ridge_zisofs_claim"]
+    assert claim["algorithm"] == "pz"
+    assert claim["header_size_words"] == 4
+    assert claim["header_size_bytes"] == 16
+    assert claim["block_shift"] == 9
+    assert claim["block_size"] == 512
+    assert claim["uncompressed_size"] == len(logical_payload)
+    assert isinstance(claim["source_absolute_offset"], int)
+    zf_entry = regular["rock_ridge_zisofs_entries"][0]
+    assert zf_entry["valid"] is True
+    assert zf_entry["uncompressed_size_both_endian_match"] is True
+
+    records = values["archive.iso9660.rock_ridge_zisofs"]
+    assert len(records) == 1
+    record = records[0]
+    data_offset = 21 * 2_048
+    pointer_table_end = 28
+    assert record["valid"] is True
+    assert record["failed_checks"] == []
+    assert record["data_offset"] == data_offset
+    assert record["stored_length"] == len(stored_payload)
+    assert record["stored_end_offset"] == data_offset + len(stored_payload)
+    assert record["header_offset"] == data_offset
+    assert record["header_length"] == 16
+    assert record["header_end_offset"] == data_offset + 16
+    assert record["magic_raw_hex"] == "37e45396c9dbd607"
+    assert record["magic_valid"] is True
+    assert record["uncompressed_size"] == len(logical_payload)
+    assert record["block_count"] == 2
+    assert record["pointer_count"] == 3
+    assert record["pointer_table_offset"] == data_offset + 16
+    assert record["pointer_table_length"] == 12
+    assert record["pointer_table_end_offset"] == data_offset + pointer_table_end
+    assert record["pointer_table_end_relative"] == pointer_table_end
+    assert record["metadata_offset"] == data_offset
+    assert record["metadata_length"] == pointer_table_end
+    assert record["metadata_end_offset"] == data_offset + pointer_table_end
+    assert record["metadata_raw_sha256"] == hashlib.sha256(
+        stored_payload[:pointer_table_end]
+    ).hexdigest()
+    assert record["pointer_table_raw_sha256"] == hashlib.sha256(
+        stored_payload[16:pointer_table_end]
+    ).hexdigest()
+    assert record["pointers"][0] == pointer_table_end
+    assert record["pointers"][-1] == len(stored_payload)
+    assert record["compressed_blocks"][0]["zero_fill"] is False
+    assert record["compressed_blocks"][0]["data_offset"] == (
+        data_offset + pointer_table_end
+    )
+    assert record["compressed_blocks"][1]["zero_fill"] is True
+    assert record["compressed_blocks"][1]["compressed_length"] == 0
+    assert record["decompression_performed"] is False
+    assert record["extraction_eligible"] is False
+    assert regular["rock_ridge_zisofs_validation"] == record
+    assert values["archive.iso9660.rock_ridge_zisofs_errors"] == []
+    assert values["archive.iso9660.susp_errors"] == []
+
+    profile = ProfileEngine().evaluate(artifact, observations)
+    finding = next(
+        item for item in profile.findings
+        if item.category == "archive_compression_metadata"
+    )
+    assert finding.severity == "info"
+    assert not any(
+        item.category == "iso9660_zisofs_anomaly"
+        for item in profile.findings
+    )
+
+
+def test_iso9660_rock_ridge_zisofs_rejects_nonmonotonic_pointer_table(
+    tmp_path: Path,
+) -> None:
+    image, _, _ = _iso9660_with_zisofs(corrupt_pointer_order=True)
+    evidence = tmp_path / "bad-zisofs.iso"
+    evidence.write_bytes(image)
+    artifact = _artifact(evidence)
+    observations = GenericTriageEngine().analyze(artifact, evidence)
+    values = _values(observations)
+
+    regular = values["archive.iso9660.regular_files"][0]
+    record = values["archive.iso9660.rock_ridge_zisofs"][0]
+    assert regular["extraction_eligible"] is False
+    assert record["valid"] is False
+    assert "pointer_order" in record["failed_checks"]
+    assert "pointer_within_stored_stream" in record["failed_checks"]
+    assert "compressed_block_1_length" in record["failed_checks"]
+    errors = values["archive.iso9660.rock_ridge_zisofs_errors"]
+    assert errors == [{
+        "reason": "invalid_zisofs_metadata",
+        "record_offset": regular["record_offset"],
+        "archive_path": "Compressed Evidence.bin",
+        "failed_checks": record["failed_checks"],
+    }]
+    profile = ProfileEngine().evaluate(artifact, observations)
+    finding = next(
+        item for item in profile.findings
+        if item.category == "iso9660_zisofs_anomaly"
+    )
+    assert finding.severity == "medium"
+    assert not any(
+        item.category == "archive_compression_metadata"
+        for item in profile.findings
+    )
+
+    duplicate_image, _, _ = _iso9660_with_zisofs(duplicate_claim=True)
+    duplicate_path = tmp_path / "duplicate-zf.iso"
+    duplicate_path.write_bytes(duplicate_image)
+    duplicate_values = _values(GenericTriageEngine().analyze(
+        _artifact(duplicate_path), duplicate_path,
+    ))
+    duplicate_regular = duplicate_values["archive.iso9660.regular_files"][0]
+    assert "duplicate_rock_ridge_zisofs" in duplicate_regular[
+        "rock_ridge_anomalies"
+    ]
+    assert "invalid_rock_ridge_zisofs_claim" in duplicate_regular[
+        "rock_ridge_anomalies"
+    ]
+    assert "rock_ridge_zisofs_claim" not in duplicate_regular
+    duplicate_record = duplicate_values[
+        "archive.iso9660.rock_ridge_zisofs"
+    ][0]
+    assert duplicate_record["valid"] is False
+    assert duplicate_record["failed_checks"] == ["unique_valid_zf_claim"]
+    assert duplicate_values["archive.iso9660.rock_ridge_zisofs_errors"]
 
 
 def test_iso9660_joliet_tree_reconciles_ucs2_path_to_primary_extent(

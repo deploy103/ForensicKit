@@ -141,6 +141,41 @@ def _rrip_link(signature: bytes, block: int) -> bytes:
     return _susp_entry(signature, data)
 
 
+def _rrip_zf(uncompressed_size: int) -> bytes:
+    data = (
+        b"pz\x04\x09"
+        + uncompressed_size.to_bytes(4, "little")
+        + uncompressed_size.to_bytes(4, "big")
+    )
+    return _susp_entry(b"ZF", data)
+
+
+def _zisofs_stream(payload: bytes) -> bytes:
+    block_shift = 9
+    blocks = [
+        payload[offset:offset + (1 << block_shift)]
+        for offset in range(0, len(payload), 1 << block_shift)
+    ]
+    pointer_table_end = 16 + 4 * (len(blocks) + 1)
+    pointers = [pointer_table_end]
+    compressed_blocks: list[bytes] = []
+    for block in blocks:
+        if any(block):
+            compressor = zlib.compressobj(level=9, wbits=-15)
+            compressed = compressor.compress(block) + compressor.flush()
+        else:
+            compressed = b""
+        compressed_blocks.append(compressed)
+        pointers.append(pointers[-1] + len(compressed))
+    return (
+        bytes.fromhex("37e45396c9dbd607")
+        + len(payload).to_bytes(4, "little")
+        + bytes((4, block_shift, 0, 0))
+        + b"".join(pointer.to_bytes(4, "little") for pointer in pointers)
+        + b"".join(compressed_blocks)
+    )
+
+
 def _iso9660_with_root_file(name: bytes, payload: bytes) -> bytes:
     block_size = 2_048
     image = bytearray(23 * block_size)
@@ -221,7 +256,7 @@ def _iso9660_with_nested_file(
     name: bytes, payload: bytes, *, rock_ridge: bool = False,
     path_tables: bool = False, rock_ridge_continuation: bool = False,
     rock_ridge_relocation: bool = False, hard_links: bool = False,
-    hard_link_extent_mismatch: bool = False,
+    hard_link_extent_mismatch: bool = False, zisofs: bool = False,
 ) -> bytes:
     block_size = 2_048
     image = bytearray(25 * block_size)
@@ -310,6 +345,7 @@ def _iso9660_with_nested_file(
     root = root_self + parent + directory
     image[20 * block_size:20 * block_size + len(root)] = root
     if rock_ridge:
+        stored_payload = _zisofs_stream(payload) if zisofs else payload
         continuation_area = (
             _susp_entry(b"NM", b"\x00Evidence.txt") + _susp_entry(b"ST")
         )
@@ -332,7 +368,7 @@ def _iso9660_with_nested_file(
                 system_use=skip_prefix + _rrip_px(0o040755, links=2) + _susp_entry(b"ST"),
             )
             + _iso_directory_record(
-                name, 23, len(payload),
+                name, 23, len(stored_payload),
                 system_use=(
                     skip_prefix
                     + _rrip_px(
@@ -340,6 +376,7 @@ def _iso9660_with_nested_file(
                         serial=42 if hard_links else 1,
                     )
                     + _rrip_tf_short(bytes((124, 2, 3, 4, 5, 6, 4)))
+                    + (_rrip_zf(len(payload)) if zisofs else b"")
                     + file_name_system_use
                     + _susp_entry(b"ST")
                 ),
@@ -379,13 +416,14 @@ def _iso9660_with_nested_file(
                 continuation_offset:continuation_offset + len(continuation_area)
             ] = continuation_area
     else:
+        stored_payload = payload
         subdirectory = (
             _iso_directory_record(b"\x00", 22, block_size, flags=0x02)
             + _iso_directory_record(b"\x01", 20, block_size, flags=0x02)
             + _iso_directory_record(name, 23, len(payload))
         )
     image[22 * block_size:22 * block_size + len(subdirectory)] = subdirectory
-    image[23 * block_size:23 * block_size + len(payload)] = payload
+    image[23 * block_size:23 * block_size + len(stored_payload)] = stored_payload
     if hard_links and hard_link_extent_mismatch:
         mismatch_payload = b"different-hard-link-payload"
         image[24 * block_size:24 * block_size + len(mismatch_payload)] = mismatch_payload
@@ -1126,6 +1164,53 @@ def test_iso9660_rock_ridge_hard_link_alias_extracts_one_canonical_child(
     assert "rock_ridge_hard_link_groups" in report
     assert "Alias Evidence.txt" in report
     assert "archive_hard_link_metadata" in report
+
+
+def test_iso9660_zisofs_remains_metadata_only_in_auto_analysis(
+    tmp_path: Path,
+) -> None:
+    logical_payload = b"A" * 512 + b"\x00" * 88
+    evidence = tmp_path / "zisofs.iso"
+    evidence.write_bytes(_iso9660_with_nested_file(
+        b"ZISOFS.BIN;1", logical_payload, rock_ridge=True, zisofs=True,
+    ))
+
+    result = AnalysisEngine().analyze(
+        evidence, tmp_path / "zisofs-cases", mode=AnalysisMode.AUTO,
+        execute=False,
+    )
+
+    assert [item.logical_name for item in result.artifacts] == ["zisofs.iso"]
+    assert any(
+        "zisofs compressed stream is metadata-only" in error
+        for error in result.errors
+    )
+    records = next(
+        item.value for item in result.observations
+        if item.artifact_id == result.artifacts[0].id
+        and item.key == "archive.iso9660.rock_ridge_zisofs"
+    )
+    assert len(records) == 1
+    assert records[0]["valid"] is True
+    assert records[0]["decompression_performed"] is False
+    assert records[0]["extraction_eligible"] is False
+    assert records[0]["compressed_blocks"][1]["zero_fill"] is True
+    assert any(
+        item.category == "archive_compression_metadata"
+        and item.severity == "info"
+        for item in result.findings
+    )
+    assert not any(
+        item.source == "builtin_iso9660_extractor"
+        for item in result.findings
+    )
+    report = next(
+        (tmp_path / "zisofs-cases").glob("*/reports/report.json")
+    ).read_text(encoding="utf-8")
+    assert "archive.iso9660.rock_ridge_zisofs" in report
+    assert "rock_ridge_zisofs_validation" in report
+    assert '"decompression_performed": false' in report
+    assert "archive_compression_metadata" in report
 
 
 def test_iso9660_joliet_extent_alias_recurses_once_with_ucs2_lineage(

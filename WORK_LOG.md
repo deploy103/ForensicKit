@@ -1,5 +1,18 @@
 # ForensicKit Work Log
 
+## 2026-09-07 13:38 KST
+
+### Rock Ridge ZF / zisofs metadata validation
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/extraction.py`, `src/forensickit/profiles/archive.py`, `tests/test_triage.py`, and `tests/test_engine_pipeline.py`.
+- RRIP `ZF` entries now require exact 16-byte framing, the supported `pz` algorithm, a 4-255-word header, a 9-17 block shift, and matching both-endian uncompressed size. A unique valid claim marks the regular-file extent as zisofs and permanently excludes the stored compressed bytes from ordinary ISO extraction; duplicate, malformed, or contradictory claims remain explicit SUSP and zisofs anomalies.
+- Single-extent streams receive an exact 16-byte zisofs-header read followed by a bounded metadata-only pointer-table read. The validator cross-checks the ZF claim, magic, reserved bytes, configured decompressed-size limit, stored/evidence/declared-volume ranges, at most 65,536 pointers and 1 MiB of metadata, monotonic stream-relative pointers, exact final stored length, and per-block deflate-bound lengths. Header/table offsets, raw header, hashes, every pointer, compressed block range, and zero-fill blocks remain provenance; no decompression or child creation occurs.
+- Synthetic triage covers a valid two-block stream with a zero-fill block and exact hashes/offsets, a nonmonotonic/out-of-range pointer table, and a duplicate ZF claim. AUTO E2E proves valid metadata and the informational finding persist in JSON while the compressed stream yields no speculative child and produces a clear metadata-only skip reason. Focused triage/Engine regressions passed: 179 passed, 0 failed. The full direct synthetic suite passed: 340 passed, 0 failed. `python -m compileall -q src tests scripts` and `git diff --check` passed.
+
+### Next
+
+- Add bounded zisofs block decompression only after independently revalidating every stored metadata byte and enforcing exact per-block output, total output, recursion, and cumulative extraction limits.
+
 ## 2026-09-07 13:09 KST
 
 ### El Torito hard-disk-emulation MBR metadata

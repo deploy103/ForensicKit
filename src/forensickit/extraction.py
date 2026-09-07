@@ -542,6 +542,10 @@ class ExtractionManager:
                         result.errors.append(
                             f"skipped ISO member {name!r}: Rock Ridge symbolic link is metadata-only"
                         )
+                    elif record.get("rock_ridge_zisofs") is True:
+                        result.errors.append(
+                            f"skipped ISO member {name!r}: zisofs compressed stream is metadata-only"
+                        )
                     elif record.get("rock_ridge_non_regular") is True:
                         result.errors.append(
                             f"skipped ISO member {name!r}: Rock Ridge special file is metadata-only"
