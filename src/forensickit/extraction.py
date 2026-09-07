@@ -534,7 +534,15 @@ class ExtractionManager:
                     result.errors.append(f"skipped ISO member {name!r}: unsafe path")
                     continue
                 if record.get("extraction_eligible") is not True:
-                    if (
+                    if record.get("rock_ridge_symlink") is True:
+                        result.errors.append(
+                            f"skipped ISO member {name!r}: Rock Ridge symbolic link is metadata-only"
+                        )
+                    elif record.get("rock_ridge_non_regular") is True:
+                        result.errors.append(
+                            f"skipped ISO member {name!r}: Rock Ridge special file is metadata-only"
+                        )
+                    elif (
                         record.get("multi_extent") is True
                         or record.get("file_unit_size") not in {0, None}
                         or record.get("interleave_gap_size") not in {0, None}
@@ -555,6 +563,7 @@ class ExtractionManager:
                 data_offset = record.get("data_offset")
                 data_length = record.get("data_length")
                 identifier_raw_hex = record.get("identifier_raw_hex")
+                record_raw_hex = record.get("record_raw_hex")
                 if (
                     isinstance(record_offset, bool) or not isinstance(record_offset, int)
                     or isinstance(record_length, bool) or not isinstance(record_length, int)
@@ -565,6 +574,7 @@ class ExtractionManager:
                     or isinstance(data_offset, bool) or not isinstance(data_offset, int)
                     or isinstance(data_length, bool) or not isinstance(data_length, int)
                     or not isinstance(identifier_raw_hex, str)
+                    or not isinstance(record_raw_hex, str)
                     or record_offset < 0 or not 34 <= record_length <= 255
                     or block_size < 512 or block_size > 32_768
                     or block_size != pvd_block_size
@@ -585,6 +595,7 @@ class ExtractionManager:
                     if (
                         len(raw_record) != record_length
                         or raw_record[0] != record_length
+                        or raw_record.hex() != record_raw_hex
                         or raw_record[1] != extended_attribute_blocks
                         or 33 + identifier_length > record_length
                         or raw_identifier.hex() != identifier_raw_hex

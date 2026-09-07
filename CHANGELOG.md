@@ -41,6 +41,7 @@ Notable user-facing changes are documented here. This project follows Semantic V
 - Primary MBR, EBR logical, and CRC-eligible GPT data extents now receive bounded cross-table duplicate/overlap analysis; every competing entry retains exact range provenance and is barred from recursive copying, while extended/protective MBR containers are inventoried but excluded from expected-containment conflicts.
 - Portable ASCII `odc` and SVR4 CPIO `newc`/CRC archives now receive bounded native format-specific entry/trailer/path/checksum inventory and regular-file extraction with exact byte-range provenance; links, special files, and unsafe names remain metadata-only.
 - ISO 9660 images now receive bounded descriptor/PVD/root and active-subdirectory parsing with both-endian, block-boundary, dot/dotdot, and shared/cyclic-extent validation; safe single-extent files can recursively re-enter analysis with exact descriptor, record, byte-range, archive-path, and directory-identity lineage.
+- Valid root-self SUSP markers now enable bounded inline Rock Ridge parsing: safe continuation-aware `NM` names and `PX` POSIX metadata enrich ISO lineage, while malformed/unsafe metadata, `SL` symlinks, and POSIX special files remain raw evidence and cannot be materialized.
 
 ## [1.1.0] - 2026-09-04
 
