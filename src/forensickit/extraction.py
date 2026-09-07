@@ -315,7 +315,7 @@ class ExtractionManager:
         return result
 
     def extract_cpio(self, artifact: Artifact) -> ExtractionResult:
-        """Copy bounded regular-file ranges from native newc/CRC observations."""
+        """Copy bounded regular-file ranges from native CPIO observations."""
         result = ExtractionResult()
         entry_observation = next(
             (
@@ -343,6 +343,8 @@ class ExtractionManager:
                     continue
                 name = record.get("name")
                 header_offset = record.get("header_offset")
+                header_length = record.get("header_length")
+                alignment = record.get("alignment")
                 name_offset = record.get("name_offset")
                 name_size = record.get("name_size_including_nul")
                 data_offset = record.get("data_offset")
@@ -354,18 +356,29 @@ class ExtractionManager:
                     continue
                 if (
                     isinstance(header_offset, bool) or not isinstance(header_offset, int)
+                    or isinstance(header_length, bool) or not isinstance(header_length, int)
+                    or isinstance(alignment, bool) or not isinstance(alignment, int)
                     or isinstance(name_offset, bool) or not isinstance(name_offset, int)
                     or isinstance(name_size, bool) or not isinstance(name_size, int)
                     or isinstance(data_offset, bool) or not isinstance(data_offset, int)
                     or isinstance(data_length, bool) or not isinstance(data_length, int)
-                    or header_offset < 0 or name_offset != header_offset + 110
+                    or header_offset < 0 or name_offset != header_offset + header_length
+                    or magic not in {"070701", "070702", "070707"}
+                    or (magic == "070707" and (header_length != 76 or alignment != 2))
+                    or (magic in {"070701", "070702"} and (header_length != 110 or alignment != 4))
                     or not 1 <= name_size <= 4_096
                     or data_offset != (
-                        name_offset + name_size + (-(name_offset + name_size)) % 4
+                        name_offset + name_size + (-(name_offset + name_size)) % alignment
                     )
                     or data_length < 0 or data_offset + data_length > artifact.size
-                    or magic not in {"070701", "070702"}
-                    or isinstance(stored_checksum, bool) or not isinstance(stored_checksum, int)
+                    or (
+                        magic in {"070701", "070702"}
+                        and (
+                            isinstance(stored_checksum, bool)
+                            or not isinstance(stored_checksum, int)
+                        )
+                    )
+                    or (magic == "070707" and stored_checksum is not None)
                 ):
                     result.errors.append(f"skipped CPIO member {name!r}: invalid observed byte range")
                     continue
@@ -375,16 +388,35 @@ class ExtractionManager:
                     continue
                 try:
                     source_stream.seek(header_offset)
-                    raw_header = source_stream.read(110)
-                    if (
-                        len(raw_header) != 110
-                        or raw_header[:6].decode("ascii", errors="replace") != magic
-                        or int(raw_header[14:22], 16) & 0o170000 != 0o100000
-                        or int(raw_header[54:62], 16) != data_length
-                        or int(raw_header[94:102], 16) != name_size
-                        or int(raw_header[102:110], 16) != stored_checksum
-                    ):
+                    raw_header = source_stream.read(header_length)
+                    if len(raw_header) != header_length or raw_header[:6].decode(
+                        "ascii", errors="replace"
+                    ) != magic:
                         raise RuntimeError("header no longer matches triage provenance")
+                    if magic == "070707":
+                        if any(byte not in b"01234567" for byte in raw_header[6:]):
+                            raise RuntimeError("odc header has a non-octal field")
+                        raw_mode = int(raw_header[18:24], 8)
+                        raw_name_size = int(raw_header[59:65], 8)
+                        raw_data_length = int(raw_header[65:76], 8)
+                        raw_stored_checksum = None
+                    else:
+                        if any(
+                            byte not in b"0123456789abcdefABCDEF"
+                            for byte in raw_header[6:]
+                        ):
+                            raise RuntimeError("newc header has a non-hex field")
+                        raw_mode = int(raw_header[14:22], 16)
+                        raw_data_length = int(raw_header[54:62], 16)
+                        raw_name_size = int(raw_header[94:102], 16)
+                        raw_stored_checksum = int(raw_header[102:110], 16)
+                    if (
+                        raw_mode & 0o170000 != 0o100000
+                        or raw_data_length != data_length
+                        or raw_name_size != name_size
+                        or raw_stored_checksum != stored_checksum
+                    ):
+                        raise RuntimeError("header fields no longer match triage provenance")
                     source_stream.seek(name_offset)
                     raw_name = source_stream.read(name_size)
                     if (
@@ -449,8 +481,8 @@ class ExtractionManager:
                 confidence=0.99,
                 explanation=(
                     "Only regular files with relative non-traversing paths and exact image-bounded "
-                    "newc/CRC ranges were copied. Directories, links, and device/special entries "
-                    "remain metadata-only; CRC entries retain a byte-sum verdict computed while copying."
+                    "CPIO ranges were copied. Directories, links, and device/special entries remain "
+                    "metadata-only; CRC entries retain a byte-sum verdict computed while copying."
                 ),
                 source="builtin_cpio_extractor",
                 supporting_evidence=evidence[:128],

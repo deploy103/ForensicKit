@@ -59,6 +59,7 @@ _SIGNATURES = (
     _Signature("rar5", "rar", b"Rar!\x1a\x07\x01\x00"),
     _Signature("cpio_newc", "cpio", b"070701"),
     _Signature("cpio_crc", "cpio", b"070702"),
+    _Signature("cpio_odc", "cpio", b"070707"),
     _Signature("bzip2", "bzip2", b"BZh"),
     _Signature("xz", "xz", b"\xfd7zXZ\x00"),
     _Signature("ewf", "ewf", b"EVF\x09\x0d\x0a\xff\x00"),
@@ -258,7 +259,7 @@ class GenericTriageEngine:
         if detected_format == "gzip":
             observations.extend(self._inspect_gzip_header(artifact, header))
         if detected_format == "cpio":
-            observations.extend(self._inspect_cpio_newc(artifact, path, actual_size))
+            observations.extend(self._inspect_cpio(artifact, path, actual_size))
         if detected_format in {"pcap", "pcapng"}:
             observations.extend(PcapObservationEngine(max_bytes=self.limits.signature_scan_bytes).analyze(artifact, path))
         if detected_format == "sqlite":
@@ -723,10 +724,10 @@ class GenericTriageEngine:
             self._observation(artifact, "archive.tar.structure_error", error),
         ]
 
-    def _inspect_cpio_newc(
+    def _inspect_cpio(
         self, artifact: Artifact, path: Path, size: int,
     ) -> list[Observation]:
-        """Walk a bounded SVR4 newc/CRC archive without materializing members."""
+        """Walk a bounded portable-ASCII or SVR4 CPIO archive without extraction."""
         entries: list[dict[str, object]] = []
         invalid_checksums: list[dict[str, object]] = []
         formats: set[str] = set()
@@ -740,7 +741,7 @@ class GenericTriageEngine:
         checksum_budget = min(self.limits.signature_scan_bytes, 16 * _MIB)
         checksum_bytes_read = 0
         bytes_read = 0
-        magic_names = {b"070701": "newc", b"070702": "crc"}
+        magic_names = {b"070701": "newc", b"070702": "crc", b"070707": "odc"}
         type_names = {
             0o010000: "fifo",
             0o020000: "character",
@@ -750,7 +751,7 @@ class GenericTriageEngine:
             0o120000: "symlink",
             0o140000: "socket",
         }
-        field_names = (
+        newc_field_names = (
             "inode", "mode", "uid", "gid", "link_count", "mtime",
             "file_size", "device_major", "device_minor",
             "rdevice_major", "rdevice_minor", "name_size", "checksum",
@@ -758,33 +759,61 @@ class GenericTriageEngine:
         try:
             with path.open("rb") as stream:
                 while len(entries) < entry_limit:
-                    if cursor + 110 > size:
+                    if cursor + 6 > size:
                         structure_error = f"truncated CPIO header at offset {cursor}"
                         break
-                    if cursor + 110 > scan_limit:
+                    if cursor + 6 > scan_limit:
                         scan_truncated = True
                         break
                     stream.seek(cursor)
-                    header = stream.read(110)
-                    bytes_read += len(header)
-                    if len(header) != 110:
-                        structure_error = f"truncated CPIO header at offset {cursor}"
-                        break
-                    magic = header[:6]
+                    magic = stream.read(6)
+                    bytes_read += len(magic)
                     format_name = magic_names.get(magic)
                     if format_name is None:
-                        structure_error = f"invalid CPIO newc magic at offset {cursor}"
+                        structure_error = f"invalid CPIO magic at offset {cursor}"
+                        break
+                    header_length = 76 if format_name == "odc" else 110
+                    alignment = 2 if format_name == "odc" else 4
+                    numeric_encoding = "octal" if format_name == "odc" else "hexadecimal"
+                    if cursor + header_length > size:
+                        structure_error = f"truncated CPIO header at offset {cursor}"
+                        break
+                    if cursor + header_length > scan_limit:
+                        scan_truncated = True
+                        break
+                    stream.seek(cursor)
+                    header = stream.read(header_length)
+                    bytes_read += len(header)
+                    if len(header) != header_length:
+                        structure_error = f"truncated CPIO header at offset {cursor}"
                         break
                     formats.add(format_name)
-                    try:
+                    if format_name == "odc":
+                        if any(byte not in b"01234567" for byte in header[6:]):
+                            structure_error = f"non-octal CPIO odc header field at offset {cursor}"
+                            break
+                        fields = {
+                            "device": int(header[6:12], 8),
+                            "inode": int(header[12:18], 8),
+                            "mode": int(header[18:24], 8),
+                            "uid": int(header[24:30], 8),
+                            "gid": int(header[30:36], 8),
+                            "link_count": int(header[36:42], 8),
+                            "rdevice": int(header[42:48], 8),
+                            "mtime": int(header[48:59], 8),
+                            "name_size": int(header[59:65], 8),
+                            "file_size": int(header[65:76], 8),
+                            "checksum": None,
+                        }
+                    else:
+                        if any(byte not in b"0123456789abcdefABCDEF" for byte in header[6:]):
+                            structure_error = f"non-hex CPIO header field at offset {cursor}"
+                            break
                         values = [
                             int(header[6 + field * 8:14 + field * 8], 16)
                             for field in range(13)
                         ]
-                    except ValueError:
-                        structure_error = f"non-hex CPIO header field at offset {cursor}"
-                        break
-                    fields = dict(zip(field_names, values, strict=True))
+                        fields = dict(zip(newc_field_names, values, strict=True))
                     name_size = int(fields["name_size"])
                     file_size = int(fields["file_size"])
                     if not 1 <= name_size <= 4_096:
@@ -792,7 +821,7 @@ class GenericTriageEngine:
                             f"invalid CPIO pathname length {name_size} at offset {cursor}"
                         )
                         break
-                    name_offset = cursor + 110
+                    name_offset = cursor + header_length
                     name_end = name_offset + name_size
                     if name_end > size:
                         structure_error = f"CPIO pathname at offset {name_offset} exceeds evidence"
@@ -814,10 +843,10 @@ class GenericTriageEngine:
                     if not name:
                         structure_error = f"empty CPIO pathname at offset {name_offset}"
                         break
-                    name_padding_length = (-name_end) % 4
+                    name_padding_length = (-name_end) % alignment
                     data_offset = name_end + name_padding_length
                     data_end = data_offset + file_size
-                    data_padding_length = (-data_end) % 4
+                    data_padding_length = (-data_end) % alignment
                     next_header_offset = data_end + data_padding_length
                     mode = int(fields["mode"])
                     file_type_code = mode & 0o170000
@@ -832,7 +861,9 @@ class GenericTriageEngine:
                         "format": format_name,
                         "magic": magic.decode("ascii"),
                         "header_offset": cursor,
-                        "header_length": 110,
+                        "header_length": header_length,
+                        "numeric_encoding": numeric_encoding,
+                        "alignment": alignment,
                         "name": name[:4_095],
                         "name_raw_hex": raw_name[:-1].hex(),
                         "name_offset": name_offset,
@@ -853,15 +884,17 @@ class GenericTriageEngine:
                         "gid": int(fields["gid"]),
                         "link_count": int(fields["link_count"]),
                         "mtime_unix": int(fields["mtime"]),
-                        "device_major": int(fields["device_major"]),
-                        "device_minor": int(fields["device_minor"]),
-                        "rdevice_major": int(fields["rdevice_major"]),
-                        "rdevice_minor": int(fields["rdevice_minor"]),
-                        "stored_checksum": int(fields["checksum"]),
+                        "device_major": fields.get("device_major"),
+                        "device_minor": fields.get("device_minor"),
+                        "rdevice_major": fields.get("rdevice_major"),
+                        "rdevice_minor": fields.get("rdevice_minor"),
+                        "legacy_device": fields.get("device"),
+                        "legacy_rdevice": fields.get("rdevice"),
+                        "stored_checksum": fields["checksum"],
                         "calculated_checksum": None,
                         "checksum_valid": None,
                         "checksum_verification": (
-                            "not_applicable" if format_name == "newc" else "not_checked"
+                            "not_checked" if format_name == "crc" else "not_applicable"
                         ),
                     }
                     if format_name == "newc":
@@ -10650,7 +10683,7 @@ def _format_from_header_bytes(header: bytes) -> str | None:
         return "pe"
     if header.startswith((b"Rar!\x1a\x07\x00", b"Rar!\x1a\x07\x01\x00")):
         return "rar"
-    if header.startswith((b"070701", b"070702")):
+    if header.startswith((b"070701", b"070702", b"070707")):
         return "cpio"
     if header.startswith(b"BZh"):
         return "bzip2"

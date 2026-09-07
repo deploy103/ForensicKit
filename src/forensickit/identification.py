@@ -26,7 +26,7 @@ _FORMAT_INFO: dict[str, _FormatInfo] = {
     "gzip": _FormatInfo("archive", "archive", "application/gzip", "gzip compressed data", 0.99),
     "tar": _FormatInfo("archive", "archive", "application/x-tar", "tar archive", 0.98),
     "rar": _FormatInfo("archive", "archive", "application/vnd.rar", "RAR archive data", 0.99),
-    "cpio": _FormatInfo("archive", "archive", "application/x-cpio", "SVR4 cpio archive", 0.99),
+    "cpio": _FormatInfo("archive", "archive", "application/x-cpio", "ASCII cpio archive", 0.99),
     "bzip2": _FormatInfo("archive", "archive", "application/x-bzip2", "bzip2 compressed data", 0.98),
     "xz": _FormatInfo("archive", "archive", "application/x-xz", "XZ compressed data", 0.99),
     "ewf": _FormatInfo("disk", "disk", "application/x-ewf", "EWF forensic image", 0.99),
