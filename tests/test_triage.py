@@ -168,7 +168,16 @@ def _rrip_px(mode: int, *, links: int = 1, uid: int = 1000, gid: int = 1000) -> 
     return _susp_entry(b"PX", b"".join(_iso_both32(value) for value in fields))
 
 
-def _iso9660_with_rock_ridge(*, unsafe_file_name: bool = False) -> tuple[bytes, bytes]:
+def _rrip_ce(block: int, offset: int, length: int) -> bytes:
+    return _susp_entry(
+        b"CE", _iso_both32(block) + _iso_both32(offset) + _iso_both32(length),
+    )
+
+
+def _iso9660_with_rock_ridge(
+    *, unsafe_file_name: bool = False, continued_name: bool = False,
+    continuation_cycle: bool = False,
+) -> tuple[bytes, bytes]:
     block_size = 2_048
     image = bytearray(25 * block_size)
     pvd_offset = 16 * block_size
@@ -223,9 +232,18 @@ def _iso9660_with_rock_ridge(*, unsafe_file_name: bool = False) -> tuple[bytes, 
     image[20 * block_size:20 * block_size + len(root)] = root
 
     payload = b"CTF{rock_ridge_alternate_name}"
+    continuation_area = (
+        _rrip_ce(24, 256, 32) + _susp_entry(b"ST")
+        if continuation_cycle
+        else _susp_entry(b"NM", b"\x00Evidence.txt") + _susp_entry(b"ST")
+    )
     file_name_entries = (
         _susp_entry(b"NM", b"\x00../escape.txt")
         if unsafe_file_name
+        else (
+            _susp_entry(b"NM", b"\x01Flag ")
+            + _rrip_ce(24, 256, len(continuation_area))
+        ) if continued_name or continuation_cycle
         else (
             _susp_entry(b"NM", b"\x01Flag ")
             + _susp_entry(b"NM", b"\x00Evidence.txt")
@@ -259,6 +277,11 @@ def _iso9660_with_rock_ridge(*, unsafe_file_name: bool = False) -> tuple[bytes, 
     )
     image[22 * block_size:22 * block_size + len(subdirectory)] = subdirectory
     image[23 * block_size:23 * block_size + len(payload)] = payload
+    if continued_name or continuation_cycle:
+        continuation_offset = 24 * block_size + 256
+        image[
+            continuation_offset:continuation_offset + len(continuation_area)
+        ] = continuation_area
     return bytes(image), payload
 
 
@@ -1926,6 +1949,75 @@ def test_iso9660_rock_ridge_names_posix_metadata_and_symlinks_are_bounded(
     assert any(
         item.category == "archive_unsafe_member_path"
         for item in unsafe_profile.findings
+    )
+
+
+def test_iso9660_rock_ridge_ce_continuation_completes_name_with_exact_provenance(
+    tmp_path: Path,
+) -> None:
+    block_size = 2_048
+    image, payload = _iso9660_with_rock_ridge(continued_name=True)
+    evidence = tmp_path / "rock-ridge-ce.iso"
+    evidence.write_bytes(image)
+    values = _values(GenericTriageEngine().analyze(_artifact(evidence), evidence))
+    nested = next(
+        item for item in values["archive.iso9660.directory_entries"]
+        if item.get("file_identifier") == "FLAG000.TXT;1"
+    )
+    assert nested["rock_ridge_name"] == "Flag Evidence.txt"
+    assert nested["rock_ridge_name_chain_complete"] is True
+    assert nested["rock_ridge_name_usable"] is True
+    assert nested["archive_path"] == "Evidence Directory/Flag Evidence.txt"
+    assert nested["data_length"] == len(payload)
+    assert nested["extraction_eligible"] is True
+    areas = nested["susp_continuation_areas"]
+    assert len(areas) == 1
+    area = areas[0]
+    assert area["block"] == 24
+    assert area["block_relative_offset"] == 256
+    assert area["absolute_offset"] == 24 * block_size + 256
+    assert area["length"] > 0
+    assert area["parse_error"] is None
+    assert len(area["raw_sha256"]) == 64
+    continued = nested["susp_resolved_continuation_entries"]
+    assert [item["signature"] for item in continued] == ["NM", "ST"]
+    assert continued[0]["name"] == "Evidence.txt"
+    assert continued[0]["absolute_offset"] == area["absolute_offset"]
+    assert continued[0]["source_ce_absolute_offset"] == next(
+        item["absolute_offset"] for item in nested["susp_entries"]
+        if item["signature"] == "CE"
+    )
+    assert nested["susp_continuation_errors"] == []
+    assert nested["susp_continuation_unparsed"] is False
+    state = values["archive.iso9660.susp_continuation_state"]
+    assert state["area_count"] == 1
+    assert state["bytes_read"] == area["length"]
+    assert state["area_limit"] == 128
+    assert state["byte_limit"] == 1024 * 1024
+    assert values["archive.iso9660.susp_errors"] == []
+
+    cycle_image, _ = _iso9660_with_rock_ridge(continuation_cycle=True)
+    cycle_path = tmp_path / "rock-ridge-ce-cycle.iso"
+    cycle_path.write_bytes(cycle_image)
+    cycle_artifact = _artifact(cycle_path)
+    cycle_observations = GenericTriageEngine().analyze(cycle_artifact, cycle_path)
+    cycle_values = _values(cycle_observations)
+    cycle_entry = next(
+        item for item in cycle_values["archive.iso9660.directory_entries"]
+        if item.get("file_identifier") == "FLAG000.TXT;1"
+    )
+    assert cycle_entry["susp_continuation_unparsed"] is True
+    assert cycle_entry["extraction_eligible"] is False
+    assert any(
+        "overlaps a claimed area" in error
+        for error in cycle_entry["susp_continuation_errors"]
+    )
+    assert "unresolved_susp_continuation" in cycle_entry["rock_ridge_anomalies"]
+    assert cycle_values["archive.iso9660.susp_continuation_state"]["area_count"] == 1
+    cycle_profile = ProfileEngine().evaluate(cycle_artifact, cycle_observations)
+    assert any(
+        item.category == "iso9660_susp_anomaly"
+        for item in cycle_profile.findings
     )
 
 

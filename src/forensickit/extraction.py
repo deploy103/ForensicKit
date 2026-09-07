@@ -608,6 +608,34 @@ class ExtractionManager:
                         or raw_record[27] != 0
                     ):
                         raise RuntimeError("directory record no longer matches triage provenance")
+                    continuation_areas = record.get("susp_continuation_areas", [])
+                    if not isinstance(continuation_areas, list):
+                        raise RuntimeError("invalid SUSP continuation provenance")
+                    for continuation_area in continuation_areas:
+                        if not isinstance(continuation_area, dict):
+                            raise RuntimeError("invalid SUSP continuation record")
+                        continuation_offset = continuation_area.get("absolute_offset")
+                        continuation_length = continuation_area.get("length")
+                        continuation_sha256 = continuation_area.get("raw_sha256")
+                        if (
+                            not isinstance(continuation_offset, int)
+                            or not isinstance(continuation_length, int)
+                            or continuation_length <= 0
+                            or continuation_offset < 0
+                            or continuation_offset + continuation_length > artifact.size
+                            or not isinstance(continuation_sha256, str)
+                        ):
+                            raise RuntimeError("invalid SUSP continuation byte range")
+                        source_stream.seek(continuation_offset)
+                        continuation_raw = source_stream.read(continuation_length)
+                        if (
+                            len(continuation_raw) != continuation_length
+                            or hashlib.sha256(continuation_raw).hexdigest()
+                            != continuation_sha256
+                        ):
+                            raise RuntimeError(
+                                "SUSP continuation area no longer matches triage provenance"
+                            )
                 except (OSError, RuntimeError) as exc:
                     result.errors.append(f"skipped ISO member {name!r}: {exc}")
                     continue

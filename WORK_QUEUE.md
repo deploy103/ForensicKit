@@ -1,10 +1,10 @@
 # ForensicKit Work Queue
 
-Last reviewed: 2026-09-07 11:18 KST
+Last reviewed: 2026-09-07 11:26 KST
 
 ## Post-v1.1 backlog
 
-- [ ] Resolve bounded Rock Ridge `CE` continuation areas with cycle/range/byte protection.
+- [ ] Parse Rock Ridge `TF` timestamps and `PN` device metadata with both-endian validation.
 
 ## v1.1.0 release gate
 
@@ -17,6 +17,7 @@ Last reviewed: 2026-09-07 11:18 KST
 
 ## Completed this session
 
+- [x] Bounded Rock Ridge `CE` continuation-area resolution with range/cycle/overlap/hash provenance.
 - [x] Bounded primary ISO little-/big-endian path-table parsing, copy comparison, and directory reconciliation.
 - [x] Bounded El Torito section header/entry/extension parsing and platform boot-load extraction.
 - [x] Bounded El Torito boot-record/default-catalog validation and deterministic boot-load child extraction.

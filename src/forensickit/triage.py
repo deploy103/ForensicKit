@@ -1332,18 +1332,39 @@ class GenericTriageEngine:
             susp_config = self._iso9660_susp_configuration(root_self_entry)
         susp_skip = susp_config.get("skip_bytes")
         rock_ridge_detected = susp_config.get("rock_ridge_detected") is True
+        susp_continuation_state: dict[str, object] = {
+            "bytes_read": 0,
+            "byte_limit": min(self.limits.signature_scan_bytes, _MIB),
+            "area_count": 0,
+            "area_limit": 128,
+            "claimed_ranges": [],
+        }
         if susp_config.get("detected") is True and isinstance(susp_skip, int):
             for entry in root_entries:
+                continued_entries, continuation_errors = (
+                    self._iso9660_resolve_susp_continuations(
+                        path,
+                        entry,
+                        skip_bytes=susp_skip,
+                        logical_block_size=int(pvd["logical_block_size"]),
+                        evidence_size=size,
+                        declared_volume_bytes=int(pvd["declared_volume_bytes"]),
+                        state=susp_continuation_state,
+                    )
+                )
                 susp_error, rrip_anomalies = self._iso9660_enrich_susp_record(
                     entry,
                     skip_bytes=susp_skip,
                     rock_ridge_detected=rock_ridge_detected,
+                    continued_entries=continued_entries,
+                    continuation_errors=continuation_errors,
                 )
                 if susp_error or rrip_anomalies:
                     susp_errors.append({
                         "record_offset": entry.get("record_offset"),
                         "file_identifier": entry.get("file_identifier"),
-                        "susp_error": susp_error,
+                            "susp_error": susp_error,
+                            "continuation_errors": continuation_errors,
                         "rock_ridge_anomalies": rrip_anomalies,
                     })
 
@@ -1535,16 +1556,30 @@ class GenericTriageEngine:
                     )
                     if susp_config.get("detected") is True and isinstance(susp_skip, int):
                         for child_entry in child_entries:
+                            continued_entries, continuation_errors = (
+                                self._iso9660_resolve_susp_continuations(
+                                    path,
+                                    child_entry,
+                                    skip_bytes=susp_skip,
+                                    logical_block_size=logical_block_size,
+                                    evidence_size=size,
+                                    declared_volume_bytes=declared_volume_bytes,
+                                    state=susp_continuation_state,
+                                )
+                            )
                             susp_error, rrip_anomalies = self._iso9660_enrich_susp_record(
                                 child_entry,
                                 skip_bytes=susp_skip,
                                 rock_ridge_detected=rock_ridge_detected,
+                                continued_entries=continued_entries,
+                                continuation_errors=continuation_errors,
                             )
                             if susp_error or rrip_anomalies:
                                 susp_errors.append({
                                     "record_offset": child_entry.get("record_offset"),
                                     "file_identifier": child_entry.get("file_identifier"),
                                     "susp_error": susp_error,
+                                    "continuation_errors": continuation_errors,
                                     "rock_ridge_anomalies": rrip_anomalies,
                                 })
                     processed_directories += 1
@@ -1767,6 +1802,10 @@ class GenericTriageEngine:
             self._observation(artifact, "archive.iso9660.directory_traversal_errors", directory_traversal_errors),
             self._observation(artifact, "archive.iso9660.susp", susp_config),
             self._observation(artifact, "archive.iso9660.susp_errors", susp_errors),
+            self._observation(artifact, "archive.iso9660.susp_continuation_state", {
+                key: value for key, value in susp_continuation_state.items()
+                if key != "claimed_ranges"
+            }),
             self._observation(artifact, "archive.iso9660.rock_ridge_detected", rock_ridge_detected),
             self._observation(artifact, "archive.iso9660.rock_ridge_entries", rock_ridge_entries),
             self._observation(artifact, "archive.iso9660.rock_ridge_entry_count", len(rock_ridge_entries)),
@@ -3116,8 +3155,151 @@ class GenericTriageEngine:
         return entries, first_error
 
     @staticmethod
+    def _iso9660_resolve_susp_continuations(
+        path: Path,
+        record: dict[str, object],
+        *,
+        skip_bytes: int,
+        logical_block_size: int,
+        evidence_size: int,
+        declared_volume_bytes: int,
+        state: dict[str, object],
+    ) -> tuple[list[dict[str, object]], list[str]]:
+        """Read explicitly referenced SUSP continuation areas under one global budget."""
+        raw_hex = record.get("system_use_raw_hex")
+        if not isinstance(raw_hex, str):
+            return [], []
+        try:
+            inline = bytes.fromhex(raw_hex)
+        except ValueError:
+            return [], ["invalid inline system-use hex"]
+        inline_entries, _ = GenericTriageEngine._iso9660_susp_records(
+            inline, skip_bytes=skip_bytes,
+        )
+        record_offset = record.get("record_offset")
+        system_use_offset = record.get("system_use_offset_in_record")
+        for entry in inline_entries:
+            relative = entry.get("system_use_offset")
+            if (
+                isinstance(record_offset, int)
+                and isinstance(system_use_offset, int)
+                and isinstance(relative, int)
+            ):
+                entry["absolute_offset"] = record_offset + system_use_offset + relative
+        queue: list[tuple[dict[str, object], int]] = [
+            (entry, 0) for entry in inline_entries
+            if entry.get("signature") == "CE"
+        ]
+        resolved: list[dict[str, object]] = []
+        areas: list[dict[str, object]] = []
+        errors: list[str] = []
+        while queue:
+            ce, depth = queue.pop(0)
+            if depth >= 8:
+                errors.append("SUSP continuation nesting exceeds 8 levels")
+                break
+            if ce.get("valid") is not True:
+                errors.append("invalid SUSP CE entry cannot be followed")
+                continue
+            block = ce.get("continuation_block")
+            area_offset = ce.get("continuation_offset")
+            area_length = ce.get("continuation_length")
+            if not all(isinstance(value, int) for value in (block, area_offset, area_length)):
+                errors.append("SUSP CE entry lacks numeric continuation fields")
+                continue
+            assert isinstance(block, int)
+            assert isinstance(area_offset, int)
+            assert isinstance(area_length, int)
+            absolute_offset = block * logical_block_size + area_offset
+            absolute_end = absolute_offset + area_length
+            if (
+                area_length <= 0
+                or area_offset < 0
+                or area_offset >= logical_block_size
+                or absolute_offset < 0
+                or absolute_end > evidence_size
+                or absolute_end > declared_volume_bytes
+            ):
+                errors.append(
+                    f"SUSP CE range {absolute_offset}:{absolute_end} is invalid or out of bounds"
+                )
+                continue
+            claimed_ranges = state.get("claimed_ranges")
+            if not isinstance(claimed_ranges, list):
+                claimed_ranges = []
+                state["claimed_ranges"] = claimed_ranges
+            if any(
+                absolute_offset < int(existing_end)
+                and int(existing_start) < absolute_end
+                for existing_start, existing_end in claimed_ranges
+            ):
+                errors.append(
+                    f"SUSP CE range {absolute_offset}:{absolute_end} overlaps a claimed area"
+                )
+                continue
+            byte_limit = int(state.get("byte_limit", _MIB))
+            bytes_read = int(state.get("bytes_read", 0))
+            area_limit = int(state.get("area_limit", 128))
+            area_count = int(state.get("area_count", 0))
+            if bytes_read + area_length > byte_limit:
+                errors.append("SUSP continuation byte limit reached")
+                continue
+            if area_count >= area_limit:
+                errors.append("SUSP continuation area-count limit reached")
+                continue
+            try:
+                with path.open("rb") as stream:
+                    stream.seek(absolute_offset)
+                    area_raw = stream.read(area_length)
+            except OSError as exc:
+                errors.append(f"SUSP continuation read failed: {str(exc)[:2_000]}")
+                continue
+            if len(area_raw) != area_length:
+                errors.append(
+                    f"truncated SUSP continuation read at offset {absolute_offset}"
+                )
+                continue
+            claimed_ranges.append((absolute_offset, absolute_end))
+            state["bytes_read"] = bytes_read + area_length
+            state["area_count"] = area_count + 1
+            continuation_entries, parse_error = GenericTriageEngine._iso9660_susp_records(
+                area_raw, skip_bytes=0,
+            )
+            area = {
+                "source_ce_absolute_offset": ce.get("absolute_offset"),
+                "nesting_depth": depth,
+                "block": block,
+                "block_relative_offset": area_offset,
+                "absolute_offset": absolute_offset,
+                "length": area_length,
+                "raw_sha256": hashlib.sha256(area_raw).hexdigest(),
+                "raw_preview_hex": area_raw[:256].hex(),
+                "raw_preview_truncated": len(area_raw) > 256,
+                "entry_count": len(continuation_entries),
+                "parse_error": parse_error,
+            }
+            areas.append(area)
+            if parse_error:
+                errors.append(parse_error)
+            for continued in continuation_entries:
+                relative = continued.get("system_use_offset")
+                if isinstance(relative, int):
+                    continued["absolute_offset"] = absolute_offset + relative
+                continued["continuation_area_offset"] = absolute_offset
+                continued["source_ce_absolute_offset"] = ce.get("absolute_offset")
+                continued["continuation_nesting_depth"] = depth
+                resolved.append(continued)
+                if continued.get("signature") == "CE":
+                    queue.append((continued, depth + 1))
+        record["susp_continuation_areas"] = areas
+        record["susp_continuation_errors"] = errors
+        return resolved, errors
+
+    @staticmethod
     def _iso9660_enrich_susp_record(
         record: dict[str, object], *, skip_bytes: int, rock_ridge_detected: bool,
+        continued_entries: list[dict[str, object]] | None = None,
+        continuation_errors: list[str] | None = None,
     ) -> tuple[str | None, list[str]]:
         """Attach inline SUSP/RRIP semantics without dereferencing continuation areas."""
         raw_hex = record.get("system_use_raw_hex")
@@ -3150,6 +3332,11 @@ class GenericTriageEngine:
         entries, susp_error = GenericTriageEngine._iso9660_susp_records(
             system_use, skip_bytes=skip_bytes,
         )
+        continued_entries = continued_entries or []
+        continuation_errors = continuation_errors or []
+        semantic_entries = [*entries, *continued_entries]
+        if continuation_errors and susp_error is None:
+            susp_error = continuation_errors[0]
         record_offset = record.get("record_offset")
         system_use_offset_in_record = record.get("system_use_offset_in_record")
         for entry in entries:
@@ -3167,19 +3354,25 @@ class GenericTriageEngine:
                 )
         rrip_signatures = {"RR", "PX", "NM", "SL", "TF", "CL", "PL", "RE", "PN"}
         rrip_entries = [
-            entry for entry in entries if entry.get("signature") in rrip_signatures
+            entry for entry in semantic_entries if entry.get("signature") in rrip_signatures
         ]
         continuation_entries = [
             entry for entry in entries if entry.get("signature") == "CE"
         ]
         anomalies: list[str] = []
+        continuation_unparsed = bool(
+            continuation_entries and (not continued_entries or continuation_errors)
+        )
+        if continuation_unparsed:
+            anomalies.append("unresolved_susp_continuation")
         record.update({
             "susp_skip_bytes": skip_bytes,
             "susp_skipped_prefix_raw_hex": system_use[:skip_bytes].hex(),
             "susp_entries": entries,
             "susp_error": susp_error,
+            "susp_resolved_continuation_entries": continued_entries,
             "susp_continuation_entries": continuation_entries,
-            "susp_continuation_unparsed": bool(continuation_entries),
+            "susp_continuation_unparsed": continuation_unparsed,
             "rock_ridge_present": rock_ridge_detected and bool(rrip_entries),
         })
 
@@ -3349,6 +3542,7 @@ class GenericTriageEngine:
             or record.get("rock_ridge_type_mismatch") is True
             or record.get("rock_ridge_name_usable") is False
             or (susp_error is not None and rock_ridge_detected)
+            or continuation_unparsed
         ):
             record["extraction_eligible"] = False
         record["rock_ridge_anomalies"] = anomalies

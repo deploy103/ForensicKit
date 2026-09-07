@@ -1,5 +1,18 @@
 # ForensicKit Work Log
 
+## 2026-09-07 11:26 KST
+
+### Rock Ridge SUSP continuation areas
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/extraction.py`, `tests/test_triage.py`, and `tests/test_engine_pipeline.py`.
+- Valid inline `CE` records can now resolve SUSP continuation areas using exact both-endian block/offset/length fields. Resolution is globally capped at 1 MiB and 128 areas per ISO, at depth 8, and rejects invalid offsets, evidence/declared-volume overrun, duplicate/overlapping areas, read truncation, malformed nested records, and continuation cycles. Each area preserves its source CE absolute offset, nesting depth, exact byte range, SHA-256, bounded preview, entry count, and parse result; continued entries retain absolute/source-area/source-CE provenance.
+- Inline and resolved records form one ordered RRIP semantic stream for continued `NM`/`SL` handling. An unresolved or anomalous continuation suppresses the affected file extraction or directory traversal instead of falling back to a potentially misleading partial name. Before copying a continued-name file, the extractor independently rereads and hashes every referenced continuation range in addition to revalidating the original directory record.
+- Synthetic fixtures prove an inline `NM` fragment plus external final `NM` becomes `Evidence Directory/Flag Evidence.txt`, with exact offsets and budget counters, while a self-referencing CE is stopped by overlap protection and remains metadata-only. The existing Rock Ridge AUTO E2E now obtains its file name through CE and proves the continuation inventory persists into extraction/report/FlagCandidate lineage. Focused triage/Engine regressions passed: 162 passed, 0 failed. The full direct synthetic suite passed: 323 passed, 0 failed. `python -m compileall -q src tests scripts` and `git diff --check` passed.
+
+### Next
+
+- Decode bounded RRIP `TF` short/long timestamps and both-endian `PN` device numbers as provenance-only POSIX metadata, with malformed-field findings and no device materialization.
+
 ## 2026-09-07 11:18 KST
 
 ### ISO 9660 path-table copy validation
