@@ -1,5 +1,18 @@
 # ForensicKit Work Log
 
+## 2026-09-07 09:49 KST
+
+### Cross-table partition extent ambiguity gating
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/profiles/disk.py`, `src/forensickit/extraction.py`, `tests/test_triage.py`, and `tests/test_engine_pipeline.py`.
+- Structurally valid primary MBR, EBR logical, and CRC-eligible GPT data entries now receive stable table/entry identities and participate in a bounded exact-LBA overlap audit. Exact duplicates, partial overlaps, containment direction, both complete entry descriptors, exact overlap sectors/bytes, and per-entry conflict counts remain in `disk.partition_extent_conflicts` and a dedicated medium-severity finding.
+- Extended-MBR and protective-MBR extents remain separately inventoried as semantic containers and do not create false conflicts with the logical/GPT entries they are expected to contain. Any data entry involved in a conflict is marked ambiguous before boot-validation records are built, and even a valid, complete filesystem extent is then barred from recursive materialization while all competing records remain report-visible.
+- Direct fixtures cover exact duplicates, overlapping valid FAT12 primaries, both skipped extraction errors, JSON report provenance, and expected extended/protective-container exclusions. Six focused triage/Engine regressions passed; the full direct synthetic suite passed: 306 passed, 0 failed. `python -m compileall -q src tests` and `git diff --check` passed; pytest remains unavailable in the base environment.
+
+### Next
+
+- Add native bounded CPIO `newc`/CRC archive parsing and safe regular-file child extraction with header, pathname, checksum, byte-range, and trailer provenance.
+
 ## 2026-09-05 02:31 KST
 
 ### Recursive validated-partition child materialization

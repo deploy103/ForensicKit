@@ -36,6 +36,34 @@ class DiskProfile(BaseProfile):
 
     def analyze(self, context: ProfileContext) -> ProfileResult:
         result = ProfileResult(profile=self.name, matched=True)
+        partition_extent_conflicts = next(
+            (
+                value for value in context.values("disk.partition_extent_conflicts")
+                if isinstance(value, dict)
+            ),
+            {},
+        )
+        conflict_records = partition_extent_conflicts.get("records", [])
+        conflict_count = partition_extent_conflicts.get("conflict_count", 0)
+        if (
+            isinstance(conflict_count, int) and conflict_count > 0
+            and isinstance(conflict_records, list)
+        ):
+            result.findings.append(self.finding(
+                context,
+                title=f"{conflict_count} ambiguous partition extent overlap/duplicate(s)",
+                category="partition_extent_conflict", confidence=0.99,
+                explanation=(
+                    "Structurally valid data-partition entries claim at least one shared sector. "
+                    "Each pair retains both table/entry identities and exact declared and overlap ranges; all involved candidates are barred from recursive child materialization. "
+                    "Expected extended-MBR and protective-MBR container coverage is inventoried separately and is not treated as a conflict."
+                ),
+                evidence=[
+                    f"inventory={partition_extent_conflicts}",
+                    *[str(item)[:8_000] for item in conflict_records[:8] if isinstance(item, dict)],
+                ],
+                severity="medium",
+            ))
         partition_filesystems = next(
             (
                 value for value in context.values("disk.mbr.partition_filesystems")

@@ -1,10 +1,11 @@
 # ForensicKit Work Queue
 
-Last reviewed: 2026-09-05 02:31 KST
+Last reviewed: 2026-09-07 09:49 KST
 
 ## Post-v1.1 backlog
 
-- [ ] Detect overlapping/duplicate primary, logical, and GPT partition extents and gate recursive materialization on unambiguous ownership.
+- [ ] Add native bounded CPIO `newc`/CRC archive parsing and safe recursive regular-file extraction.
+- [ ] Extend native CPIO coverage to portable ASCII `odc` while preserving format-specific alignment and numeric provenance.
 
 ## v1.1.0 release gate
 
@@ -17,6 +18,7 @@ Last reviewed: 2026-09-05 02:31 KST
 
 ## Completed this session
 
+- [x] Cross-table primary/logical/GPT partition extent overlap/duplicate detection, semantic-container exclusion, and ambiguity-gated recursive materialization.
 - [x] Bounded ext4 depth-two extent-tree traversal, intermediate-index provenance, range validation, cycle protection, and recursive Engine E2E.
 - [x] Bounded ext2/3 single-indirect directory/file mapping, pointer provenance, alias protection, and recursive Engine E2E.
 - [x] FAT16 fixed-root/LFN inventory and cautious single/multi-cluster deleted-file recursive recovery.

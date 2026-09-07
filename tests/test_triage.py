@@ -1950,6 +1950,85 @@ def test_mbr_partition_boot_filesystems_are_offset_validated_without_trusting_ty
     assert "'boot_sector_offset': 2560" in boot_anomaly.supporting_evidence[0]
 
 
+def test_partition_extent_conflicts_preserve_pair_provenance_and_mark_every_owner(tmp_path: Path) -> None:
+    duplicate_entries = [
+        {
+            "slot": slot,
+            "entry_valid": True,
+            "entry_offset": 446 + (slot - 1) * 16,
+            "type_code": "0x01",
+            "type": "FAT12",
+            "start_lba": 10,
+            "sector_count": 4,
+            "within_image": True,
+        }
+        for slot in (1, 2)
+    ]
+    duplicate_summary = GenericTriageEngine._partition_extent_conflicts(
+        duplicate_entries, [], [],
+    )
+    assert duplicate_summary["conflict_count"] == 1
+    assert duplicate_summary["ambiguous_candidate_identities"] == [
+        "mbr_primary:1", "mbr_primary:2",
+    ]
+    assert duplicate_summary["records"][0]["relation"] == "exact_duplicate"
+    assert duplicate_summary["records"][0]["overlap_start_lba"] == 10
+    assert duplicate_summary["records"][0]["overlap_end_lba"] == 13
+    assert all(item["partition_extent_ambiguous"] is True for item in duplicate_entries)
+
+    sector_size = 512
+    image = bytearray(7 * sector_size)
+    for slot, start_lba in ((0, 1), (1, 3)):
+        entry = 446 + slot * 16
+        image[entry + 4] = 0x01
+        image[entry + 8:entry + 12] = start_lba.to_bytes(4, "little")
+        image[entry + 12:entry + 16] = (4).to_bytes(4, "little")
+        boot = start_lba * sector_size
+        image[boot:boot + 3] = b"\xeb\x3c\x90"
+        image[boot + 11:boot + 13] = sector_size.to_bytes(2, "little")
+        image[boot + 13] = 1
+        image[boot + 14:boot + 16] = (1).to_bytes(2, "little")
+        image[boot + 16] = 1
+        image[boot + 17:boot + 19] = (16).to_bytes(2, "little")
+        image[boot + 19:boot + 21] = (4).to_bytes(2, "little")
+        image[boot + 21] = 0xF8
+        image[boot + 22:boot + 24] = (1).to_bytes(2, "little")
+        image[boot + 28:boot + 32] = start_lba.to_bytes(4, "little")
+        image[boot + 510:boot + 512] = b"\x55\xaa"
+    image[510:512] = b"\x55\xaa"
+    evidence = tmp_path / "overlapping-primary-partitions.dd"
+    evidence.write_bytes(image)
+    artifact = _artifact(evidence)
+
+    observations = GenericTriageEngine().analyze(artifact, evidence)
+    values = _values(observations)
+    conflicts = values["disk.partition_extent_conflicts"]
+    assert conflicts["candidate_count"] == 2
+    assert conflicts["conflict_count"] == 1
+    assert conflicts["ambiguous_candidate_count"] == 2
+    assert conflicts["records"][0]["relation"] == "partial_overlap"
+    assert conflicts["records"][0]["overlap_start_lba"] == 3
+    assert conflicts["records"][0]["overlap_end_lba"] == 4
+    assert conflicts["records"][0]["overlap_offset"] == 3 * sector_size
+    assert conflicts["records"][0]["overlap_length"] == 2 * sector_size
+    filesystems = values["disk.mbr.partition_filesystems"]
+    assert [item["detected_filesystem"] for item in filesystems] == ["fat12", "fat12"]
+    assert [item["partition_extent_identity"] for item in filesystems] == [
+        "mbr_primary:1", "mbr_primary:2",
+    ]
+    assert all(item["partition_extent_ambiguous"] is True for item in filesystems)
+    assert all(item["partition_extent_conflict_count"] == 1 for item in filesystems)
+
+    profile = ProfileEngine().evaluate(artifact, observations)
+    finding = next(
+        item for item in profile.findings
+        if item.category == "partition_extent_conflict"
+    )
+    assert finding.severity == "medium"
+    assert "'overlap_start_lba': 3" in finding.supporting_evidence[0]
+    assert "'identity': 'mbr_primary:1'" in finding.supporting_evidence[0]
+
+
 def test_ebr_logical_partitions_use_current_and_extended_base_relative_offsets(tmp_path: Path) -> None:
     sector_size = 512
     image = bytearray(20 * sector_size)
@@ -2018,6 +2097,15 @@ def test_ebr_logical_partitions_use_current_and_extended_base_relative_offsets(t
     assert [item["ebr_lba"] for item in logical] == [1, 7]
     assert logical[0]["entry_offset"] == first_ebr + 446
     assert logical[1]["entry_offset"] == second_ebr + 446
+    extent_conflicts = values["disk.partition_extent_conflicts"]
+    assert extent_conflicts["candidate_count"] == 2
+    assert extent_conflicts["excluded_semantic_container_count"] == 1
+    assert extent_conflicts["excluded_semantic_containers"][0]["identity"] == "mbr_primary:1"
+    assert extent_conflicts["excluded_semantic_containers"][0]["partition_extent_role"] == "extended_container"
+    assert extent_conflicts["excluded_semantic_containers"][0]["partition_length"] == 15 * sector_size
+    assert extent_conflicts["conflict_count"] == 0
+    assert logical[0]["partition_extent_identity"] == "mbr_logical:1"
+    assert logical[0]["partition_extent_ambiguous"] is False
 
     filesystems = values["disk.mbr.logical_partition_filesystems"]
     assert [item["detected_filesystem"] for item in filesystems] == ["fat12", "ntfs"]
@@ -2151,6 +2239,12 @@ def test_gpt_partition_filesystems_require_crc_validated_entries_and_keep_guid_p
     assert values["disk.gpt.header"]["backup"]["reciprocal_locations_match"] is True
     assert values["disk.gpt.header"]["backup"]["partition_entry_table_matches_primary"] is True
     assert values["disk.gpt.partition_filesystem_validation"]["eligible"] is True
+    extent_conflicts = values["disk.partition_extent_conflicts"]
+    assert extent_conflicts["candidate_count"] == 2
+    assert extent_conflicts["excluded_semantic_container_count"] == 1
+    assert extent_conflicts["excluded_semantic_containers"][0]["identity"] == "mbr_primary:1"
+    assert extent_conflicts["excluded_semantic_containers"][0]["partition_extent_role"] == "gpt_protective_container"
+    assert extent_conflicts["conflict_count"] == 0
     filesystems = values["disk.gpt.partition_filesystems"]
     assert len(filesystems) == 2
     assert filesystems[0]["partition_table"] == "gpt"
