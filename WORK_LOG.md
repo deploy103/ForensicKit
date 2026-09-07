@@ -1,5 +1,18 @@
 # ForensicKit Work Log
 
+## 2026-09-07 10:01 KST
+
+### Native CPIO newc/CRC parsing and recursive extraction
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/identification.py`, `src/forensickit/profiles/archive.py`, `src/forensickit/extraction.py`, `tests/test_triage.py`, and `tests/test_engine_pipeline.py`.
+- Added signature-first SVR4 `newc`/CRC classification and a bounded native walker capped by the configured signature-byte and artifact-count limits. Each entry retains its exact 110-byte header, pathname, alignment padding, data range, format/magic, inode/mode/type/permissions, ownership/link/device fields, Unix mtime, stored checksum, and path-safety verdict; trailer presence/completeness, mixed formats, malformed ranges, and scan/checksum bounds remain explicit observations.
+- CRC archives receive a cumulative 16-MiB-bounded byte-sum validation during triage, while plain `newc` entries preserve whether their required zero checksum field is valid. The archive profile reports checksum/structure/format anomalies and absolute, drive-rooted, or parent-traversing names. The built-in extractor independently revalidates each observed header/name/range, copies only regular files under ordinary recursion/size/count limits, never creates links/devices, recomputes CRC while copying, and retains the source observation UUID and exact range/checksum record in its finding.
+- A CRC initramfs-style E2E proves directory/symlink metadata retention, unsafe-member suppression, safe `etc/flag.txt` child registration, recursive FlagHunter attribution, and JSON report provenance. Focused newc/CRC, TAR, and gzip regressions passed; the full direct synthetic suite passed: 308 passed, 0 failed. `python -m compileall -q src tests scripts` and `git diff --check` passed.
+
+### Next
+
+- Extend the same bounded inventory/extraction contract to portable ASCII CPIO `odc`, keeping its 76-byte octal header and two-byte pathname/data alignment distinct from newc.
+
 ## 2026-09-07 09:49 KST
 
 ### Cross-table partition extent ambiguity gating

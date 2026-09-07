@@ -47,6 +47,42 @@ def _png(chunks: list[tuple[bytes, bytes]]) -> bytes:
     return bytes(result)
 
 
+def _cpio_newc_member(
+    name: str,
+    data: bytes = b"",
+    *,
+    mode: int = 0o100644,
+    inode: int = 1,
+    magic: bytes = b"070701",
+    checksum: int | None = None,
+) -> bytes:
+    raw_name = name.encode("utf-8") + b"\x00"
+    stored_checksum = (
+        sum(data) & 0xFFFFFFFF if magic == b"070702" and checksum is None
+        else 0 if checksum is None
+        else checksum
+    )
+    fields = (
+        inode, mode, 1000, 1000, 1, 1_700_000_000, len(data),
+        0, 0, 0, 0, len(raw_name), stored_checksum,
+    )
+    header = magic + b"".join(f"{value:08x}".encode("ascii") for value in fields)
+    assert len(header) == 110
+    result = bytearray(header)
+    result.extend(raw_name)
+    result.extend(b"\x00" * ((-len(result)) % 4))
+    result.extend(data)
+    result.extend(b"\x00" * ((-len(result)) % 4))
+    return bytes(result)
+
+
+def _cpio_newc_archive(*members: bytes, magic: bytes = b"070701") -> bytes:
+    trailer = _cpio_newc_member(
+        "TRAILER!!!", mode=0, inode=len(members) + 1, magic=magic,
+    )
+    return b"".join((*members, trailer))
+
+
 def test_png_appended_zip_is_observed_and_classified(tmp_path: Path) -> None:
     zip_path = tmp_path / "payload.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
@@ -1011,6 +1047,120 @@ def test_tar_header_inventory_validates_member_checksum(tmp_path: Path) -> None:
     assert values["archive.tar.entries"][0]["name"] == "nested/flag.txt"
     assert values["archive.tar.entries"][0]["checksum_valid"] is True
     assert values["archive.tar.invalid_checksums"] == []
+
+
+def test_cpio_crc_entries_preserve_ranges_checksums_types_and_unsafe_paths(tmp_path: Path) -> None:
+    magic = b"070702"
+    directory = _cpio_newc_member("nested", mode=0o040755, inode=1, magic=magic)
+    payload = b"CTF{cpio_triage}"
+    regular = _cpio_newc_member(
+        "nested/flag.txt", payload, mode=0o100640, inode=2, magic=magic,
+    )
+    symlink = _cpio_newc_member(
+        "nested/link", b"../flag.txt", mode=0o120777, inode=3, magic=magic,
+    )
+    unsafe = _cpio_newc_member(
+        "../escape.txt", b"unsafe", mode=0o100600, inode=4, magic=magic,
+    )
+    evidence = tmp_path / "initramfs.cpio"
+    evidence.write_bytes(_cpio_newc_archive(
+        directory, regular, symlink, unsafe, magic=magic,
+    ))
+    artifact = _artifact(evidence)
+
+    observations = GenericTriageEngine().analyze(artifact, evidence)
+    values = _values(observations)
+    identified = IdentificationEngine().identify(artifact, observations)
+
+    assert identified.format == "cpio"
+    assert artifact.artifact_type == "archive"
+    assert values["archive.container_kind"] == "cpio"
+    assert values["archive.cpio.formats"] == ["crc"]
+    assert values["archive.cpio.format_consistent"] is True
+    assert values["archive.cpio.entry_count"] == 4
+    assert values["archive.cpio.trailer_found"] is True
+    assert values["archive.cpio.trailer"]["valid_zero_length"] is True
+    assert values["archive.cpio.complete"] is True
+    assert values["archive.cpio.scan_truncated"] is False
+    assert values["archive.cpio.structure_error"] is None
+    assert values["archive.cpio.invalid_checksums"] == []
+    entries = values["archive.cpio.entries"]
+    assert [item["file_type"] for item in entries] == [
+        "directory", "regular", "symlink", "regular",
+    ]
+    assert entries[1]["header_offset"] == len(directory)
+    assert entries[1]["name_offset"] == len(directory) + 110
+    assert entries[1]["data_offset"] % 4 == 0
+    assert entries[1]["data_length"] == len(payload)
+    assert entries[1]["permissions"] == "0o0640"
+    assert entries[1]["stored_checksum"] == sum(payload)
+    assert entries[1]["calculated_checksum"] == sum(payload)
+    assert entries[1]["checksum_valid"] is True
+    assert entries[1]["checksum_verification"] == "complete"
+    assert entries[1]["path_safe"] is True
+    assert entries[3]["path_safe"] is False
+    assert values["archive.cpio.checksum_bytes_read"] == (
+        len(payload) + len(b"../flag.txt") + len(b"unsafe")
+    )
+
+    profile = ProfileEngine().evaluate(artifact, observations)
+    unsafe_finding = next(
+        item for item in profile.findings
+        if item.category == "archive_unsafe_member_path"
+    )
+    assert "../escape.txt" in unsafe_finding.supporting_evidence[0]
+    assert not any(
+        item.category == "archive_structure_anomaly"
+        for item in profile.findings
+    )
+
+    bad_crc = tmp_path / "bad-crc.cpio"
+    bad_crc.write_bytes(_cpio_newc_archive(
+        _cpio_newc_member(
+            "bad.bin", b"checksum", magic=magic, checksum=0,
+        ),
+        magic=magic,
+    ))
+    bad_artifact = _artifact(bad_crc)
+    bad_observations = GenericTriageEngine().analyze(bad_artifact, bad_crc)
+    bad_values = _values(bad_observations)
+    assert bad_values["archive.cpio.entries"][0]["checksum_valid"] is False
+    assert len(bad_values["archive.cpio.invalid_checksums"]) == 1
+    bad_profile = ProfileEngine().evaluate(bad_artifact, bad_observations)
+    anomaly = next(
+        item for item in bad_profile.findings
+        if item.category == "archive_structure_anomaly"
+    )
+    assert "'checksum_valid': False" in anomaly.supporting_evidence[0]
+
+    newc = tmp_path / "plain-newc.cpio"
+    newc.write_bytes(_cpio_newc_archive(
+        _cpio_newc_member("plain.txt", b"newc", inode=1),
+    ))
+    newc_artifact = _artifact(newc)
+    newc_observations = GenericTriageEngine().analyze(newc_artifact, newc)
+    newc_values = _values(newc_observations)
+    assert newc_values["archive.cpio.formats"] == ["newc"]
+    assert newc_values["archive.cpio.complete"] is True
+    assert newc_values["archive.cpio.entries"][0]["checksum_field_zero"] is True
+    assert newc_values["archive.cpio.entries"][0]["checksum_valid"] is None
+    assert newc_values["archive.cpio.entries"][0]["checksum_verification"] == "not_applicable"
+
+    nonzero_newc = tmp_path / "nonzero-newc-check.cpio"
+    nonzero_newc.write_bytes(_cpio_newc_archive(
+        _cpio_newc_member("plain.txt", b"newc", inode=1, checksum=1),
+    ))
+    nonzero_artifact = _artifact(nonzero_newc)
+    nonzero_observations = GenericTriageEngine().analyze(
+        nonzero_artifact, nonzero_newc,
+    )
+    nonzero_values = _values(nonzero_observations)
+    assert nonzero_values["archive.cpio.entries"][0]["checksum_field_zero"] is False
+    nonzero_profile = ProfileEngine().evaluate(nonzero_artifact, nonzero_observations)
+    assert any(
+        item.category == "archive_structure_anomaly"
+        for item in nonzero_profile.findings
+    )
 
 
 def test_ntfs_mft_zero_fixed_header_is_observed_at_boot_geometry_offset(tmp_path: Path) -> None:

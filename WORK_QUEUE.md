@@ -1,10 +1,9 @@
 # ForensicKit Work Queue
 
-Last reviewed: 2026-09-07 09:49 KST
+Last reviewed: 2026-09-07 10:01 KST
 
 ## Post-v1.1 backlog
 
-- [ ] Add native bounded CPIO `newc`/CRC archive parsing and safe recursive regular-file extraction.
 - [ ] Extend native CPIO coverage to portable ASCII `odc` while preserving format-specific alignment and numeric provenance.
 
 ## v1.1.0 release gate
@@ -18,6 +17,7 @@ Last reviewed: 2026-09-07 09:49 KST
 
 ## Completed this session
 
+- [x] Native bounded CPIO `newc`/CRC parsing, checksum/path anomaly findings, and safe recursive regular-file extraction.
 - [x] Cross-table primary/logical/GPT partition extent overlap/duplicate detection, semantic-container exclusion, and ambiguity-gated recursive materialization.
 - [x] Bounded ext4 depth-two extent-tree traversal, intermediate-index provenance, range validation, cycle protection, and recursive Engine E2E.
 - [x] Bounded ext2/3 single-indirect directory/file mapping, pointer provenance, alias protection, and recursive Engine E2E.
