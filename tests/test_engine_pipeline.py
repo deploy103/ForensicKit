@@ -2590,6 +2590,64 @@ def test_validated_small_partition_becomes_recursive_filesystem_child(tmp_path: 
     )
 
 
+def test_ambiguous_validated_partition_extents_are_not_materialized(tmp_path: Path) -> None:
+    sector_size = 512
+    image = bytearray(7 * sector_size)
+    for slot, start_lba in ((0, 1), (1, 3)):
+        entry = 446 + slot * 16
+        image[entry + 4] = 0x01
+        image[entry + 8:entry + 12] = start_lba.to_bytes(4, "little")
+        image[entry + 12:entry + 16] = (4).to_bytes(4, "little")
+        boot = start_lba * sector_size
+        image[boot:boot + 3] = b"\xeb\x3c\x90"
+        image[boot + 11:boot + 13] = sector_size.to_bytes(2, "little")
+        image[boot + 13] = 1
+        image[boot + 14:boot + 16] = (1).to_bytes(2, "little")
+        image[boot + 16] = 1
+        image[boot + 17:boot + 19] = (16).to_bytes(2, "little")
+        image[boot + 19:boot + 21] = (4).to_bytes(2, "little")
+        image[boot + 21] = 0xF8
+        image[boot + 22:boot + 24] = (1).to_bytes(2, "little")
+        image[boot + 28:boot + 32] = start_lba.to_bytes(4, "little")
+        image[boot + 510:boot + 512] = b"\x55\xaa"
+    image[510:512] = b"\x55\xaa"
+    evidence = tmp_path / "ambiguous-partitions.dd"
+    evidence.write_bytes(image)
+
+    result = AnalysisEngine().analyze(
+        evidence, tmp_path / "ambiguous-partition-cases",
+        mode=AnalysisMode.AUTO, execute=False,
+    )
+
+    assert [item.logical_name for item in result.artifacts] == [evidence.name]
+    assert any(
+        item.category == "partition_extent_conflict"
+        for item in result.findings
+    )
+    assert not any(
+        item.category == "validated_partition_extraction"
+        for item in result.findings
+    )
+    assert sum(
+        "skipped ambiguous validated partition" in error
+        for error in result.errors
+    ) == 2
+    assert any(
+        "mbr_primary:1 at offset 512: overlaps 1 other declared partition extent(s)"
+        in error for error in result.errors
+    )
+    assert any(
+        "mbr_primary:2 at offset 1536: overlaps 1 other declared partition extent(s)"
+        in error for error in result.errors
+    )
+    report = next(
+        (tmp_path / "ambiguous-partition-cases").glob("*/reports/report.json")
+    ).read_text(encoding="utf-8")
+    assert "partition_extent_conflict" in report
+    assert "mbr_primary:1" in report and "mbr_primary:2" in report
+    assert "validated_partition_extraction" not in report
+
+
 def test_mmls_parser_output_drives_followup_offset_fls_run(tmp_path: Path) -> None:
     mmls = tmp_path / "mmls"
     mmls.write_text(

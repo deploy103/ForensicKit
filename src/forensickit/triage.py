@@ -750,12 +750,6 @@ class GenericTriageEngine:
             path, size, mbr_partitions,
         )
         gpt_details, gpt_partitions = self._gpt_partitions(path, size, gpt_header) if gpt else ({"valid": False}, [])
-        partition_filesystems = self._inspect_mbr_partition_filesystems(
-            path, size, mbr_partitions,
-        )
-        logical_partition_filesystems = self._inspect_mbr_logical_partition_filesystems(
-            path, size, logical_partitions,
-        )
         gpt_filesystem_validation = {
             "eligible": bool(
                 gpt_details.get("valid") is True
@@ -771,6 +765,17 @@ class GenericTriageEngine:
             gpt_filesystem_validation["reason"] = (
                 "GPT header geometry, header CRC, and complete partition-entry-table CRC must all validate"
             )
+        partition_extent_conflicts = self._partition_extent_conflicts(
+            mbr_partitions,
+            logical_partitions,
+            gpt_partitions if gpt_filesystem_validation["eligible"] else [],
+        )
+        partition_filesystems = self._inspect_mbr_partition_filesystems(
+            path, size, mbr_partitions,
+        )
+        logical_partition_filesystems = self._inspect_mbr_logical_partition_filesystems(
+            path, size, logical_partitions,
+        )
         gpt_partition_filesystems = (
             self._inspect_gpt_partition_filesystems(path, size, gpt_partitions)
             if gpt_filesystem_validation["eligible"] else []
@@ -792,6 +797,7 @@ class GenericTriageEngine:
             self._observation(artifact, "disk.gpt.partitions", gpt_partitions),
             self._observation(artifact, "disk.gpt.partition_filesystem_validation", gpt_filesystem_validation),
             self._observation(artifact, "disk.gpt.partition_filesystems", gpt_partition_filesystems),
+            self._observation(artifact, "disk.partition_extent_conflicts", partition_extent_conflicts),
             self._observation(artifact, "disk.ewf_signature", ewf),
             self._observation(artifact, "disk.qcow2_signature", header.startswith(b"QFI\xfb")),
             self._observation(artifact, "disk.qcow2.header", qcow_header),
@@ -919,6 +925,167 @@ class GenericTriageEngine:
         return partitions
 
     @staticmethod
+    def _partition_extent_conflicts(
+        primary_partitions: list[dict[str, object]],
+        logical_partitions: list[dict[str, object]],
+        gpt_partitions: list[dict[str, object]],
+    ) -> dict[str, object]:
+        """Inventory ambiguous data-partition extents under a fixed bounded table scope.
+
+        Extended MBR entries and the protective 0xEE entry are address-space
+        containers, not independently materializable data partitions. Their
+        expected containment of logical/GPT entries is retained but excluded
+        from conflict decisions.
+        """
+        candidates: list[tuple[dict[str, object], dict[str, object]]] = []
+        excluded: list[dict[str, object]] = []
+
+        def add_candidate(
+            record: dict[str, object],
+            *,
+            table: str,
+            index_key: str,
+            index_value: object,
+            start_key: str,
+            type_fields: tuple[str, ...],
+            excluded_role: str | None = None,
+        ) -> None:
+            start_lba = record.get(start_key)
+            sector_count = record.get("sector_count")
+            if (
+                record.get("entry_valid") is not True
+                or isinstance(start_lba, bool) or not isinstance(start_lba, int)
+                or isinstance(sector_count, bool) or not isinstance(sector_count, int)
+                or start_lba < 0 or sector_count <= 0
+            ):
+                return
+            identity = f"{table}:{index_value}"
+            descriptor: dict[str, object] = {
+                "identity": identity,
+                "partition_table": table,
+                "partition_extent_role": excluded_role or "data",
+                index_key: index_value,
+                "entry_offset": record.get("entry_offset"),
+                "start_lba": start_lba,
+                "end_lba": start_lba + sector_count - 1,
+                "sector_count": sector_count,
+                "partition_offset": start_lba * 512,
+                "partition_length": sector_count * 512,
+                "partition_end_offset_exclusive": (start_lba + sector_count) * 512,
+            }
+            for key in type_fields:
+                if key in record:
+                    descriptor[key] = record[key]
+            record["partition_extent_identity"] = identity
+            record["partition_extent_role"] = excluded_role or "data"
+            record["partition_extent_ambiguous"] = False
+            record["partition_extent_conflict_count"] = 0
+            if excluded_role is not None:
+                excluded.append(descriptor)
+                return
+            candidates.append((record, descriptor))
+
+        for partition in primary_partitions[:4]:
+            type_code = str(partition.get("type_code", "")).lower()
+            role = None
+            if type_code in {"0x05", "0x0f", "0x85"}:
+                role = "extended_container"
+            elif type_code == "0xee":
+                role = "gpt_protective_container"
+            add_candidate(
+                partition,
+                table="mbr_primary",
+                index_key="slot",
+                index_value=partition.get("slot"),
+                start_key="start_lba",
+                type_fields=("status", "type_code", "type", "raw_hex", "within_image"),
+                excluded_role=role,
+            )
+        for partition in logical_partitions[:32]:
+            add_candidate(
+                partition,
+                table="mbr_logical",
+                index_key="logical_partition_index",
+                index_value=partition.get("logical_index"),
+                start_key="start_lba",
+                type_fields=(
+                    "extended_primary_slot", "extended_base_lba", "extended_end_lba",
+                    "ebr_lba", "ebr_offset", "relative_start_lba", "status",
+                    "type_code", "type", "raw_hex", "within_image",
+                ),
+            )
+        for partition in gpt_partitions[:256]:
+            add_candidate(
+                partition,
+                table="gpt",
+                index_key="gpt_partition_index",
+                index_value=partition.get("index"),
+                start_key="first_lba",
+                type_fields=(
+                    "type_guid", "unique_guid", "name", "within_usable_range", "within_image",
+                ),
+            )
+
+        conflict_records: list[dict[str, object]] = []
+        conflict_count = 0
+        ambiguous_identities: set[str] = set()
+        for left_index, (left_record, left) in enumerate(candidates):
+            left_start = int(left["start_lba"])
+            left_end = int(left["end_lba"])
+            for right_record, right in candidates[left_index + 1:]:
+                right_start = int(right["start_lba"])
+                right_end = int(right["end_lba"])
+                overlap_start = max(left_start, right_start)
+                overlap_end = min(left_end, right_end)
+                if overlap_start > overlap_end:
+                    continue
+                relation = (
+                    "exact_duplicate"
+                    if left_start == right_start and left_end == right_end
+                    else "partial_overlap"
+                )
+                containment: str | None = None
+                if relation == "partial_overlap":
+                    if left_start <= right_start and right_end <= left_end:
+                        containment = "left_contains_right"
+                    elif right_start <= left_start and left_end <= right_end:
+                        containment = "right_contains_left"
+                conflict_count += 1
+                left_record["partition_extent_ambiguous"] = True
+                right_record["partition_extent_ambiguous"] = True
+                left_record["partition_extent_conflict_count"] = int(
+                    left_record["partition_extent_conflict_count"]
+                ) + 1
+                right_record["partition_extent_conflict_count"] = int(
+                    right_record["partition_extent_conflict_count"]
+                ) + 1
+                ambiguous_identities.update((str(left["identity"]), str(right["identity"])))
+                if len(conflict_records) < 128:
+                    conflict_records.append({
+                        "relation": relation,
+                        "containment": containment,
+                        "overlap_start_lba": overlap_start,
+                        "overlap_end_lba": overlap_end,
+                        "overlap_sector_count": overlap_end - overlap_start + 1,
+                        "overlap_offset": overlap_start * 512,
+                        "overlap_length": (overlap_end - overlap_start + 1) * 512,
+                        "left": left,
+                        "right": right,
+                    })
+        return {
+            "sector_size": 512,
+            "candidate_count": len(candidates),
+            "excluded_semantic_container_count": len(excluded),
+            "excluded_semantic_containers": excluded[:8],
+            "conflict_count": conflict_count,
+            "ambiguous_candidate_count": len(ambiguous_identities),
+            "ambiguous_candidate_identities": sorted(ambiguous_identities)[:256],
+            "ambiguous_candidate_identities_truncated": len(ambiguous_identities) > 256,
+            "records": conflict_records,
+            "records_truncated": conflict_count > len(conflict_records),
+        }
+
+    @staticmethod
     def _mbr_logical_partitions(
         path: Path,
         image_size: int,
@@ -1034,6 +1201,8 @@ class GenericTriageEngine:
                             "ebr_lba": current_ebr_lba,
                             "ebr_offset": ebr_offset,
                             "entry_offset": ebr_offset + 446,
+                            "entry_valid": True,
+                            "raw_hex": logical_entry.hex(),
                             "status": f"0x{status:02x}",
                             "bootable": status == 0x80,
                             "type_code": f"0x{kind:02x}",
@@ -1112,6 +1281,7 @@ class GenericTriageEngine:
             expected = expected_by_type.get(type_code, [])
             record: dict[str, object] = {
                 "slot": partition.get("slot"),
+                "partition_table": partition.get("partition_table", "mbr_primary"),
                 "partition_type_code": type_code,
                 "partition_type": partition.get("type"),
                 "start_lba": start_lba,
@@ -1122,6 +1292,10 @@ class GenericTriageEngine:
                 "partition_within_supplied_image": partition.get("within_image"),
                 "partition_entry_valid": partition.get("entry_valid"),
                 "partition_entry_offset": partition.get("entry_offset"),
+                "partition_extent_identity": partition.get("partition_extent_identity"),
+                "partition_extent_role": partition.get("partition_extent_role"),
+                "partition_extent_ambiguous": partition.get("partition_extent_ambiguous", False),
+                "partition_extent_conflict_count": partition.get("partition_extent_conflict_count", 0),
                 "boot_sector_offset": partition_offset,
                 "boot_sector_available": available_bytes >= 512,
                 "expected_filesystems_from_type_code": expected,
@@ -1258,6 +1432,7 @@ class GenericTriageEngine:
         for partition in partitions[:32]:
             pseudo_partition = {
                 "slot": partition.get("logical_index"),
+                "partition_table": "mbr_logical",
                 "type_code": partition.get("type_code"),
                 "type": partition.get("type"),
                 "start_lba": partition.get("start_lba"),
@@ -1265,6 +1440,10 @@ class GenericTriageEngine:
                 "within_image": partition.get("within_image"),
                 "entry_valid": True,
                 "entry_offset": partition.get("entry_offset"),
+                "partition_extent_identity": partition.get("partition_extent_identity"),
+                "partition_extent_role": partition.get("partition_extent_role"),
+                "partition_extent_ambiguous": partition.get("partition_extent_ambiguous"),
+                "partition_extent_conflict_count": partition.get("partition_extent_conflict_count"),
             }
             records = self._inspect_mbr_partition_filesystems(
                 path, image_size, [pseudo_partition],
@@ -1309,6 +1488,7 @@ class GenericTriageEngine:
             first_lba = int(partition.get("first_lba", 0))
             pseudo_partition = {
                 "slot": partition.get("index"),
+                "partition_table": "gpt",
                 "type_code": "",
                 "type": "GPT",
                 "start_lba": first_lba,
@@ -1316,6 +1496,10 @@ class GenericTriageEngine:
                 "within_image": partition.get("within_image"),
                 "entry_valid": partition.get("entry_valid"),
                 "entry_offset": partition.get("entry_offset"),
+                "partition_extent_identity": partition.get("partition_extent_identity"),
+                "partition_extent_role": partition.get("partition_extent_role"),
+                "partition_extent_ambiguous": partition.get("partition_extent_ambiguous"),
+                "partition_extent_conflict_count": partition.get("partition_extent_conflict_count"),
             }
             records = self._inspect_mbr_partition_filesystems(
                 path, image_size, [pseudo_partition],

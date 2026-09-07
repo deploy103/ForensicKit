@@ -38,6 +38,7 @@ Notable user-facing changes are documented here. This project follows Semantic V
 - CRC-validated GPT entries now receive the same exact-offset boot checks with GUID/name provenance; the declared backup header/table is independently CRC-checked and compared without selecting or repairing a copy.
 - Extended MBR partitions now receive bounded EBR-chain traversal with distinct current-EBR logical offsets and extended-base link offsets, cycle/bounds isolation, and exact-offset logical FAT/NTFS/exFAT boot validation.
 - Complete small partitions with structurally valid table entries and boot sectors can now become immutable child artifacts under extraction limits, recursively activating the existing filesystem parsers and FlagHunter with exact source-observation and byte-range lineage.
+- Primary MBR, EBR logical, and CRC-eligible GPT data extents now receive bounded cross-table duplicate/overlap analysis; every competing entry retains exact range provenance and is barred from recursive copying, while extended/protective MBR containers are inventoried but excluded from expected-containment conflicts.
 
 ## [1.1.0] - 2026-09-04
 

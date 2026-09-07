@@ -2656,6 +2656,14 @@ class ExtractionManager:
                     or offset + size > artifact.size
                 ):
                     continue
+                if candidate.get("partition_extent_ambiguous") is True:
+                    result.errors.append(
+                        "skipped ambiguous validated partition "
+                        f"{candidate.get('partition_extent_identity') or 'unknown'} "
+                        f"at offset {offset}: overlaps {candidate.get('partition_extent_conflict_count')} "
+                        "other declared partition extent(s)"
+                    )
+                    continue
                 extent = (offset, size)
                 if extent in seen_extents:
                     continue
@@ -2667,12 +2675,24 @@ class ExtractionManager:
                     )
                     continue
                 table = candidate.get("partition_table")
+                raw_identity_index: object
                 if table == "gpt":
-                    identity = f"gpt_{int(candidate.get('gpt_partition_index', candidate_index + 1)):03d}"
+                    raw_identity_index = candidate.get("gpt_partition_index")
+                    identity_prefix, identity_width = "gpt", 3
                 elif table == "mbr_logical":
-                    identity = f"mbr_logical_{int(candidate.get('logical_partition_index', candidate_index + 1)):03d}"
+                    raw_identity_index = candidate.get("logical_partition_index")
+                    identity_prefix, identity_width = "mbr_logical", 3
                 else:
-                    identity = f"mbr_primary_{int(candidate.get('slot', candidate_index + 1)):02d}"
+                    raw_identity_index = candidate.get("slot")
+                    identity_prefix, identity_width = "mbr_primary", 2
+                identity_index = (
+                    raw_identity_index
+                    if isinstance(raw_identity_index, int)
+                    and not isinstance(raw_identity_index, bool)
+                    and raw_identity_index > 0
+                    else candidate_index + 1
+                )
+                identity = f"{identity_prefix}_{identity_index:0{identity_width}d}"
                 logical_name = f"{identity}_{detected}.img"
                 output = target_root / safe_name(logical_name)
                 output.parent.mkdir(parents=True, exist_ok=True)
