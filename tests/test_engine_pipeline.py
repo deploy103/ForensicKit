@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import csv
 import gzip
+import hashlib
 import io
 import sqlite3
 import tarfile
@@ -171,6 +172,49 @@ def _iso9660_with_root_file(name: bytes, payload: bytes) -> bytes:
     image[20 * block_size:20 * block_size + len(root)] = root
     image[21 * block_size:21 * block_size + len(payload)] = payload
     return bytes(image)
+
+
+def _iso9660_with_multi_extent_file(
+    name: bytes, final_payload: bytes, *, final_identifier: bytes | None = None,
+    final_multi_extent: bool = False,
+) -> tuple[bytes, bytes]:
+    block_size = 2_048
+    first_payload = b"A" * block_size
+    assembled = first_payload + final_payload
+    image = bytearray(24 * block_size)
+    pvd_offset = 16 * block_size
+    image[pvd_offset] = 1
+    image[pvd_offset + 1:pvd_offset + 6] = b"CD001"
+    image[pvd_offset + 6] = 1
+    image[pvd_offset + 8:pvd_offset + 40] = b"FORENSICKIT".ljust(32, b" ")
+    image[pvd_offset + 40:pvd_offset + 72] = b"MULTI_EXTENT".ljust(32, b" ")
+    image[pvd_offset + 80:pvd_offset + 84] = (24).to_bytes(4, "little")
+    image[pvd_offset + 84:pvd_offset + 88] = (24).to_bytes(4, "big")
+    image[pvd_offset + 120:pvd_offset + 122] = (1).to_bytes(2, "little")
+    image[pvd_offset + 122:pvd_offset + 124] = (1).to_bytes(2, "big")
+    image[pvd_offset + 124:pvd_offset + 126] = (1).to_bytes(2, "little")
+    image[pvd_offset + 126:pvd_offset + 128] = (1).to_bytes(2, "big")
+    image[pvd_offset + 128:pvd_offset + 130] = block_size.to_bytes(2, "little")
+    image[pvd_offset + 130:pvd_offset + 132] = block_size.to_bytes(2, "big")
+    root_record = _iso_directory_record(b"\x00", 20, block_size, flags=0x02)
+    image[pvd_offset + 156:pvd_offset + 156 + len(root_record)] = root_record
+    terminator = 17 * block_size
+    image[terminator] = 255
+    image[terminator + 1:terminator + 6] = b"CD001"
+    image[terminator + 6] = 1
+    root = (
+        root_record
+        + _iso_directory_record(b"\x01", 20, block_size, flags=0x02)
+        + _iso_directory_record(name, 21, len(first_payload), flags=0x80)
+        + _iso_directory_record(
+            final_identifier or name, 22, len(final_payload),
+            flags=0x80 if final_multi_extent else 0,
+        )
+    )
+    image[20 * block_size:20 * block_size + len(root)] = root
+    image[21 * block_size:21 * block_size + len(first_payload)] = first_payload
+    image[22 * block_size:22 * block_size + len(final_payload)] = final_payload
+    return bytes(image), assembled
 
 
 def _iso9660_with_nested_file(
@@ -687,6 +731,108 @@ def test_iso9660_root_file_recurses_with_descriptor_and_extent_lineage(tmp_path:
     assert "ISO 9660 filesystem image" in report
     assert "builtin_iso9660_extractor" in report
     assert "CTF{iso9660_recursive_lineage}" in report
+
+
+def test_iso9660_multi_extent_file_is_assembled_once_with_segment_lineage(
+    tmp_path: Path,
+) -> None:
+    final_payload = b"CTF{iso9660_multi_extent_recursive}"
+    image, assembled = _iso9660_with_multi_extent_file(
+        b"SPLIT.BIN;1", final_payload,
+    )
+    evidence = tmp_path / "multi-extent.iso"
+    evidence.write_bytes(image)
+
+    result = AnalysisEngine().analyze(
+        evidence, tmp_path / "multi-extent-cases", mode=AnalysisMode.AUTO,
+        execute=False,
+    )
+
+    assert [item.logical_name for item in result.artifacts] == [
+        "multi-extent.iso", "SPLIT.BIN",
+    ]
+    child = result.artifacts[1]
+    assert child.parent_id == result.artifacts[0].id
+    assert child.size == len(assembled)
+    assert child.sha256 == hashlib.sha256(assembled).hexdigest()
+    assert any(
+        candidate.value == "CTF{iso9660_multi_extent_recursive}"
+        and candidate.artifact_id == child.id
+        for candidate in result.flags
+    )
+    regular_files = next(
+        item.value for item in result.observations
+        if item.artifact_id == result.artifacts[0].id
+        and item.key == "archive.iso9660.regular_files"
+    )
+    assert len(regular_files) == 1
+    entry = regular_files[0]
+    assert entry["multi_extent_assembled"] is True
+    assert entry["assembled_data_length"] == len(assembled)
+    assert [segment["data_offset"] for segment in entry["multi_extent_segments"]] == [
+        21 * 2_048, 22 * 2_048,
+    ]
+    chains = next(
+        item.value for item in result.observations
+        if item.artifact_id == result.artifacts[0].id
+        and item.key == "archive.iso9660.multi_extent_chains"
+    )
+    assert len(chains) == 1
+    assert chains[0]["complete"] is True
+    recovery = next(
+        item for item in result.findings
+        if item.source == "builtin_iso9660_extractor"
+    )
+    evidence_line = recovery.supporting_evidence[0]
+    assert "multi_extent:True" in evidence_line
+    assert f"'data_offset': {21 * 2_048}, 'data_length': 2048" in evidence_line
+    assert f"'data_offset': {22 * 2_048}, 'data_length': {len(final_payload)}" in evidence_line
+    report = next(
+        (tmp_path / "multi-extent-cases").glob("*/reports/report.json")
+    ).read_text(encoding="utf-8")
+    assert "archive.iso9660.multi_extent_chains" in report
+    assert "CTF{iso9660_multi_extent_recursive}" in report
+
+
+def test_iso9660_incomplete_multi_extent_chain_is_never_partially_extracted(
+    tmp_path: Path,
+) -> None:
+    image, _ = _iso9660_with_multi_extent_file(
+        b"SPLIT.BIN;1", b"partial-tail", final_multi_extent=True,
+    )
+    evidence = tmp_path / "incomplete-multi-extent.iso"
+    evidence.write_bytes(image)
+
+    result = AnalysisEngine().analyze(
+        evidence, tmp_path / "incomplete-multi-cases", mode=AnalysisMode.AUTO,
+        execute=False,
+    )
+
+    assert [item.logical_name for item in result.artifacts] == [
+        "incomplete-multi-extent.iso",
+    ]
+    regular_files = next(
+        item.value for item in result.observations
+        if item.artifact_id == result.artifacts[0].id
+        and item.key == "archive.iso9660.regular_files"
+    )
+    assert len(regular_files) == 1
+    assert regular_files[0]["multi_extent_chain_complete"] is False
+    assert regular_files[0]["extraction_eligible"] is False
+    errors = next(
+        item.value for item in result.observations
+        if item.artifact_id == result.artifacts[0].id
+        and item.key == "archive.iso9660.multi_extent_errors"
+    )
+    assert "missing_final_record" in errors[0]["failed_checks"]
+    assert any(
+        "unsupported multi-extent/interleaved layout" in error
+        for error in result.errors
+    )
+    assert any(
+        finding.category == "iso9660_multi_extent_anomaly"
+        for finding in result.findings
+    )
 
 
 def test_iso9660_nested_file_recurses_with_directory_identity_lineage(tmp_path: Path) -> None:
