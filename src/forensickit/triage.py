@@ -3080,6 +3080,71 @@ class GenericTriageEngine:
                         entry[f"{field_name}_both_endian_match"] = little == big
                         if little != big:
                             fail(entry, f"RRIP PX {field_name} both-endian mismatch")
+            elif signature == "PN":
+                if entry_length != 20:
+                    fail(entry, "invalid RRIP PN entry length")
+                else:
+                    for field_index, field_name in enumerate(("device_high", "device_low")):
+                        field_offset = 4 + field_index * 8
+                        little = int.from_bytes(raw[field_offset:field_offset + 4], "little")
+                        big = int.from_bytes(raw[field_offset + 4:field_offset + 8], "big")
+                        entry[field_name] = little
+                        entry[f"{field_name}_big_endian"] = big
+                        entry[f"{field_name}_both_endian_match"] = little == big
+                        if little != big:
+                            fail(entry, f"RRIP PN {field_name} both-endian mismatch")
+            elif signature == "TF":
+                if entry_length < 5:
+                    fail(entry, "truncated RRIP TF entry")
+                else:
+                    flags = raw[4]
+                    long_form = bool(flags & 0x80)
+                    timestamp_length = 17 if long_form else 7
+                    timestamp_names = (
+                        "creation", "modify", "access", "attributes",
+                        "backup", "expiration", "effective",
+                    )
+                    present_names = [
+                        name for bit, name in enumerate(timestamp_names)
+                        if flags & (1 << bit)
+                    ]
+                    expected_length = 5 + len(present_names) * timestamp_length
+                    entry.update({
+                        "flags_raw": f"0x{flags:02x}",
+                        "long_form": long_form,
+                        "timestamp_length": timestamp_length,
+                        "fields_present": present_names,
+                        "timestamps": {},
+                    })
+                    if expected_length != entry_length:
+                        fail(entry, "RRIP TF flags and entry length disagree")
+                    else:
+                        time_cursor = 5
+                        for timestamp_name in present_names:
+                            timestamp_raw = raw[time_cursor:time_cursor + timestamp_length]
+                            if long_form:
+                                timestamp, timestamp_valid, offset_units = (
+                                    GenericTriageEngine._iso9660_long_recording_time(
+                                        timestamp_raw
+                                    )
+                                )
+                            else:
+                                timestamp, timestamp_valid = (
+                                    GenericTriageEngine._iso9660_recording_time(timestamp_raw)
+                                )
+                                offset_units = (
+                                    timestamp_raw[6] - 256
+                                    if timestamp_raw[6] >= 128 else timestamp_raw[6]
+                                )
+                            entry["timestamps"][timestamp_name] = {
+                                "raw_hex": timestamp_raw.hex(),
+                                "utc": timestamp,
+                                "valid": timestamp_valid,
+                                "gmt_offset_15_minutes": offset_units,
+                            }
+                            if not timestamp_valid:
+                                fail(entry, f"invalid RRIP TF {timestamp_name} timestamp")
+                            time_cursor += timestamp_length
             elif signature == "SL":
                 if entry_length < 5:
                     fail(entry, "truncated RRIP SL entry")
@@ -3416,6 +3481,41 @@ class GenericTriageEngine:
             if file_type not in {"regular", "directory"}:
                 record["rock_ridge_non_regular"] = True
 
+        tf_entries = [
+            entry for entry in rrip_entries if entry.get("signature") == "TF"
+        ]
+        if tf_entries:
+            timestamps: list[dict[str, object]] = []
+            seen_timestamp_names: set[str] = set()
+            for tf_entry in tf_entries:
+                entry_timestamps = tf_entry.get("timestamps", {})
+                if not isinstance(entry_timestamps, dict):
+                    continue
+                for timestamp_name, timestamp_value in entry_timestamps.items():
+                    timestamps.append({
+                        "type": timestamp_name,
+                        "value": timestamp_value,
+                        "source_absolute_offset": tf_entry.get("absolute_offset"),
+                        "long_form": tf_entry.get("long_form"),
+                    })
+                    if timestamp_name in seen_timestamp_names:
+                        anomalies.append(f"duplicate_rock_ridge_timestamp:{timestamp_name}")
+                    seen_timestamp_names.add(timestamp_name)
+            record["rock_ridge_timestamps"] = timestamps
+
+        pn_entries = [
+            entry for entry in rrip_entries if entry.get("signature") == "PN"
+        ]
+        if pn_entries:
+            record["rock_ridge_devices"] = [{
+                "device_high": entry.get("device_high"),
+                "device_low": entry.get("device_low"),
+                "source_absolute_offset": entry.get("absolute_offset"),
+                "valid": entry.get("valid"),
+            } for entry in pn_entries]
+            if len(pn_entries) > 1:
+                anomalies.append("duplicate_rock_ridge_device_number")
+
         nm_entries = [
             entry for entry in rrip_entries if entry.get("signature") == "NM"
         ]
@@ -3696,6 +3796,27 @@ class GenericTriageEngine:
         return record, None if not failed_checks else (
             f"ISO directory record at offset {record_offset} failed: {', '.join(failed_checks)}"
         )
+
+    @staticmethod
+    def _iso9660_long_recording_time(
+        raw: bytes,
+    ) -> tuple[str | None, bool, int | None]:
+        if len(raw) != 17 or not raw[:16].isdigit():
+            return None, False, None
+        offset_units = raw[16] - 256 if raw[16] >= 128 else raw[16]
+        try:
+            if not -48 <= offset_units <= 52:
+                return None, False, offset_units
+            text = raw[:16].decode("ascii")
+            local_time = datetime(
+                int(text[0:4]), int(text[4:6]), int(text[6:8]),
+                int(text[8:10]), int(text[10:12]), int(text[12:14]),
+                int(text[14:16]) * 10_000,
+            )
+            utc_time = local_time - timedelta(minutes=offset_units * 15)
+        except (UnicodeDecodeError, ValueError):
+            return None, False, offset_units
+        return utc_time.replace(tzinfo=UTC).isoformat(), True, offset_units
 
     @staticmethod
     def _iso9660_recording_time(raw: bytes) -> tuple[str | None, bool]:

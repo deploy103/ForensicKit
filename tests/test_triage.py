@@ -174,6 +174,15 @@ def _rrip_ce(block: int, offset: int, length: int) -> bytes:
     )
 
 
+def _rrip_tf_short(*, modify: bytes) -> bytes:
+    assert len(modify) == 7
+    return _susp_entry(b"TF", b"\x02" + modify)
+
+
+def _rrip_pn(device_high: int, device_low: int) -> bytes:
+    return _susp_entry(b"PN", _iso_both32(device_high) + _iso_both32(device_low))
+
+
 def _iso9660_with_rock_ridge(
     *, unsafe_file_name: bool = False, continued_name: bool = False,
     continuation_cycle: bool = False,
@@ -250,11 +259,16 @@ def _iso9660_with_rock_ridge(
         )
     )
     file_system_use = (
-        skip_prefix + _rrip_px(0o100640) + file_name_entries + _susp_entry(b"ST")
+        skip_prefix
+        + _rrip_px(0o100640)
+        + _rrip_tf_short(modify=bytes((124, 2, 3, 4, 5, 6, 4)))
+        + file_name_entries
+        + _susp_entry(b"ST")
     )
     symlink_system_use = (
         skip_prefix
         + _rrip_px(0o120777)
+        + _rrip_pn(8, 1)
         + _susp_entry(b"NM", b"\x00latest")
         + _susp_entry(b"SL", b"\x00\x04\x00\x00\x06secret")
         + _susp_entry(b"ST")
@@ -1894,6 +1908,20 @@ def test_iso9660_rock_ridge_names_posix_metadata_and_symlinks_are_bounded(
     assert nested["data_length"] == len(payload)
     assert nested["rock_ridge_posix"]["file_type"] == "regular"
     assert nested["rock_ridge_posix"]["permissions"] == "0o0640"
+    assert nested["rock_ridge_timestamps"] == [{
+        "type": "modify",
+        "value": {
+            "raw_hex": "7c020304050604",
+            "utc": "2024-02-03T03:05:06+00:00",
+            "valid": True,
+            "gmt_offset_15_minutes": 4,
+        },
+        "source_absolute_offset": next(
+            item["absolute_offset"] for item in nested["susp_entries"]
+            if item["signature"] == "TF"
+        ),
+        "long_form": False,
+    }]
     assert nested["containing_directory_identity"]["logical_name"] == "Evidence Directory"
     assert nested["extraction_eligible"] is True
     for susp_entry in nested["susp_entries"]:
@@ -1907,6 +1935,15 @@ def test_iso9660_rock_ridge_names_posix_metadata_and_symlinks_are_bounded(
     assert symlink["rock_ridge_posix"]["file_type"] == "symlink"
     assert symlink["rock_ridge_symlink"] is True
     assert symlink["extraction_eligible"] is False
+    assert symlink["rock_ridge_devices"] == [{
+        "device_high": 8,
+        "device_low": 1,
+        "source_absolute_offset": next(
+            item["absolute_offset"] for item in symlink["susp_entries"]
+            if item["signature"] == "PN"
+        ),
+        "valid": True,
+    }]
     sl_entry = symlink["rock_ridge_symlink_entries"][0]
     assert sl_entry["valid"] is True
     assert sl_entry["components"][0]["parent"] is True
@@ -1920,6 +1957,7 @@ def test_iso9660_rock_ridge_names_posix_metadata_and_symlinks_are_bounded(
     assert values["archive.iso9660.rock_ridge_symlink_count"] == 1
     profile = ProfileEngine().evaluate(artifact, observations)
     assert any(item.category == "archive_link_metadata" for item in profile.findings)
+    assert any(item.category == "archive_device_metadata" for item in profile.findings)
     assert not any(item.category == "iso9660_susp_anomaly" for item in profile.findings)
 
     unsafe_image, _ = _iso9660_with_rock_ridge(unsafe_file_name=True)
@@ -2019,6 +2057,34 @@ def test_iso9660_rock_ridge_ce_continuation_completes_name_with_exact_provenance
         item.category == "iso9660_susp_anomaly"
         for item in cycle_profile.findings
     )
+
+
+def test_iso9660_rock_ridge_tf_long_form_and_pn_mismatch_validate() -> None:
+    long_time = b"2024020304050675" + bytes((0xFC,))
+    tf = _susp_entry(b"TF", b"\x82" + long_time)
+    pn = bytearray(_rrip_pn(8, 1))
+    pn[8:12] = (9).to_bytes(4, "big")
+    entries, error = GenericTriageEngine._iso9660_susp_records(
+        tf + bytes(pn) + _susp_entry(b"ST"), skip_bytes=0,
+    )
+    assert error == "RRIP PN device_high both-endian mismatch"
+    tf_entry = entries[0]
+    assert tf_entry["signature"] == "TF"
+    assert tf_entry["valid"] is True
+    assert tf_entry["long_form"] is True
+    assert tf_entry["timestamp_length"] == 17
+    assert tf_entry["timestamps"]["modify"] == {
+        "raw_hex": long_time.hex(),
+        "utc": "2024-02-03T05:05:06.750000+00:00",
+        "valid": True,
+        "gmt_offset_15_minutes": -4,
+    }
+    pn_entry = entries[1]
+    assert pn_entry["signature"] == "PN"
+    assert pn_entry["valid"] is False
+    assert pn_entry["device_high"] == 8
+    assert pn_entry["device_high_big_endian"] == 9
+    assert pn_entry["device_high_both_endian_match"] is False
 
 
 def test_iso9660_joliet_tree_reconciles_ucs2_path_to_primary_extent(
