@@ -1,10 +1,10 @@
 # ForensicKit Work Queue
 
-Last reviewed: 2026-09-07 11:35 KST
+Last reviewed: 2026-09-07 11:47 KST
 
 ## Post-v1.1 backlog
 
-- [ ] Validate Rock Ridge `CL`/`PL`/`RE` relocated-directory references without unsafe inferred traversal.
+- [ ] Add bounded ISO multi-extent regular-file assembly with ordered record-chain provenance.
 
 ## v1.1.0 release gate
 
@@ -17,6 +17,7 @@ Last reviewed: 2026-09-07 11:35 KST
 
 ## Completed this session
 
+- [x] Rock Ridge `CL`/`PL`/`RE` relocation-role validation and non-traversing extent reconciliation.
 - [x] Rock Ridge `TF` short/long timestamp and `PN` both-endian device metadata parsing.
 - [x] Bounded Rock Ridge `CE` continuation-area resolution with range/cycle/overlap/hash provenance.
 - [x] Bounded primary ISO little-/big-endian path-table parsing, copy comparison, and directory reconciliation.

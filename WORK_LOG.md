@@ -1,5 +1,18 @@
 # ForensicKit Work Log
 
+## 2026-09-07 11:47 KST
+
+### Rock Ridge relocated-directory metadata
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/profiles/archive.py`, `tests/test_triage.py`, and `tests/test_engine_pipeline.py`.
+- RRIP `CL` and `PL` records now retain distinct both-endian child/parent link blocks rather than one ambiguous field, while `RE` markers retain their exact source entry offsets. Duplicate roles, `CL` on non-directories, `PL` outside `..`, and `RE` on non-directories enter the SUSP anomaly path.
+- Each link target is compared by exact block only against already validated primary directory extents, retaining match count, matched record offset/path, and an explicit unique-reconciliation verdict. This comparison is evidence only: entries carrying `CL` or `RE` are marked relocation-suppressed and never scheduled by the native directory walker, even when a unique target exists. No relocated path or child content is inferred.
+- Synthetic triage covers a placeholder `CL`, root-parent `PL`, and `RR_MOVED`/`RE` target with exact reconciliation and confirms no traversal error is mislabeled. An AUTO E2E proves the relocation inventory and informational finding persist while the hidden directory payload never becomes a child. Focused triage/Engine regressions passed: 165 passed, 0 failed. The full direct synthetic suite passed: 326 passed, 0 failed. `python -m compileall -q src tests scripts` and `git diff --check` passed.
+
+### Next
+
+- Assemble bounded ISO 9660 multi-extent regular files only from adjacent, identifier/version-consistent record chains with complete image-bounded segments and exact per-record provenance.
+
 ## 2026-09-07 11:35 KST
 
 ### Rock Ridge TF timestamps and PN device metadata

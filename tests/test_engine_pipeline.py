@@ -135,6 +135,11 @@ def _rrip_pn(device_high: int, device_low: int) -> bytes:
     return _susp_entry(b"PN", data)
 
 
+def _rrip_link(signature: bytes, block: int) -> bytes:
+    data = block.to_bytes(4, "little") + block.to_bytes(4, "big")
+    return _susp_entry(signature, data)
+
+
 def _iso9660_with_root_file(name: bytes, payload: bytes) -> bytes:
     block_size = 2_048
     image = bytearray(23 * block_size)
@@ -171,6 +176,7 @@ def _iso9660_with_root_file(name: bytes, payload: bytes) -> bytes:
 def _iso9660_with_nested_file(
     name: bytes, payload: bytes, *, rock_ridge: bool = False,
     path_tables: bool = False, rock_ridge_continuation: bool = False,
+    rock_ridge_relocation: bool = False,
 ) -> bytes:
     block_size = 2_048
     image = bytearray(24 * block_size)
@@ -222,12 +228,15 @@ def _iso9660_with_nested_file(
             + _susp_entry(b"ST")
         )
         parent_system_use = (
-            skip_prefix + _rrip_px(0o040755, links=2) + _susp_entry(b"ST")
+            skip_prefix + _rrip_px(0o040755, links=2)
+            + (_rrip_link(b"PL", 20) if rock_ridge_relocation else b"")
+            + _susp_entry(b"ST")
         )
         directory_system_use = (
             skip_prefix
             + _rrip_px(0o040750, links=2)
             + _susp_entry(b"NM", b"\x00Evidence Directory")
+            + (_rrip_link(b"CL", 22) if rock_ridge_relocation else b"")
             + _susp_entry(b"ST")
         )
         root_self = _iso_directory_record(
@@ -237,9 +246,18 @@ def _iso9660_with_nested_file(
             b"\x01", 20, block_size, flags=0x02, system_use=parent_system_use,
         )
         directory = _iso_directory_record(
-            b"LONGDIR", 22, block_size, flags=0x02,
+            b"LONGDIR", 21 if rock_ridge_relocation else 22,
+            block_size, flags=0x02,
             system_use=directory_system_use,
         )
+        if rock_ridge_relocation:
+            directory += _iso_directory_record(
+                b"RR_MOVED", 22, block_size, flags=0x02,
+                system_use=(
+                    skip_prefix + _rrip_px(0o040700, links=2)
+                    + _susp_entry(b"RE") + _susp_entry(b"ST")
+                ),
+            )
     else:
         root_self = root_record
         parent = _iso_directory_record(b"\x01", 20, block_size, flags=0x02)
@@ -809,6 +827,41 @@ def test_iso9660_rock_ridge_name_recurses_while_symlink_stays_metadata_only(
     assert "rock_ridge_timestamps" in report
     assert "rock_ridge_devices" in report
     assert "CTF{rock_ridge_recursive_lineage}" in report
+
+
+def test_iso9660_rock_ridge_relocation_is_reported_without_inferred_children(
+    tmp_path: Path,
+) -> None:
+    evidence = tmp_path / "relocated.iso"
+    evidence.write_bytes(_iso9660_with_nested_file(
+        b"FLAG000.TXT;1", b"UNREACHED_PAYLOAD", rock_ridge=True,
+        rock_ridge_relocation=True,
+    ))
+    result = AnalysisEngine().analyze(
+        evidence, tmp_path / "relocated-cases", mode=AnalysisMode.AUTO,
+        execute=False,
+    )
+    assert [item.logical_name for item in result.artifacts] == ["relocated.iso"]
+    relocation_observation = next(
+        item for item in result.observations
+        if item.key == "archive.iso9660.rock_ridge_relocations"
+    )
+    placeholder = next(
+        item for item in relocation_observation.value
+        if item["source_file_identifier"] == "LONGDIR"
+    )
+    assert placeholder["child_links"][0]["known_directory_archive_path"] == "RR_MOVED"
+    assert placeholder["traversal_suppressed"] is True
+    finding = next(
+        item for item in result.findings
+        if item.category == "archive_relocated_directory_metadata"
+    )
+    assert finding.severity == "info"
+    report = next(
+        (tmp_path / "relocated-cases").glob("*/reports/report.json")
+    ).read_text(encoding="utf-8")
+    assert "rock_ridge_relocations" in report
+    assert "rock_ridge_relocation_traversal_suppressed" in report
 
 
 def test_iso9660_joliet_extent_alias_recurses_once_with_ucs2_lineage(

@@ -512,6 +512,41 @@ class ArchiveProfile(BaseProfile):
                     severity="info",
                 )
             )
+        rock_ridge_relocations = next(
+            (
+                value for value in context.values(
+                    "archive.iso9660.rock_ridge_relocations"
+                )
+                if isinstance(value, list)
+            ),
+            [],
+        )
+        if rock_ridge_relocations:
+            unresolved_relocations = [
+                record for record in rock_ridge_relocations
+                if isinstance(record, dict)
+                and any(
+                    isinstance(link, dict)
+                    and link.get("uniquely_reconciled") is not True
+                    for role in ("child_links", "parent_links")
+                    for link in record.get(role, [])
+                )
+            ]
+            result.findings.append(
+                self.finding(
+                    context,
+                    title="Rock Ridge relocated-directory metadata retained without traversal",
+                    category="archive_relocated_directory_metadata",
+                    confidence=0.98,
+                    explanation=(
+                        "RRIP CL/PL/RE metadata describes relocated directory relationships. "
+                        "References are compared only with already validated directory extents; no "
+                        "relocation link is followed or used to infer an extraction path."
+                    ),
+                    evidence=[str(item)[:2_000] for item in rock_ridge_relocations[:16]],
+                    severity="medium" if unresolved_relocations else "info",
+                )
+            )
         unsupported_iso_entries = [
             item for item in iso_entries
             if isinstance(item, dict)

@@ -48,6 +48,7 @@ Notable user-facing changes are documented here. This project follows Semantic V
 - Primary ISO Type-L/Type-M path-table copies now receive bounded framing, hash, parent/path, endian-independent comparison, and exact active-directory reconciliation; divergent copies remain non-authoritative anomaly evidence.
 - Rock Ridge `CE` continuation areas now resolve under global byte/count/depth and overlap bounds; continued names retain exact source/hash provenance and are revalidated before extraction, while cycles or partial continuations remain metadata-only.
 - Rock Ridge short/long `TF` timestamps now retain raw offsets and normalized UTC, while both-endian `PN` device numbers are reported without ever materializing device nodes.
+- Rock Ridge `CL`/`PL`/`RE` relocation roles and target blocks are validated and reconciled to known directory extents, but remain deliberately non-traversing metadata to avoid inferred paths and cycles.
 
 ## [1.1.0] - 2026-09-04
 
