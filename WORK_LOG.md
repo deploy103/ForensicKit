@@ -1,5 +1,18 @@
 # ForensicKit Work Log
 
+## 2026-09-07 10:56 KST
+
+### Joliet supplementary-volume traversal and extent aliases
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/profiles/archive.py`, `src/forensickit/extraction.py`, `tests/test_triage.py`, and `tests/test_engine_pipeline.py`.
+- Type-2 supplementary descriptors with exact `%/@`, `%/C`, or `%/E` escape sequences now receive independent both-endian volume/set/sequence/block/path-table, declared-range, volume-identifier, and root-record validation. Big-endian UCS-2 names reject odd byte counts and UTF-16 surrogate semantics; original identifier bytes, descriptor level, and exact offsets remain visible.
+- The highest valid Joliet level drives a separate bounded root/subdirectory walk under the same 32-directory, 8-MiB, 4,096-entry, dot/dotdot, block-boundary, layout, and shared/cyclic-extent constraints. Exact unique `(data_offset, data_length)` matches reconcile Joliet paths to primary-volume files without creating a second extraction candidate; ambiguity is reported and cannot drive an alias. A valid unmatched Joliet-only regular extent remains eligible under the ordinary safety contract.
+- Primary/Rock Ridge path priority is preserved, otherwise a uniquely reconciled Joliet path supplies the child logical name. Extraction evidence retains both primary and Joliet record offsets, descriptor offset, archive paths, and Joliet directory lineage. Synthetic triage and AUTO fixtures prove primary `FILE000.TXT;1` plus Joliet `증거/깃발.txt` produce exactly one child and FlagCandidate with both namespaces in report provenance. Focused triage/Engine regressions passed: 156 passed, 0 failed. The full direct synthetic suite passed: 317 passed, 0 failed. `python -m compileall -q src tests scripts` and `git diff --check` passed.
+
+### Next
+
+- Validate bounded El Torito boot records/catalogs and copy only fully image-bounded declared boot images as recursive children with catalog-entry provenance.
+
 ## 2026-09-07 10:44 KST
 
 ### Rock Ridge SUSP/RRIP metadata and safe names

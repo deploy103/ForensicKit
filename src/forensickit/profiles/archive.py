@@ -297,6 +297,69 @@ class ArchiveProfile(BaseProfile):
                     severity="medium",
                 )
             )
+        joliet_descriptors = next(
+            (
+                value for value in context.values("archive.iso9660.joliet_descriptors")
+                if isinstance(value, list)
+            ),
+            [],
+        )
+        invalid_joliet_descriptors = [
+            item for item in joliet_descriptors
+            if isinstance(item, dict) and item.get("valid") is not True
+        ]
+        joliet_traversal_errors = next(
+            (
+                value for value in context.values("archive.iso9660.joliet_traversal_errors")
+                if isinstance(value, list)
+            ),
+            [],
+        )
+        joliet_reconciliation_errors = next(
+            (
+                value for value in context.values(
+                    "archive.iso9660.joliet_reconciliation_errors"
+                )
+                if isinstance(value, list)
+            ),
+            [],
+        )
+        joliet_truncated = next(
+            (
+                value for value in context.values(
+                    "archive.iso9660.joliet_traversal_truncated"
+                )
+                if isinstance(value, bool)
+            ),
+            False,
+        )
+        if (
+            invalid_joliet_descriptors
+            or joliet_traversal_errors
+            or joliet_reconciliation_errors
+            or joliet_truncated
+        ):
+            result.findings.append(
+                self.finding(
+                    context,
+                    title="ISO 9660 Joliet namespace anomaly or ambiguity",
+                    category="iso9660_joliet_anomaly",
+                    confidence=0.97,
+                    explanation=(
+                        "A Joliet supplementary descriptor/UCS-2BE directory record failed "
+                        "validation, its bounded tree walk was incomplete, or an extent could not "
+                        "be uniquely reconciled with the primary namespace. Ambiguous names do not "
+                        "drive duplicate extraction."
+                    ),
+                    evidence=(
+                        [str(item)[:2_000] for item in invalid_joliet_descriptors[:8]]
+                        + [str(item)[:2_000] for item in joliet_traversal_errors[:8]]
+                        + [str(item)[:2_000] for item in joliet_reconciliation_errors[:8]]
+                        + (["joliet_traversal_truncated=True"] if joliet_truncated else [])
+                    ),
+                    severity="medium",
+                )
+            )
         iso_entries = next(
             (
                 value for value in context.values("archive.iso9660.directory_entries")

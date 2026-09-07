@@ -1,10 +1,10 @@
 # ForensicKit Work Queue
 
-Last reviewed: 2026-09-07 10:44 KST
+Last reviewed: 2026-09-07 10:56 KST
 
 ## Post-v1.1 backlog
 
-- [ ] Add bounded Joliet supplementary-volume descriptor and UCS-2 directory-name traversal with duplicate-extent reconciliation.
+- [ ] Add bounded El Torito boot-record/catalog validation and safe boot-image child extraction with catalog provenance.
 
 ## v1.1.0 release gate
 
@@ -17,6 +17,7 @@ Last reviewed: 2026-09-07 10:44 KST
 
 ## Completed this session
 
+- [x] Bounded Joliet supplementary-volume/UCS-2 tree traversal with exact primary-extent alias reconciliation.
 - [x] Bounded Rock Ridge SUSP/RRIP alternate-name/POSIX metadata parsing with symlink non-materialization.
 - [x] Bounded ISO 9660 active subdirectory traversal with shared-extent/cycle protection and directory lineage.
 - [x] Bounded ISO 9660 primary-volume/root directory parsing and safe single-extent regular-file recursive extraction.

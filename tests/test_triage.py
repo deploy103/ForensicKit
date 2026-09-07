@@ -249,6 +249,72 @@ def _iso9660_with_rock_ridge(*, unsafe_file_name: bool = False) -> tuple[bytes, 
     return bytes(image), payload
 
 
+def _iso9660_with_joliet_alias() -> tuple[bytes, bytes]:
+    block_size = 2_048
+    image = bytearray(25 * block_size)
+    pvd_offset = 16 * block_size
+    pvd = memoryview(image)[pvd_offset:pvd_offset + block_size]
+    pvd[0] = 1
+    pvd[1:6] = b"CD001"
+    pvd[6] = 1
+    pvd[8:40] = b"FORENSICKIT".ljust(32, b" ")
+    pvd[40:72] = b"JOLIET_PRIMARY".ljust(32, b" ")
+    pvd[80:88] = _iso_both32(25)
+    pvd[120:124] = _iso_both16(1)
+    pvd[124:128] = _iso_both16(1)
+    pvd[128:132] = _iso_both16(block_size)
+    pvd[132:140] = _iso_both32(0)
+    primary_root_record = _iso_directory_record(
+        b"\x00", 20, block_size, flags=0x02,
+    )
+    pvd[156:156 + len(primary_root_record)] = primary_root_record
+
+    svd_offset = 17 * block_size
+    svd = memoryview(image)[svd_offset:svd_offset + block_size]
+    svd[0] = 2
+    svd[1:6] = b"CD001"
+    svd[6] = 1
+    svd[8:40] = b"\x00" * 32
+    volume_identifier = "졸리엣".encode("utf-16-be")
+    svd[40:72] = volume_identifier.ljust(32, b"\x00")
+    svd[80:88] = _iso_both32(25)
+    svd[88:91] = b"%/E"
+    svd[120:124] = _iso_both16(1)
+    svd[124:128] = _iso_both16(1)
+    svd[128:132] = _iso_both16(block_size)
+    svd[132:140] = _iso_both32(0)
+    joliet_root_record = _iso_directory_record(
+        b"\x00", 21, block_size, flags=0x02,
+    )
+    svd[156:156 + len(joliet_root_record)] = joliet_root_record
+    terminator = 18 * block_size
+    image[terminator] = 255
+    image[terminator + 1:terminator + 6] = b"CD001"
+    image[terminator + 6] = 1
+
+    payload = b"CTF{joliet_extent_alias}"
+    primary_root = (
+        primary_root_record
+        + _iso_directory_record(b"\x01", 20, block_size, flags=0x02)
+        + _iso_directory_record(b"FILE000.TXT;1", 24, len(payload))
+    )
+    image[20 * block_size:20 * block_size + len(primary_root)] = primary_root
+    joliet_root = (
+        joliet_root_record
+        + _iso_directory_record(b"\x01", 21, block_size, flags=0x02)
+        + _iso_directory_record("증거".encode("utf-16-be"), 22, block_size, flags=0x02)
+    )
+    image[21 * block_size:21 * block_size + len(joliet_root)] = joliet_root
+    joliet_directory = (
+        _iso_directory_record(b"\x00", 22, block_size, flags=0x02)
+        + _iso_directory_record(b"\x01", 21, block_size, flags=0x02)
+        + _iso_directory_record("깃발.txt;1".encode("utf-16-be"), 24, len(payload))
+    )
+    image[22 * block_size:22 * block_size + len(joliet_directory)] = joliet_directory
+    image[24 * block_size:24 * block_size + len(payload)] = payload
+    return bytes(image), payload
+
+
 def _iso9660_with_subdirectory(*, shared_extent: bool = False) -> tuple[bytes, bytes]:
     block_size = 2_048
     image = bytearray(25 * block_size)
@@ -1677,6 +1743,76 @@ def test_iso9660_rock_ridge_names_posix_metadata_and_symlinks_are_bounded(
     assert any(
         item.category == "archive_unsafe_member_path"
         for item in unsafe_profile.findings
+    )
+
+
+def test_iso9660_joliet_tree_reconciles_ucs2_path_to_primary_extent(
+    tmp_path: Path,
+) -> None:
+    block_size = 2_048
+    image, payload = _iso9660_with_joliet_alias()
+    evidence = tmp_path / "joliet.iso"
+    evidence.write_bytes(image)
+    artifact = _artifact(evidence)
+
+    observations = GenericTriageEngine().analyze(artifact, evidence)
+    values = _values(observations)
+    assert values["archive.iso9660.joliet_detected"] is True
+    descriptors = values["archive.iso9660.joliet_descriptors"]
+    assert len(descriptors) == 1
+    descriptor = descriptors[0]
+    assert descriptor["valid"] is True
+    assert descriptor["descriptor_offset"] == 17 * block_size
+    assert descriptor["escape_sequence"] == "%/E"
+    assert descriptor["joliet_level"] == 3
+    assert descriptor["volume_identifier"] == "졸리엣"
+    assert descriptor["root_directory_record"]["data_offset"] == 21 * block_size
+    assert values["archive.iso9660.joliet_active_descriptor"] == descriptor
+    assert values["archive.iso9660.joliet_traversal_errors"] == []
+    assert values["archive.iso9660.joliet_traversal_truncated"] is False
+    assert values["archive.iso9660.joliet_directory_scan_bytes"] == 2 * block_size
+
+    joliet_entries = values["archive.iso9660.joliet_directory_entries"]
+    joliet_directory = next(
+        item for item in joliet_entries if item.get("archive_path") == "증거"
+    )
+    joliet_file = next(
+        item for item in joliet_entries if item.get("archive_path") == "증거/깃발.txt"
+    )
+    assert joliet_directory["identifier_encoding"] == "joliet"
+    assert joliet_directory["record_offset"] == 21 * block_size + 68
+    assert joliet_file["record_offset"] == 22 * block_size + 68
+    assert joliet_file["file_identifier"] == "깃발.txt;1"
+    assert joliet_file["logical_name"] == "깃발.txt"
+    assert joliet_file["data_offset"] == 24 * block_size
+    assert joliet_file["data_length"] == len(payload)
+    assert joliet_file["directory_identity_lineage"][0]["logical_name"] == "증거"
+    assert joliet_file["extraction_reconciled_to_primary"] is True
+    assert joliet_file["extraction_eligible"] is False
+
+    aliases = values["archive.iso9660.joliet_extent_aliases"]
+    assert aliases == [{
+        "data_offset": 24 * block_size,
+        "data_length": len(payload),
+        "primary_record_offset": 20 * block_size + 68,
+        "primary_archive_path": "FILE000.TXT",
+        "joliet_record_offset": 22 * block_size + 68,
+        "joliet_archive_path": "증거/깃발.txt",
+        "joliet_descriptor_offset": 17 * block_size,
+    }]
+    assert values["archive.iso9660.joliet_reconciliation_errors"] == []
+    regular_files = values["archive.iso9660.regular_files"]
+    assert len(regular_files) == 1
+    primary_file = regular_files[0]
+    assert primary_file["file_identifier"] == "FILE000.TXT;1"
+    assert primary_file["archive_path"] == "증거/깃발.txt"
+    assert primary_file["archive_name_source"] == "joliet_extent_alias"
+    assert primary_file["joliet_alias"] == aliases[0]
+    assert primary_file["joliet_directory_identity_lineage"][0]["logical_name"] == "증거"
+    profile = ProfileEngine().evaluate(artifact, observations)
+    assert not any(
+        item.category == "iso9660_joliet_anomaly"
+        for item in profile.findings
     )
 
 

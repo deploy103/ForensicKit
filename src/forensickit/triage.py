@@ -1022,6 +1022,7 @@ class GenericTriageEngine:
         descriptor_error: str | None = None
         descriptor_terminator_found = False
         pvd: dict[str, object] | None = None
+        joliet_descriptors: list[dict[str, object]] = []
 
         try:
             with path.open("rb") as stream:
@@ -1129,6 +1130,89 @@ class GenericTriageEngine:
                             "failed_checks": failed_checks,
                             "valid": not failed_checks,
                         }
+                    if descriptor_type == 2 and raw[88:91] in {
+                        b"%/@", b"%/C", b"%/E",
+                    }:
+                        joliet_level = {b"%/@": 1, b"%/C": 2, b"%/E": 3}[raw[88:91]]
+                        volume_space_le = int.from_bytes(raw[80:84], "little")
+                        volume_space_be = int.from_bytes(raw[84:88], "big")
+                        volume_set_size_le = int.from_bytes(raw[120:122], "little")
+                        volume_set_size_be = int.from_bytes(raw[122:124], "big")
+                        volume_sequence_le = int.from_bytes(raw[124:126], "little")
+                        volume_sequence_be = int.from_bytes(raw[126:128], "big")
+                        logical_block_le = int.from_bytes(raw[128:130], "little")
+                        logical_block_be = int.from_bytes(raw[130:132], "big")
+                        path_table_size_le = int.from_bytes(raw[132:136], "little")
+                        path_table_size_be = int.from_bytes(raw[136:140], "big")
+                        declared_volume_bytes = volume_space_le * logical_block_le
+                        root_length = raw[156]
+                        root_raw = raw[156:156 + root_length]
+                        root_record, root_error = self._iso9660_directory_record(
+                            root_raw,
+                            record_offset=offset + 156,
+                            logical_block_size=logical_block_le,
+                            evidence_size=size,
+                            declared_volume_bytes=declared_volume_bytes,
+                            identifier_encoding="joliet",
+                        )
+                        failed_checks: list[str] = []
+                        if volume_space_le <= 0 or volume_space_le != volume_space_be:
+                            failed_checks.append("volume_space_size_both_endian")
+                        if volume_set_size_le <= 0 or volume_set_size_le != volume_set_size_be:
+                            failed_checks.append("volume_set_size_both_endian")
+                        if volume_sequence_le <= 0 or volume_sequence_le != volume_sequence_be:
+                            failed_checks.append("volume_sequence_number_both_endian")
+                        if (
+                            logical_block_le != logical_block_be
+                            or logical_block_le < 512
+                            or logical_block_le > 32_768
+                            or logical_block_le & (logical_block_le - 1)
+                        ):
+                            failed_checks.append("logical_block_size_both_endian")
+                        if path_table_size_le != path_table_size_be:
+                            failed_checks.append("path_table_size_both_endian")
+                        if declared_volume_bytes > size:
+                            failed_checks.append("declared_volume_within_evidence")
+                        if root_error is not None or root_record.get("file_type") != "directory":
+                            failed_checks.append("root_directory_record")
+                        volume_identifier, volume_identifier_encoding_valid = (
+                            self._iso9660_decode_ucs2(raw[40:72])
+                        )
+                        volume_identifier = volume_identifier.rstrip(" \x00")
+                        if not volume_identifier_encoding_valid:
+                            failed_checks.append("volume_identifier_ucs2")
+                        joliet_descriptor = {
+                            "descriptor_offset": offset,
+                            "descriptor_block": 16 + descriptor_index,
+                            "escape_sequence_raw_hex": raw[88:91].hex(),
+                            "escape_sequence": raw[88:91].decode("ascii"),
+                            "joliet_level": joliet_level,
+                            "volume_identifier": volume_identifier,
+                            "volume_identifier_encoding_valid": volume_identifier_encoding_valid,
+                            "volume_space_blocks": volume_space_le,
+                            "volume_space_blocks_big_endian": volume_space_be,
+                            "declared_volume_bytes": declared_volume_bytes,
+                            "volume_set_size": volume_set_size_le,
+                            "volume_set_size_big_endian": volume_set_size_be,
+                            "volume_sequence_number": volume_sequence_le,
+                            "volume_sequence_number_big_endian": volume_sequence_be,
+                            "logical_block_size": logical_block_le,
+                            "logical_block_size_big_endian": logical_block_be,
+                            "path_table_size": path_table_size_le,
+                            "path_table_size_big_endian": path_table_size_be,
+                            "little_endian_path_table_block": int.from_bytes(raw[140:144], "little"),
+                            "optional_little_endian_path_table_block": int.from_bytes(raw[144:148], "little"),
+                            "big_endian_path_table_block": int.from_bytes(raw[148:152], "big"),
+                            "optional_big_endian_path_table_block": int.from_bytes(raw[152:156], "big"),
+                            "root_directory_record_offset": offset + 156,
+                            "root_directory_record_length": root_length,
+                            "root_directory_record": root_record,
+                            "root_directory_record_error": root_error,
+                            "failed_checks": failed_checks,
+                            "valid": not failed_checks,
+                        }
+                        joliet_descriptors.append(joliet_descriptor)
+                        descriptor["joliet"] = joliet_descriptor
                     if descriptor_type == 255:
                         descriptor_terminator_found = True
                         break
@@ -1509,6 +1593,94 @@ class GenericTriageEngine:
             if entry.get("file_type") == "regular"
             and entry.get("logical_name") not in {".", ".."}
         ]
+        valid_joliet_descriptors = [
+            descriptor for descriptor in joliet_descriptors
+            if descriptor.get("valid") is True
+        ]
+        active_joliet_descriptor = next(iter(sorted(
+            valid_joliet_descriptors,
+            key=lambda item: (
+                -int(item.get("joliet_level", 0)),
+                int(item.get("descriptor_offset", 0)),
+            ),
+        )), None)
+        joliet_walk: dict[str, object] = {
+            "entries": [], "regular_files": [], "inventory": [], "errors": [],
+            "bytes_read": 0,
+            "byte_limit": min(self.limits.signature_scan_bytes, 8 * _MIB),
+            "entry_limit": min(self.limits.max_artifact_count + 64, 4_096),
+            "directory_limit": 32,
+            "truncated": False,
+        }
+        if active_joliet_descriptor is not None:
+            joliet_walk = self._iso9660_walk_namespace(
+                path,
+                evidence_size=size,
+                descriptor=active_joliet_descriptor,
+                namespace="joliet",
+                identifier_encoding="joliet",
+            )
+        joliet_entries = joliet_walk.get("entries", [])
+        joliet_regular_files = joliet_walk.get("regular_files", [])
+        joliet_aliases: list[dict[str, object]] = []
+        joliet_reconciliation_errors: list[dict[str, object]] = []
+        if isinstance(joliet_regular_files, list):
+            for joliet_entry in joliet_regular_files:
+                if not isinstance(joliet_entry, dict):
+                    continue
+                extent = (
+                    joliet_entry.get("data_offset"), joliet_entry.get("data_length"),
+                )
+                primary_matches = [
+                    entry for entry in regular_files
+                    if (entry.get("data_offset"), entry.get("data_length")) == extent
+                ]
+                joliet_matches = [
+                    entry for entry in joliet_regular_files
+                    if isinstance(entry, dict)
+                    and (entry.get("data_offset"), entry.get("data_length")) == extent
+                ]
+                if len(primary_matches) == 1 and len(joliet_matches) == 1:
+                    primary_entry = primary_matches[0]
+                    alias = {
+                        "data_offset": extent[0],
+                        "data_length": extent[1],
+                        "primary_record_offset": primary_entry.get("record_offset"),
+                        "primary_archive_path": primary_entry.get("archive_path"),
+                        "joliet_record_offset": joliet_entry.get("record_offset"),
+                        "joliet_archive_path": joliet_entry.get("archive_path"),
+                        "joliet_descriptor_offset": active_joliet_descriptor.get(
+                            "descriptor_offset"
+                        ) if active_joliet_descriptor else None,
+                    }
+                    joliet_aliases.append(alias)
+                    primary_entry["joliet_alias"] = alias
+                    primary_entry["joliet_archive_path"] = joliet_entry.get("archive_path")
+                    primary_entry["joliet_record_offset"] = joliet_entry.get("record_offset")
+                    primary_entry["joliet_containing_directory_identity"] = joliet_entry.get(
+                        "containing_directory_identity"
+                    )
+                    primary_entry["joliet_directory_identity_lineage"] = joliet_entry.get(
+                        "directory_identity_lineage"
+                    )
+                    if primary_entry.get("rock_ridge_name_usable") is not True:
+                        primary_entry["archive_path"] = joliet_entry.get("archive_path")
+                        primary_entry["archive_name_source"] = "joliet_extent_alias"
+                    joliet_entry["primary_entry_match"] = alias
+                    joliet_entry["extraction_reconciled_to_primary"] = True
+                    joliet_entry["extraction_eligible"] = False
+                elif not primary_matches and len(joliet_matches) == 1:
+                    joliet_entry["extraction_reconciled_to_primary"] = False
+                    regular_files.append(joliet_entry)
+                else:
+                    joliet_entry["extraction_eligible"] = False
+                    joliet_entry["extraction_reconciliation_ambiguous"] = True
+                    joliet_reconciliation_errors.append({
+                        "reason": "ambiguous_extent_reconciliation",
+                        "joliet_entry": joliet_entry,
+                        "primary_match_count": len(primary_matches),
+                        "joliet_match_count": len(joliet_matches),
+                    })
         rock_ridge_entries = [
             entry for entry in all_directory_entries
             if entry.get("rock_ridge_present") is True
@@ -1548,6 +1720,17 @@ class GenericTriageEngine:
             self._observation(artifact, "archive.iso9660.rock_ridge_entry_count", len(rock_ridge_entries)),
             self._observation(artifact, "archive.iso9660.rock_ridge_symlinks", rock_ridge_symlinks),
             self._observation(artifact, "archive.iso9660.rock_ridge_symlink_count", len(rock_ridge_symlinks)),
+            self._observation(artifact, "archive.iso9660.joliet_detected", bool(joliet_descriptors)),
+            self._observation(artifact, "archive.iso9660.joliet_descriptors", joliet_descriptors),
+            self._observation(artifact, "archive.iso9660.joliet_active_descriptor", active_joliet_descriptor),
+            self._observation(artifact, "archive.iso9660.joliet_directory_entries", joliet_entries),
+            self._observation(artifact, "archive.iso9660.joliet_regular_files", joliet_regular_files),
+            self._observation(artifact, "archive.iso9660.joliet_directory_inventory", joliet_walk.get("inventory", [])),
+            self._observation(artifact, "archive.iso9660.joliet_traversal_errors", joliet_walk.get("errors", [])),
+            self._observation(artifact, "archive.iso9660.joliet_traversal_truncated", joliet_walk.get("truncated", False)),
+            self._observation(artifact, "archive.iso9660.joliet_directory_scan_bytes", joliet_walk.get("bytes_read", 0)),
+            self._observation(artifact, "archive.iso9660.joliet_extent_aliases", joliet_aliases),
+            self._observation(artifact, "archive.iso9660.joliet_reconciliation_errors", joliet_reconciliation_errors),
             self._observation(artifact, "archive.container_kind", "iso9660"),
         ]
 
@@ -1560,6 +1743,7 @@ class GenericTriageEngine:
         evidence_size: int,
         declared_volume_bytes: int,
         entry_limit: int,
+        identifier_encoding: str = "ascii",
     ) -> tuple[list[dict[str, object]], str | None, bool]:
         """Decode block-bounded records from one already bounded directory extent."""
         entries: list[dict[str, object]] = []
@@ -1603,6 +1787,7 @@ class GenericTriageEngine:
                 logical_block_size=logical_block_size,
                 evidence_size=evidence_size,
                 declared_volume_bytes=declared_volume_bytes,
+                identifier_encoding=identifier_encoding,
             )
             record["directory_relative_offset"] = cursor
             entries.append(record)
@@ -1610,6 +1795,297 @@ class GenericTriageEngine:
                 first_error = record_error
             cursor += record_length
         return entries, first_error, entry_limit_reached
+
+    def _iso9660_walk_namespace(
+        self,
+        path: Path,
+        *,
+        evidence_size: int,
+        descriptor: dict[str, object],
+        namespace: str,
+        identifier_encoding: str,
+    ) -> dict[str, object]:
+        """Walk one independently validated ISO namespace under fixed shared bounds."""
+        entries: list[dict[str, object]] = []
+        inventory: list[dict[str, object]] = []
+        errors: list[dict[str, object]] = []
+        byte_limit = min(self.limits.signature_scan_bytes, 8 * _MIB)
+        entry_limit = min(self.limits.max_artifact_count + 64, 4_096)
+        directory_limit = 32
+        bytes_read = 0
+        truncated = False
+        root = descriptor.get("root_directory_record")
+        block_size = descriptor.get("logical_block_size")
+        declared_volume_bytes = descriptor.get("declared_volume_bytes")
+        if (
+            descriptor.get("valid") is not True
+            or not isinstance(root, dict)
+            or not isinstance(block_size, int)
+            or not isinstance(declared_volume_bytes, int)
+        ):
+            return {
+                "entries": entries, "inventory": inventory, "errors": errors,
+                "bytes_read": bytes_read, "byte_limit": byte_limit,
+                "entry_limit": entry_limit, "directory_limit": directory_limit,
+                "truncated": truncated,
+            }
+
+        root_offset = root.get("data_offset")
+        root_length = root.get("data_length")
+        if (
+            not isinstance(root_offset, int)
+            or not isinstance(root_length, int)
+            or root_length <= 0
+            or root_offset < 0
+            or root_offset + root_length > evidence_size
+        ):
+            errors.append({"reason": "invalid_root_range", "root_record": root})
+            return {
+                "entries": entries, "inventory": inventory, "errors": errors,
+                "bytes_read": bytes_read, "byte_limit": byte_limit,
+                "entry_limit": entry_limit, "directory_limit": directory_limit,
+                "truncated": truncated,
+            }
+        if root_length > byte_limit:
+            errors.append({
+                "reason": "root_byte_limit", "root_record": root,
+                "byte_limit": byte_limit,
+            })
+            truncated = True
+            return {
+                "entries": entries, "inventory": inventory, "errors": errors,
+                "bytes_read": bytes_read, "byte_limit": byte_limit,
+                "entry_limit": entry_limit, "directory_limit": directory_limit,
+                "truncated": truncated,
+            }
+        try:
+            with path.open("rb") as stream:
+                stream.seek(root_offset)
+                root_data = stream.read(root_length)
+        except OSError as exc:
+            errors.append({"reason": "root_read_error", "error": str(exc)[:2_000]})
+            return {
+                "entries": entries, "inventory": inventory, "errors": errors,
+                "bytes_read": bytes_read, "byte_limit": byte_limit,
+                "entry_limit": entry_limit, "directory_limit": directory_limit,
+                "truncated": truncated,
+            }
+        bytes_read = len(root_data)
+        if len(root_data) != root_length:
+            errors.append({
+                "reason": "root_truncated_read", "expected_bytes": root_length,
+                "received_bytes": len(root_data),
+            })
+            return {
+                "entries": entries, "inventory": inventory, "errors": errors,
+                "bytes_read": bytes_read, "byte_limit": byte_limit,
+                "entry_limit": entry_limit, "directory_limit": directory_limit,
+                "truncated": True,
+            }
+        root_entries, root_error, root_entry_limit = self._iso9660_directory_records(
+            root_data,
+            directory_offset=root_offset,
+            logical_block_size=block_size,
+            evidence_size=evidence_size,
+            declared_volume_bytes=declared_volume_bytes,
+            entry_limit=entry_limit,
+            identifier_encoding=identifier_encoding,
+        )
+        entries.extend(root_entries)
+        root_extent = (root_offset, root_length)
+        root_identity = {
+            "namespace": namespace,
+            "logical_name": "/",
+            "file_identifier": ".",
+            "directory_record_offset": root.get("record_offset"),
+            "extent_block": root.get("extent_block"),
+            "data_offset": root_offset,
+            "data_length": root_length,
+        }
+        for entry in root_entries:
+            entry["namespace"] = namespace
+            entry["containing_directory_identity"] = root_identity
+            entry["directory_identity_lineage"] = []
+            if entry.get("logical_name") not in {".", ".."}:
+                entry["archive_path"] = entry.get("logical_name")
+        if root_error or root_entry_limit:
+            errors.append({
+                "reason": "root_directory_consistency",
+                "parse_error": root_error,
+                "entry_limit_reached": root_entry_limit,
+            })
+            truncated = truncated or root_entry_limit
+
+        queue: list[
+            tuple[
+                dict[str, object], list[dict[str, object]],
+                set[tuple[object, object]], tuple[object, object],
+            ]
+        ] = []
+        claimed_extents: set[tuple[object, object]] = {root_extent}
+
+        def schedule(
+            entry: dict[str, object], lineage: list[dict[str, object]],
+            ancestors: set[tuple[object, object]], parent_extent: tuple[object, object],
+        ) -> None:
+            if (
+                entry.get("file_type") != "directory"
+                or entry.get("logical_name") in {".", ".."}
+                or entry.get("valid") is not True
+            ):
+                return
+            if (
+                entry.get("multi_extent") is True
+                or entry.get("file_unit_size") not in {0, None}
+                or entry.get("interleave_gap_size") not in {0, None}
+            ):
+                entry["directory_traversal"] = "unsupported_layout"
+                errors.append({"reason": "unsupported_directory_layout", "entry": entry})
+                return
+            extent = (entry.get("data_offset"), entry.get("data_length"))
+            identity = {
+                "namespace": namespace,
+                "logical_name": entry.get("logical_name"),
+                "file_identifier": entry.get("file_identifier"),
+                "directory_record_offset": entry.get("record_offset"),
+                "extent_block": entry.get("extent_block"),
+                "data_offset": entry.get("data_offset"),
+                "data_length": entry.get("data_length"),
+            }
+            if extent in ancestors:
+                entry["directory_traversal"] = "ancestor_cycle"
+                errors.append({"reason": "ancestor_cycle", "entry": entry})
+                return
+            if extent in claimed_extents:
+                entry["directory_traversal"] = "shared_extent"
+                errors.append({"reason": "shared_extent", "entry": entry})
+                return
+            claimed_extents.add(extent)
+            entry["directory_traversal"] = "scheduled"
+            queue.append((entry, [*lineage, identity], {*ancestors, extent}, parent_extent))
+
+        for entry in root_entries:
+            schedule(entry, [], {root_extent}, root_extent)
+
+        processed = 0
+        while queue and processed < directory_limit:
+            source_entry, lineage, ancestors, parent_extent = queue.pop(0)
+            data_offset = source_entry.get("data_offset")
+            data_length = source_entry.get("data_length")
+            if (
+                not isinstance(data_offset, int)
+                or not isinstance(data_length, int)
+                or data_length <= 0
+                or data_offset < 0
+                or data_offset + data_length > evidence_size
+            ):
+                source_entry["directory_traversal"] = "invalid_range"
+                errors.append({"reason": "invalid_range", "entry": source_entry})
+                continue
+            if bytes_read + data_length > byte_limit:
+                source_entry["directory_traversal"] = "byte_limit"
+                errors.append({"reason": "byte_limit", "entry": source_entry})
+                truncated = True
+                continue
+            remaining_entries = entry_limit - len(entries)
+            if remaining_entries <= 0:
+                source_entry["directory_traversal"] = "entry_limit"
+                errors.append({"reason": "entry_limit", "entry": source_entry})
+                truncated = True
+                break
+            try:
+                with path.open("rb") as stream:
+                    stream.seek(data_offset)
+                    directory_data = stream.read(data_length)
+            except OSError as exc:
+                source_entry["directory_traversal"] = "read_error"
+                errors.append({
+                    "reason": "read_error", "entry": source_entry,
+                    "error": str(exc)[:2_000],
+                })
+                continue
+            bytes_read += len(directory_data)
+            if len(directory_data) != data_length:
+                source_entry["directory_traversal"] = "truncated_read"
+                errors.append({"reason": "truncated_read", "entry": source_entry})
+                truncated = True
+                continue
+            child_entries, parse_error, child_limit = self._iso9660_directory_records(
+                directory_data,
+                directory_offset=data_offset,
+                logical_block_size=block_size,
+                evidence_size=evidence_size,
+                declared_volume_bytes=declared_volume_bytes,
+                entry_limit=remaining_entries,
+                identifier_encoding=identifier_encoding,
+            )
+            processed += 1
+            source_entry["directory_traversal"] = (
+                "parsed" if parse_error is None and not child_limit else "parsed_with_anomaly"
+            )
+            current_identity = lineage[-1]
+            for entry in child_entries:
+                entry["namespace"] = namespace
+                entry["containing_directory_identity"] = current_identity
+                entry["directory_identity_lineage"] = lineage
+                if entry.get("logical_name") not in {".", ".."}:
+                    entry["archive_path"] = "/".join([
+                        *[str(identity.get("logical_name")) for identity in lineage],
+                        str(entry.get("logical_name")),
+                    ])
+            entries.extend(child_entries)
+            dot = next((entry for entry in child_entries if entry.get("logical_name") == "."), None)
+            dotdot = next((entry for entry in child_entries if entry.get("logical_name") == ".."), None)
+            current_extent = (data_offset, data_length)
+            dot_matches = bool(
+                dot and dot.get("valid") is True
+                and dot.get("file_type") == "directory"
+                and (dot.get("data_offset"), dot.get("data_length")) == current_extent
+            )
+            dotdot_matches = bool(
+                dotdot and dotdot.get("valid") is True
+                and dotdot.get("file_type") == "directory"
+                and (dotdot.get("data_offset"), dotdot.get("data_length")) == parent_extent
+            )
+            inventory_record = {
+                "directory_identity": current_identity,
+                "directory_identity_lineage": lineage,
+                "data_offset": data_offset,
+                "data_length": data_length,
+                "entry_count": len(child_entries),
+                "dot_entry_matches_self": dot_matches,
+                "dotdot_entry_matches_parent": dotdot_matches,
+                "parse_error": parse_error,
+                "entry_limit_reached": child_limit,
+            }
+            inventory.append(inventory_record)
+            if parse_error or child_limit or not dot_matches or not dotdot_matches:
+                errors.append({"reason": "directory_consistency", "inventory": inventory_record})
+                truncated = truncated or child_limit
+            for entry in child_entries:
+                schedule(entry, lineage, ancestors, current_extent)
+        if queue:
+            errors.append({
+                "reason": "directory_limit",
+                "remaining_directory_count": len(queue),
+                "directory_limit": directory_limit,
+            })
+            truncated = True
+        return {
+            "entries": entries,
+            "regular_files": [
+                entry for entry in entries
+                if entry.get("file_type") == "regular"
+                and entry.get("logical_name") not in {".", ".."}
+            ],
+            "inventory": inventory,
+            "errors": errors,
+            "bytes_read": bytes_read,
+            "byte_limit": byte_limit,
+            "entry_limit": entry_limit,
+            "directory_limit": directory_limit,
+            "truncated": truncated,
+        }
 
     @staticmethod
     def _iso9660_susp_configuration(record: dict[str, object]) -> dict[str, object]:
@@ -2129,6 +2605,19 @@ class GenericTriageEngine:
         return susp_error, anomalies
 
     @staticmethod
+    def _iso9660_decode_ucs2(raw: bytes) -> tuple[str, bool]:
+        """Decode big-endian UCS-2 while rejecting UTF-16 surrogate semantics."""
+        valid = len(raw) % 2 == 0 and all(
+            not 0xD800 <= int.from_bytes(raw[index:index + 2], "big") <= 0xDFFF
+            for index in range(0, len(raw) - 1, 2)
+        )
+        try:
+            decoded = raw.decode("utf-16-be", errors="strict" if valid else "replace")
+        except UnicodeDecodeError:
+            return raw.decode("utf-16-be", errors="replace"), False
+        return decoded, valid
+
+    @staticmethod
     def _iso9660_directory_record(
         raw: bytes,
         *,
@@ -2136,6 +2625,7 @@ class GenericTriageEngine:
         logical_block_size: int,
         evidence_size: int,
         declared_volume_bytes: int,
+        identifier_encoding: str = "ascii",
     ) -> tuple[dict[str, object], str | None]:
         """Decode one bounded ISO directory record with both-endian checks."""
         record: dict[str, object] = {
@@ -2163,6 +2653,10 @@ class GenericTriageEngine:
             identifier = "."
         elif raw_identifier == b"\x01":
             identifier = ".."
+        elif identifier_encoding == "joliet":
+            identifier, joliet_identifier_valid = (
+                GenericTriageEngine._iso9660_decode_ucs2(raw_identifier)
+            )
         else:
             identifier = raw_identifier.decode("ascii", errors="replace")
         version_match = re.search(r";([0-9]+)$", identifier)
@@ -2173,6 +2667,7 @@ class GenericTriageEngine:
             logical_name in {".", ".."}
             or (
                 not normalized_name.startswith("/")
+                and "\x00" not in normalized_name
                 and re.match(r"^[A-Za-z]:/", normalized_name) is None
                 and ".." not in normalized_name.split("/")
                 and "/" not in normalized_name
@@ -2184,6 +2679,12 @@ class GenericTriageEngine:
         flags = raw[25]
         timestamp, timestamp_valid = GenericTriageEngine._iso9660_recording_time(raw[18:25])
         failed_checks: list[str] = []
+        if (
+            identifier_encoding == "joliet"
+            and raw_identifier not in {b"\x00", b"\x01"}
+            and not joliet_identifier_valid
+        ):
+            failed_checks.append("file_identifier_ucs2")
         if extent_le != extent_be:
             failed_checks.append("extent_location_both_endian")
         if data_length_le != data_length_be:
@@ -2227,6 +2728,7 @@ class GenericTriageEngine:
             "volume_sequence_number_big_endian": volume_sequence_be,
             "identifier_length": identifier_length,
             "identifier_raw_hex": raw_identifier.hex(),
+            "identifier_encoding": identifier_encoding,
             "file_identifier": identifier,
             "logical_name": logical_name,
             "archive_name": logical_name,
