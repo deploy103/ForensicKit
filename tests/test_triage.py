@@ -115,6 +115,19 @@ def _iso_both32(value: int) -> bytes:
     return value.to_bytes(4, "little") + value.to_bytes(4, "big")
 
 
+def _iso_path_table_entry(
+    identifier: bytes, extent_block: int, parent_number: int, *, byte_order: str,
+) -> bytes:
+    result = bytearray()
+    result.extend((len(identifier), 0))
+    result.extend(extent_block.to_bytes(4, byte_order))
+    result.extend(parent_number.to_bytes(2, byte_order))
+    result.extend(identifier)
+    if len(identifier) % 2:
+        result.append(0)
+    return bytes(result)
+
+
 def _iso_directory_record(
     identifier: bytes,
     extent_block: int,
@@ -395,7 +408,10 @@ def _iso9660_with_el_torito(
     return bytes(image), payload
 
 
-def _iso9660_with_subdirectory(*, shared_extent: bool = False) -> tuple[bytes, bytes]:
+def _iso9660_with_subdirectory(
+    *, shared_extent: bool = False, path_tables: bool = False,
+    divergent_path_table: bool = False,
+) -> tuple[bytes, bytes]:
     block_size = 2_048
     image = bytearray(25 * block_size)
     pvd_offset = 16 * block_size
@@ -409,7 +425,24 @@ def _iso9660_with_subdirectory(*, shared_extent: bool = False) -> tuple[bytes, b
     pvd[120:124] = _iso_both16(1)
     pvd[124:128] = _iso_both16(1)
     pvd[128:132] = _iso_both16(block_size)
-    pvd[132:140] = _iso_both32(0)
+    if path_tables:
+        little_path_table = (
+            _iso_path_table_entry(b"\x00", 20, 1, byte_order="little")
+            + _iso_path_table_entry(b"SUBDIR", 22, 1, byte_order="little")
+        )
+        big_subdir_extent = 23 if divergent_path_table else 22
+        big_path_table = (
+            _iso_path_table_entry(b"\x00", 20, 1, byte_order="big")
+            + _iso_path_table_entry(b"SUBDIR", big_subdir_extent, 1, byte_order="big")
+        )
+        assert len(little_path_table) == len(big_path_table)
+        pvd[132:140] = _iso_both32(len(little_path_table))
+        pvd[140:144] = (18).to_bytes(4, "little")
+        pvd[148:152] = (19).to_bytes(4, "big")
+        image[18 * block_size:18 * block_size + len(little_path_table)] = little_path_table
+        image[19 * block_size:19 * block_size + len(big_path_table)] = big_path_table
+    else:
+        pvd[132:140] = _iso_both32(0)
     root_record = _iso_directory_record(b"\x00", 20, block_size, flags=0x02)
     pvd[156:156 + len(root_record)] = root_record
     terminator = 17 * block_size
@@ -1719,6 +1752,76 @@ def test_iso9660_subdirectory_traversal_preserves_paths_and_rejects_shared_exten
         item.category == "iso9660_directory_traversal_anomaly"
         and "shared_extent" in " ".join(item.supporting_evidence)
         for item in shared_profile.findings
+    )
+
+
+def test_iso9660_path_table_endian_copies_reconcile_active_directories(
+    tmp_path: Path,
+) -> None:
+    block_size = 2_048
+    image, _ = _iso9660_with_subdirectory(path_tables=True)
+    evidence = tmp_path / "path-tables.iso"
+    evidence.write_bytes(image)
+    artifact = _artifact(evidence)
+    observations = GenericTriageEngine().analyze(artifact, evidence)
+    values = _values(observations)
+
+    tables = values["archive.iso9660.path_tables"]
+    assert [(table["byte_order"], table["copy_kind"]) for table in tables] == [
+        ("little", "mandatory"), ("big", "mandatory"),
+    ]
+    little, big = tables
+    assert little["table_block"] == 18
+    assert little["table_offset"] == 18 * block_size
+    assert big["table_block"] == 19
+    assert big["table_offset"] == 19 * block_size
+    assert little["declared_size"] == 24
+    assert little["valid"] is True
+    assert big["valid"] is True
+    assert [entry["identifier"] for entry in little["entries"]] == [".", "SUBDIR"]
+    assert [entry["directory_number"] for entry in little["entries"]] == [1, 2]
+    assert [entry["parent_directory_number"] for entry in little["entries"]] == [1, 1]
+    assert little["entries"][0]["entry_length"] == 10
+    assert little["entries"][0]["padding_length"] == 1
+    assert little["entries"][1]["offset"] == 18 * block_size + 10
+    assert little["entries"][1]["archive_path"] == "SUBDIR"
+    assert little["entries"][1]["data_offset"] == 22 * block_size
+    comparison = values["archive.iso9660.path_table_comparison"]
+    assert comparison["available"] is True
+    assert comparison["consistent"] is True
+    assert comparison["first_difference_index"] is None
+    assert comparison["all_entries_reconciled"] is True
+    reconciliation = values["archive.iso9660.path_table_reconciliation"]
+    assert [item["reconciled"] for item in reconciliation] == [True, True]
+    assert reconciliation[0]["directory_record_archive_path"] == "/"
+    assert reconciliation[1]["directory_record_offset"] == 20 * block_size + 68
+    assert reconciliation[1]["directory_record_archive_path"] == "SUBDIR"
+    profile = ProfileEngine().evaluate(artifact, observations)
+    assert not any(
+        item.category == "iso9660_path_table_anomaly"
+        for item in profile.findings
+    )
+
+    divergent_image, _ = _iso9660_with_subdirectory(
+        path_tables=True, divergent_path_table=True,
+    )
+    divergent_path = tmp_path / "divergent-path-tables.iso"
+    divergent_path.write_bytes(divergent_image)
+    divergent_artifact = _artifact(divergent_path)
+    divergent_observations = GenericTriageEngine().analyze(
+        divergent_artifact, divergent_path,
+    )
+    divergent_values = _values(divergent_observations)
+    divergent_comparison = divergent_values["archive.iso9660.path_table_comparison"]
+    assert divergent_comparison["consistent"] is False
+    assert divergent_comparison["first_difference_index"] == 1
+    assert divergent_values["archive.iso9660.path_table_reconciliation"] == []
+    divergent_profile = ProfileEngine().evaluate(
+        divergent_artifact, divergent_observations,
+    )
+    assert any(
+        item.category == "iso9660_path_table_anomaly"
+        for item in divergent_profile.findings
     )
 
 

@@ -383,6 +383,64 @@ class ArchiveProfile(BaseProfile):
                     severity="medium",
                 )
             )
+        path_tables = next(
+            (
+                value for value in context.values("archive.iso9660.path_tables")
+                if isinstance(value, list)
+            ),
+            [],
+        )
+        path_table_comparison = next(
+            (
+                value for value in context.values(
+                    "archive.iso9660.path_table_comparison"
+                )
+                if isinstance(value, dict)
+            ),
+            {},
+        )
+        path_table_reconciliation = next(
+            (
+                value for value in context.values(
+                    "archive.iso9660.path_table_reconciliation"
+                )
+                if isinstance(value, list)
+            ),
+            [],
+        )
+        invalid_path_tables = [
+            table for table in path_tables
+            if isinstance(table, dict) and table.get("valid") is not True
+        ]
+        unreconciled_path_entries = [
+            item for item in path_table_reconciliation
+            if isinstance(item, dict) and item.get("reconciled") is not True
+        ]
+        if path_tables and (
+            invalid_path_tables
+            or path_table_comparison.get("consistent") is not True
+            or unreconciled_path_entries
+        ):
+            result.findings.append(
+                self.finding(
+                    context,
+                    title="ISO 9660 path-table copy or directory reconciliation anomaly",
+                    category="iso9660_path_table_anomaly",
+                    confidence=0.97,
+                    explanation=(
+                        "One or more bounded path-table copies failed framing/range/parent checks, "
+                        "the mandatory little- and big-endian tables differ, or a directory extent "
+                        "did not uniquely match the active directory walk. Divergent tables are never "
+                        "selected as authoritative."
+                    ),
+                    evidence=(
+                        [f"comparison={path_table_comparison}"]
+                        + [str(item)[:2_000] for item in invalid_path_tables[:8]]
+                        + [str(item)[:2_000] for item in unreconciled_path_entries[:8]]
+                    ),
+                    severity="medium",
+                )
+            )
         iso_entries = next(
             (
                 value for value in context.values("archive.iso9660.directory_entries")

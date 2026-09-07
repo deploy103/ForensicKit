@@ -90,6 +90,18 @@ def _iso_directory_record(
     return bytes(record)
 
 
+def _iso_path_table_entry(
+    identifier: bytes, extent_block: int, parent_number: int, *, byte_order: str,
+) -> bytes:
+    result = bytearray((len(identifier), 0))
+    result.extend(extent_block.to_bytes(4, byte_order))
+    result.extend(parent_number.to_bytes(2, byte_order))
+    result.extend(identifier)
+    if len(identifier) % 2:
+        result.append(0)
+    return bytes(result)
+
+
 def _susp_entry(signature: bytes, data: bytes = b"") -> bytes:
     return signature + bytes((4 + len(data), 1)) + data
 
@@ -138,6 +150,7 @@ def _iso9660_with_root_file(name: bytes, payload: bytes) -> bytes:
 
 def _iso9660_with_nested_file(
     name: bytes, payload: bytes, *, rock_ridge: bool = False,
+    path_tables: bool = False,
 ) -> bytes:
     block_size = 2_048
     image = bytearray(24 * block_size)
@@ -155,6 +168,21 @@ def _iso9660_with_nested_file(
     image[pvd_offset + 126:pvd_offset + 128] = (1).to_bytes(2, "big")
     image[pvd_offset + 128:pvd_offset + 130] = block_size.to_bytes(2, "little")
     image[pvd_offset + 130:pvd_offset + 132] = block_size.to_bytes(2, "big")
+    if path_tables:
+        little_table = (
+            _iso_path_table_entry(b"\x00", 20, 1, byte_order="little")
+            + _iso_path_table_entry(b"SUBDIR", 22, 1, byte_order="little")
+        )
+        big_table = (
+            _iso_path_table_entry(b"\x00", 20, 1, byte_order="big")
+            + _iso_path_table_entry(b"SUBDIR", 22, 1, byte_order="big")
+        )
+        image[pvd_offset + 132:pvd_offset + 136] = len(little_table).to_bytes(4, "little")
+        image[pvd_offset + 136:pvd_offset + 140] = len(big_table).to_bytes(4, "big")
+        image[pvd_offset + 140:pvd_offset + 144] = (18).to_bytes(4, "little")
+        image[pvd_offset + 148:pvd_offset + 152] = (19).to_bytes(4, "big")
+        image[18 * block_size:18 * block_size + len(little_table)] = little_table
+        image[19 * block_size:19 * block_size + len(big_table)] = big_table
     root_record = _iso_directory_record(b"\x00", 20, block_size, flags=0x02)
     image[pvd_offset + 156:pvd_offset + 156 + len(root_record)] = root_record
     terminator = 17 * block_size
@@ -608,7 +636,9 @@ def test_iso9660_root_file_recurses_with_descriptor_and_extent_lineage(tmp_path:
 def test_iso9660_nested_file_recurses_with_directory_identity_lineage(tmp_path: Path) -> None:
     payload = b"CTF{iso9660_nested_recursive_lineage}"
     evidence = tmp_path / "nested.iso"
-    evidence.write_bytes(_iso9660_with_nested_file(b"DEEP.TXT;1", payload))
+    evidence.write_bytes(_iso9660_with_nested_file(
+        b"DEEP.TXT;1", payload, path_tables=True,
+    ))
 
     result = AnalysisEngine().analyze(
         evidence, tmp_path / "nested-iso-cases", mode=AnalysisMode.AUTO,
@@ -656,6 +686,9 @@ def test_iso9660_nested_file_recurses_with_directory_identity_lineage(tmp_path: 
     )
     assert "SUBDIR/DEEP.TXT" in report
     assert "directory_identity_lineage" in report
+    assert '"archive.iso9660.path_table_comparison"' in report
+    assert '"all_entries_reconciled": true' in report
+    assert '"raw_sha256"' in report
     assert "CTF{iso9660_nested_recursive_lineage}" in report
 
 
