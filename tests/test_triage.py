@@ -253,8 +253,7 @@ def _zisofs_stream(
     compressed_blocks: list[bytes] = []
     for block in blocks:
         if any(block):
-            compressor = zlib.compressobj(level=9, wbits=-15)
-            compressed = compressor.compress(block) + compressor.flush()
+            compressed = zlib.compress(block, level=9)
         else:
             compressed = b""
         compressed_blocks.append(compressed)
@@ -2622,6 +2621,7 @@ def test_iso9660_rock_ridge_zisofs_metadata_is_validated_without_decompression(
     assert regular["archive_path"] == "Compressed Evidence.bin"
     assert regular["rock_ridge_zisofs"] is True
     assert regular["extraction_eligible"] is False
+    assert regular["rock_ridge_zisofs_decompression_eligible"] is True
     claim = regular["rock_ridge_zisofs_claim"]
     assert claim["algorithm"] == "pz"
     assert claim["header_size_words"] == 4
@@ -2674,6 +2674,7 @@ def test_iso9660_rock_ridge_zisofs_metadata_is_validated_without_decompression(
     assert record["compressed_blocks"][1]["zero_fill"] is True
     assert record["compressed_blocks"][1]["compressed_length"] == 0
     assert record["decompression_performed"] is False
+    assert record["decompression_eligible"] is True
     assert record["extraction_eligible"] is False
     assert regular["rock_ridge_zisofs_validation"] == record
     assert values["archive.iso9660.rock_ridge_zisofs_errors"] == []

@@ -329,8 +329,9 @@ class ArchiveProfile(BaseProfile):
                     explanation=(
                         "An RRIP ZF declaration matches a bounded zisofs header and monotonic "
                         "block-pointer table. Exact metadata offsets and hashes are retained, "
-                        "including zero-fill blocks, but compressed data is not decompressed or "
-                        "materialized."
+                        "including zero-fill blocks. Triage itself does not decompress data; an "
+                        "eligible stream may be materialized only after the native extractor "
+                        "independently revalidates every declaration and exact block output."
                     ),
                     evidence=[
                         str(item)[:2_000]
@@ -720,7 +721,8 @@ class ArchiveProfile(BaseProfile):
                     explanation=(
                         "A regular-file PX claim lacks a serial, has an invalid link count, exceeds its "
                         "declared member count, disagrees across aliases, or maps one serial to different "
-                        "extent sequences. Such records are not reconciled as hard-link aliases."
+                        "extent or zisofs semantic identities. Such records are not reconciled as "
+                        "hard-link aliases."
                     ),
                     evidence=[
                         str(item)[:2_000]
