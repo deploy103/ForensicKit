@@ -27,6 +27,7 @@ _FORMAT_INFO: dict[str, _FormatInfo] = {
     "tar": _FormatInfo("archive", "archive", "application/x-tar", "tar archive", 0.98),
     "rar": _FormatInfo("archive", "archive", "application/vnd.rar", "RAR archive data", 0.99),
     "cpio": _FormatInfo("archive", "archive", "application/x-cpio", "ASCII cpio archive", 0.99),
+    "iso9660": _FormatInfo("archive", "archive", "application/x-iso9660-image", "ISO 9660 filesystem image", 0.99),
     "bzip2": _FormatInfo("archive", "archive", "application/x-bzip2", "bzip2 compressed data", 0.98),
     "xz": _FormatInfo("archive", "archive", "application/x-xz", "XZ compressed data", 0.99),
     "ewf": _FormatInfo("disk", "disk", "application/x-ewf", "EWF forensic image", 0.99),
@@ -250,6 +251,7 @@ class IdentificationEngine:
             ("sqlite", "sqlite"), ("pdf document", "pdf"), ("png image", "png"),
             ("jpeg image", "jpeg"), ("zip archive", "zip"), ("7-zip", "7z"),
             ("cpio archive", "cpio"),
+            ("iso 9660", "iso9660"),
             ("elf", "elf"), ("ms-dos executable", "pe"), ("compound document", "ole"),
             ("ewf", "ewf"),
         )
@@ -454,7 +456,7 @@ def _profile_for_artifact_type(artifact_type: str) -> str | None:
 
 
 def _artifact_type_for_embedded_format(format_name: str) -> str | None:
-    if format_name in {"zip", "7z", "gzip", "rar", "cpio", "bzip2", "xz"}:
+    if format_name in {"zip", "7z", "gzip", "rar", "cpio", "iso9660", "bzip2", "xz"}:
         return "archive"
     if format_name in {"png", "jpeg"}:
         return "image"

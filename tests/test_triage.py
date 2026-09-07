@@ -107,6 +107,40 @@ def _cpio_odc_member(
     return bytes(result)
 
 
+def _iso_both16(value: int) -> bytes:
+    return value.to_bytes(2, "little") + value.to_bytes(2, "big")
+
+
+def _iso_both32(value: int) -> bytes:
+    return value.to_bytes(4, "little") + value.to_bytes(4, "big")
+
+
+def _iso_directory_record(
+    identifier: bytes,
+    extent_block: int,
+    data_length: int,
+    *,
+    flags: int = 0,
+    extended_attribute_blocks: int = 0,
+    file_unit_size: int = 0,
+    interleave_gap_size: int = 0,
+) -> bytes:
+    padding = 1 if len(identifier) % 2 == 0 else 0
+    record = bytearray(33 + len(identifier) + padding)
+    record[0] = len(record)
+    record[1] = extended_attribute_blocks
+    record[2:10] = _iso_both32(extent_block)
+    record[10:18] = _iso_both32(data_length)
+    record[18:25] = bytes((124, 1, 2, 3, 4, 5, 0))
+    record[25] = flags
+    record[26] = file_unit_size
+    record[27] = interleave_gap_size
+    record[28:32] = _iso_both16(1)
+    record[32] = len(identifier)
+    record[33:33 + len(identifier)] = identifier
+    return bytes(record)
+
+
 def test_png_appended_zip_is_observed_and_classified(tmp_path: Path) -> None:
     zip_path = tmp_path / "payload.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
@@ -1217,6 +1251,114 @@ def test_cpio_crc_entries_preserve_ranges_checksums_types_and_unsafe_paths(tmp_p
     assert odc_record["device_major"] is None
     assert odc_record["stored_checksum"] is None
     assert odc_record["checksum_verification"] == "not_applicable"
+
+
+def test_iso9660_primary_volume_and_root_records_preserve_both_endian_extents(tmp_path: Path) -> None:
+    block_size = 2_048
+    image = bytearray(24 * block_size)
+    pvd_offset = 16 * block_size
+    pvd = memoryview(image)[pvd_offset:pvd_offset + block_size]
+    pvd[0] = 1
+    pvd[1:6] = b"CD001"
+    pvd[6] = 1
+    pvd[8:40] = b"FORENSICKIT".ljust(32, b" ")
+    pvd[40:72] = b"CTF_ISO".ljust(32, b" ")
+    pvd[80:88] = _iso_both32(24)
+    pvd[120:124] = _iso_both16(1)
+    pvd[124:128] = _iso_both16(1)
+    pvd[128:132] = _iso_both16(block_size)
+    pvd[132:140] = _iso_both32(0)
+    root_record = _iso_directory_record(b"\x00", 20, block_size, flags=0x02)
+    pvd[156:156 + len(root_record)] = root_record
+    terminator = 17 * block_size
+    image[terminator] = 255
+    image[terminator + 1:terminator + 6] = b"CD001"
+    image[terminator + 6] = 1
+
+    payload = b"CTF{iso9660_triage}"
+    root = bytearray()
+    root.extend(root_record)
+    root.extend(_iso_directory_record(b"\x01", 20, block_size, flags=0x02))
+    root.extend(_iso_directory_record(b"FLAG.TXT;1", 21, len(payload)))
+    root.extend(_iso_directory_record(b"SPLIT.BIN;2", 22, 4, flags=0x80))
+    image[20 * block_size:20 * block_size + len(root)] = root
+    image[21 * block_size:21 * block_size + len(payload)] = payload
+    image[22 * block_size:22 * block_size + 4] = b"part"
+    evidence = tmp_path / "challenge.iso"
+    evidence.write_bytes(image)
+    artifact = _artifact(evidence)
+
+    observations = GenericTriageEngine().analyze(artifact, evidence)
+    values = _values(observations)
+    identified = IdentificationEngine().identify(artifact, observations)
+
+    assert identified.format == "iso9660"
+    assert artifact.artifact_type == "archive"
+    assert values["archive.container_kind"] == "iso9660"
+    assert values["archive.iso9660.signature"] is True
+    assert values["archive.iso9660.descriptor_count"] == 2
+    assert values["archive.iso9660.descriptor_terminator_found"] is True
+    assert values["archive.iso9660.descriptor_error"] is None
+    pvd_value = values["archive.iso9660.primary_volume_descriptor"]
+    assert pvd_value["valid"] is True
+    assert pvd_value["descriptor_offset"] == pvd_offset
+    assert pvd_value["system_identifier"] == "FORENSICKIT"
+    assert pvd_value["volume_identifier"] == "CTF_ISO"
+    assert pvd_value["volume_space_blocks"] == 24
+    assert pvd_value["declared_volume_bytes"] == len(image)
+    assert pvd_value["logical_block_size"] == block_size
+    assert pvd_value["root_directory_record_offset"] == pvd_offset + 156
+    assert pvd_value["root_directory_record"]["extent_block"] == 20
+    assert pvd_value["root_directory_record"]["data_offset"] == 20 * block_size
+    assert values["archive.iso9660.root_directory_error"] is None
+    assert values["archive.iso9660.root_directory_scan_truncated"] is False
+    entries = values["archive.iso9660.root_directory_entries"]
+    assert [item["logical_name"] for item in entries] == [
+        ".", "..", "FLAG.TXT", "SPLIT.BIN",
+    ]
+    file_record = entries[2]
+    assert file_record["record_offset"] == 20 * block_size + len(root_record) * 2
+    assert file_record["file_identifier"] == "FLAG.TXT;1"
+    assert file_record["version"] == 1
+    assert file_record["extent_both_endian_match"] is True
+    assert file_record["data_length_both_endian_match"] is True
+    assert file_record["data_offset"] == 21 * block_size
+    assert file_record["data_length"] == len(payload)
+    assert file_record["recording_time_utc"] == "2024-01-02T03:04:05+00:00"
+    assert file_record["extraction_eligible"] is True
+    assert entries[3]["multi_extent"] is True
+    assert entries[3]["extraction_eligible"] is False
+    profile = ProfileEngine().evaluate(artifact, observations)
+    assert any(
+        item.category == "archive_unsupported_layout"
+        for item in profile.findings
+    )
+    assert not any(
+        item.category == "archive_structure_anomaly"
+        for item in profile.findings
+    )
+
+    malformed = bytearray(image)
+    malformed[pvd_offset + 84:pvd_offset + 88] = (23).to_bytes(4, "big")
+    malformed_path = tmp_path / "mismatched-both-endian.iso"
+    malformed_path.write_bytes(malformed)
+    malformed_artifact = _artifact(malformed_path)
+    malformed_observations = GenericTriageEngine().analyze(
+        malformed_artifact, malformed_path,
+    )
+    malformed_values = _values(malformed_observations)
+    assert malformed_values["archive.iso9660.primary_volume_descriptor"]["valid"] is False
+    assert "volume_space_size_both_endian" in malformed_values[
+        "archive.iso9660.primary_volume_descriptor"
+    ]["failed_checks"]
+    assert malformed_values["archive.iso9660.root_directory_entries"] == []
+    malformed_profile = ProfileEngine().evaluate(
+        malformed_artifact, malformed_observations,
+    )
+    assert any(
+        item.category == "archive_structure_anomaly"
+        for item in malformed_profile.findings
+    )
 
 
 def test_ntfs_mft_zero_fixed_header_is_observed_at_boot_geometry_offset(tmp_path: Path) -> None:

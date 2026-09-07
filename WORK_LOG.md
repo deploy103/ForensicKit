@@ -1,5 +1,18 @@
 # ForensicKit Work Log
 
+## 2026-09-07 10:15 KST
+
+### ISO 9660 primary-volume/root extraction
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/identification.py`, `src/forensickit/profiles/archive.py`, `src/forensickit/extraction.py`, `tests/test_triage.py`, and `tests/test_engine_pipeline.py`.
+- Added fixed-sector ISO 9660 detection and a bounded 64-descriptor walker. Primary-volume metadata now retains exact descriptor/block offsets, system/volume IDs, both-endian volume/set/sequence/logical-block/path-table values, declared-volume bounds, and the raw root directory record; a missing/invalid terminator, header, both-endian copy, declared range, or root record produces a provenance-rich structural finding.
+- The primary root directory is parsed under 8-MiB, configured signature-byte, and artifact-count bounds. Each record retains its raw bytes, record and extent offsets, extended-attribute blocks, matching little/big-endian extent/length/sequence values, seven-byte recording time and GMT adjustment, file flags, interleave/multi-extent state, raw/version-stripped identifier, system-use bytes, and extraction eligibility. Multi-extent/interleaved files remain explicit unsupported-layout findings.
+- The built-in extractor requires a valid PVD plus a safe, complete, single-extent, non-interleaved regular-file record; it revalidates the raw directory entry before an exact-range copy and retains both PVD/root observation UUIDs and descriptor/record/extent provenance. A synthetic AUTO E2E proves ISO → `FLAG.TXT` child → child-attributed FlagCandidate/report lineage; a both-endian mismatch variant proves extraction suppression and anomaly reporting. Focused ISO regressions passed; the full direct synthetic suite passed: 311 passed, 0 failed. `python -m compileall -q src tests` and `git diff --check` passed.
+
+### Next
+
+- Traverse bounded ISO 9660 active subdirectories with directory identity lineage, shared-extent/cycle rejection, and the same safe regular-file extraction contract.
+
 ## 2026-09-07 10:06 KST
 
 ### Portable ASCII CPIO odc support

@@ -100,6 +100,7 @@ _EXPECTED_EXTENSIONS: dict[str, frozenset[str]] = {
     "tar": frozenset({".tar", ".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.bz2"}),
     "rar": frozenset({".rar"}),
     "cpio": frozenset({".cpio", ".newc"}),
+    "iso9660": frozenset({".iso"}),
     "bzip2": frozenset({".bz2", ".tbz", ".tbz2"}),
     "xz": frozenset({".xz", ".txz"}),
     "pdf": frozenset({".pdf"}),
@@ -260,6 +261,8 @@ class GenericTriageEngine:
             observations.extend(self._inspect_gzip_header(artifact, header))
         if detected_format == "cpio":
             observations.extend(self._inspect_cpio(artifact, path, actual_size))
+        if detected_format == "iso9660":
+            observations.extend(self._inspect_iso9660(artifact, path, actual_size))
         if detected_format in {"pcap", "pcapng"}:
             observations.extend(PcapObservationEngine(max_bytes=self.limits.signature_scan_bytes).analyze(artifact, path))
         if detected_format == "sqlite":
@@ -639,6 +642,8 @@ class GenericTriageEngine:
             return None
         if detected is None and self._is_tar(path, size):
             return "tar"
+        if detected is None and self._is_iso9660(path, size):
+            return "iso9660"
         return detected
 
     @staticmethod
@@ -651,6 +656,19 @@ class GenericTriageEngine:
                 return stream.read(5) == b"ustar"
         except OSError:
             return False
+
+    @staticmethod
+    def _is_iso9660(path: Path, size: int) -> bool:
+        descriptor_offset = 16 * 2_048
+        if size < descriptor_offset + 7:
+            return False
+        try:
+            with path.open("rb") as stream:
+                stream.seek(descriptor_offset)
+                header = stream.read(7)
+        except OSError:
+            return False
+        return header[:1] in {b"\x00", b"\x01", b"\x02", b"\x03", b"\xff"} and header[1:6] == b"CD001" and header[6:7] == b"\x01"
 
     def _inspect_tar_headers(self, artifact: Artifact, path: Path, size: int) -> list[Observation]:
         """Walk a bounded TAR header prefix without extracting any member."""
@@ -984,6 +1002,361 @@ class GenericTriageEngine:
             self._observation(artifact, "archive.cpio.structure_error", structure_error),
             self._observation(artifact, "archive.container_kind", "cpio"),
         ]
+
+    def _inspect_iso9660(
+        self, artifact: Artifact, path: Path, size: int,
+    ) -> list[Observation]:
+        """Parse bounded ISO 9660 descriptors and one primary root directory."""
+        physical_block_size = 2_048
+        descriptor_start = 16 * physical_block_size
+        descriptor_budget = min(self.limits.signature_scan_bytes, 64 * physical_block_size)
+        descriptor_end = min(size, descriptor_start + descriptor_budget)
+        descriptor_types = {
+            0: "boot",
+            1: "primary",
+            2: "supplementary",
+            3: "partition",
+            255: "terminator",
+        }
+        descriptors: list[dict[str, object]] = []
+        descriptor_error: str | None = None
+        descriptor_terminator_found = False
+        pvd: dict[str, object] | None = None
+
+        try:
+            with path.open("rb") as stream:
+                for descriptor_index in range(64):
+                    offset = descriptor_start + descriptor_index * physical_block_size
+                    if offset + physical_block_size > size:
+                        descriptor_error = f"truncated ISO volume descriptor at offset {offset}"
+                        break
+                    if offset + physical_block_size > descriptor_end:
+                        descriptor_error = "ISO volume-descriptor scan reached its byte limit"
+                        break
+                    stream.seek(offset)
+                    raw = stream.read(physical_block_size)
+                    if len(raw) != physical_block_size:
+                        descriptor_error = f"truncated ISO volume descriptor at offset {offset}"
+                        break
+                    descriptor_type = raw[0]
+                    signature_valid = raw[1:6] == b"CD001"
+                    version_valid = raw[6] == 1
+                    descriptor = {
+                        "index": descriptor_index,
+                        "block": 16 + descriptor_index,
+                        "offset": offset,
+                        "type_code": descriptor_type,
+                        "type": descriptor_types.get(descriptor_type, f"unknown_{descriptor_type}"),
+                        "identifier_raw_hex": raw[1:6].hex(),
+                        "identifier": raw[1:6].decode("ascii", errors="replace"),
+                        "version": raw[6],
+                        "signature_valid": signature_valid,
+                        "version_valid": version_valid,
+                    }
+                    descriptors.append(descriptor)
+                    if not signature_valid or not version_valid:
+                        descriptor_error = f"invalid ISO volume descriptor header at offset {offset}"
+                        break
+                    if descriptor_type == 1 and pvd is None:
+                        volume_space_le = int.from_bytes(raw[80:84], "little")
+                        volume_space_be = int.from_bytes(raw[84:88], "big")
+                        volume_set_size_le = int.from_bytes(raw[120:122], "little")
+                        volume_set_size_be = int.from_bytes(raw[122:124], "big")
+                        volume_sequence_le = int.from_bytes(raw[124:126], "little")
+                        volume_sequence_be = int.from_bytes(raw[126:128], "big")
+                        logical_block_le = int.from_bytes(raw[128:130], "little")
+                        logical_block_be = int.from_bytes(raw[130:132], "big")
+                        path_table_size_le = int.from_bytes(raw[132:136], "little")
+                        path_table_size_be = int.from_bytes(raw[136:140], "big")
+                        declared_volume_bytes = volume_space_le * logical_block_le
+                        root_length = raw[156]
+                        root_raw = raw[156:156 + root_length]
+                        root_record, root_error = self._iso9660_directory_record(
+                            root_raw,
+                            record_offset=offset + 156,
+                            logical_block_size=logical_block_le,
+                            evidence_size=size,
+                            declared_volume_bytes=declared_volume_bytes,
+                        )
+                        failed_checks: list[str] = []
+                        if volume_space_le <= 0 or volume_space_le != volume_space_be:
+                            failed_checks.append("volume_space_size_both_endian")
+                        if volume_set_size_le <= 0 or volume_set_size_le != volume_set_size_be:
+                            failed_checks.append("volume_set_size_both_endian")
+                        if volume_sequence_le <= 0 or volume_sequence_le != volume_sequence_be:
+                            failed_checks.append("volume_sequence_number_both_endian")
+                        if (
+                            logical_block_le != logical_block_be
+                            or logical_block_le < 512
+                            or logical_block_le > 32_768
+                            or logical_block_le & (logical_block_le - 1)
+                        ):
+                            failed_checks.append("logical_block_size_both_endian")
+                        if path_table_size_le != path_table_size_be:
+                            failed_checks.append("path_table_size_both_endian")
+                        if declared_volume_bytes > size:
+                            failed_checks.append("declared_volume_within_evidence")
+                        if root_error is not None or root_record.get("file_type") != "directory":
+                            failed_checks.append("root_directory_record")
+                        pvd = {
+                            "descriptor_offset": offset,
+                            "descriptor_block": 16 + descriptor_index,
+                            "system_identifier": raw[8:40].decode("ascii", errors="replace").rstrip(" "),
+                            "volume_identifier": raw[40:72].decode("ascii", errors="replace").rstrip(" "),
+                            "volume_space_blocks": volume_space_le,
+                            "volume_space_blocks_big_endian": volume_space_be,
+                            "volume_space_both_endian_match": volume_space_le == volume_space_be,
+                            "declared_volume_bytes": declared_volume_bytes,
+                            "declared_volume_within_evidence": declared_volume_bytes <= size,
+                            "volume_set_size": volume_set_size_le,
+                            "volume_set_size_big_endian": volume_set_size_be,
+                            "volume_sequence_number": volume_sequence_le,
+                            "volume_sequence_number_big_endian": volume_sequence_be,
+                            "logical_block_size": logical_block_le,
+                            "logical_block_size_big_endian": logical_block_be,
+                            "logical_block_size_both_endian_match": logical_block_le == logical_block_be,
+                            "path_table_size": path_table_size_le,
+                            "path_table_size_big_endian": path_table_size_be,
+                            "path_table_size_both_endian_match": path_table_size_le == path_table_size_be,
+                            "little_endian_path_table_block": int.from_bytes(raw[140:144], "little"),
+                            "optional_little_endian_path_table_block": int.from_bytes(raw[144:148], "little"),
+                            "big_endian_path_table_block": int.from_bytes(raw[148:152], "big"),
+                            "optional_big_endian_path_table_block": int.from_bytes(raw[152:156], "big"),
+                            "root_directory_record_offset": offset + 156,
+                            "root_directory_record_length": root_length,
+                            "root_directory_record": root_record,
+                            "root_directory_record_error": root_error,
+                            "failed_checks": failed_checks,
+                            "valid": not failed_checks,
+                        }
+                    if descriptor_type == 255:
+                        descriptor_terminator_found = True
+                        break
+        except OSError as exc:
+            descriptor_error = str(exc)[:2_000]
+
+        if pvd is None and descriptor_error is None:
+            descriptor_error = "ISO descriptor sequence has no primary volume descriptor"
+
+        root_entries: list[dict[str, object]] = []
+        root_error: str | None = None
+        root_scan_bytes = 0
+        root_scan_truncated = False
+        root_entry_limit_reached = False
+        if pvd is not None and isinstance(pvd.get("root_directory_record"), dict):
+            root = pvd["root_directory_record"]
+            logical_block_size = pvd.get("logical_block_size")
+            root_offset = root.get("data_offset")
+            root_length = root.get("data_length")
+            if (
+                pvd.get("valid") is True
+                and isinstance(logical_block_size, int)
+                and isinstance(root_offset, int)
+                and isinstance(root_length, int)
+                and 0 <= root_offset <= size
+                and 0 <= root_length <= size - root_offset
+            ):
+                root_scan_bytes = min(
+                    root_length, self.limits.signature_scan_bytes, 8 * _MIB,
+                )
+                root_scan_truncated = root_scan_bytes < root_length
+                try:
+                    with path.open("rb") as stream:
+                        stream.seek(root_offset)
+                        directory_data = stream.read(root_scan_bytes)
+                except OSError as exc:
+                    root_error = str(exc)[:2_000]
+                    directory_data = b""
+                cursor = 0
+                entry_limit = min(self.limits.max_artifact_count + 2, 4_096)
+                while cursor < len(directory_data):
+                    record_length = directory_data[cursor]
+                    if record_length == 0:
+                        cursor = ((cursor // logical_block_size) + 1) * logical_block_size
+                        continue
+                    if len(root_entries) >= entry_limit:
+                        root_entry_limit_reached = True
+                        root_scan_truncated = True
+                        break
+                    if (
+                        record_length < 34
+                        or cursor + record_length > len(directory_data)
+                        or cursor % logical_block_size + record_length > logical_block_size
+                    ):
+                        if root_scan_truncated and cursor + record_length > len(directory_data):
+                            break
+                        root_error = (
+                            f"invalid ISO root directory record length {record_length} "
+                            f"at offset {root_offset + cursor}"
+                        )
+                        break
+                    record, record_error = self._iso9660_directory_record(
+                        directory_data[cursor:cursor + record_length],
+                        record_offset=root_offset + cursor,
+                        logical_block_size=logical_block_size,
+                        evidence_size=size,
+                        declared_volume_bytes=int(pvd["declared_volume_bytes"]),
+                    )
+                    record["root_directory_relative_offset"] = cursor
+                    root_entries.append(record)
+                    if record_error is not None and root_error is None:
+                        root_error = record_error
+                    cursor += record_length
+
+        return [
+            self._observation(artifact, "archive.iso9660.signature", True),
+            self._observation(artifact, "archive.iso9660.physical_descriptor_block_size", physical_block_size),
+            self._observation(artifact, "archive.iso9660.volume_descriptors", descriptors),
+            self._observation(artifact, "archive.iso9660.descriptor_count", len(descriptors)),
+            self._observation(artifact, "archive.iso9660.descriptor_terminator_found", descriptor_terminator_found),
+            self._observation(artifact, "archive.iso9660.descriptor_error", descriptor_error),
+            self._observation(artifact, "archive.iso9660.primary_volume_descriptor", pvd),
+            self._observation(artifact, "archive.iso9660.root_directory_entries", root_entries),
+            self._observation(artifact, "archive.iso9660.root_directory_entry_count", len(root_entries)),
+            self._observation(artifact, "archive.iso9660.root_directory_scan_bytes", root_scan_bytes),
+            self._observation(artifact, "archive.iso9660.root_directory_scan_truncated", root_scan_truncated),
+            self._observation(artifact, "archive.iso9660.root_directory_entry_limit_reached", root_entry_limit_reached),
+            self._observation(artifact, "archive.iso9660.root_directory_error", root_error),
+            self._observation(artifact, "archive.container_kind", "iso9660"),
+        ]
+
+    @staticmethod
+    def _iso9660_directory_record(
+        raw: bytes,
+        *,
+        record_offset: int,
+        logical_block_size: int,
+        evidence_size: int,
+        declared_volume_bytes: int,
+    ) -> tuple[dict[str, object], str | None]:
+        """Decode one bounded ISO directory record with both-endian checks."""
+        record: dict[str, object] = {
+            "record_offset": record_offset,
+            "record_length": len(raw),
+            "record_raw_hex": raw.hex(),
+            "valid": False,
+        }
+        if len(raw) < 34 or raw[0] != len(raw):
+            return record, f"invalid ISO directory record framing at offset {record_offset}"
+        identifier_length = raw[32]
+        identifier_end = 33 + identifier_length
+        identifier_padding = 1 if identifier_length % 2 == 0 else 0
+        system_use_offset = identifier_end + identifier_padding
+        if identifier_length == 0 or identifier_end > len(raw) or system_use_offset > len(raw):
+            return record, f"invalid ISO file identifier bounds at offset {record_offset}"
+        extent_le = int.from_bytes(raw[2:6], "little")
+        extent_be = int.from_bytes(raw[6:10], "big")
+        data_length_le = int.from_bytes(raw[10:14], "little")
+        data_length_be = int.from_bytes(raw[14:18], "big")
+        volume_sequence_le = int.from_bytes(raw[28:30], "little")
+        volume_sequence_be = int.from_bytes(raw[30:32], "big")
+        raw_identifier = raw[33:identifier_end]
+        if raw_identifier == b"\x00":
+            identifier = "."
+        elif raw_identifier == b"\x01":
+            identifier = ".."
+        else:
+            identifier = raw_identifier.decode("ascii", errors="replace")
+        version_match = re.search(r";([0-9]+)$", identifier)
+        version = int(version_match.group(1)) if version_match else None
+        logical_name = identifier[:version_match.start()] if version_match else identifier
+        normalized_name = logical_name.replace("\\", "/")
+        path_safe = (
+            logical_name in {".", ".."}
+            or (
+                not normalized_name.startswith("/")
+                and re.match(r"^[A-Za-z]:/", normalized_name) is None
+                and ".." not in normalized_name.split("/")
+                and "/" not in normalized_name
+            )
+        )
+        extended_attribute_blocks = raw[1]
+        data_offset = (extent_le + extended_attribute_blocks) * logical_block_size
+        data_end = data_offset + data_length_le
+        flags = raw[25]
+        timestamp, timestamp_valid = GenericTriageEngine._iso9660_recording_time(raw[18:25])
+        failed_checks: list[str] = []
+        if extent_le != extent_be:
+            failed_checks.append("extent_location_both_endian")
+        if data_length_le != data_length_be:
+            failed_checks.append("data_length_both_endian")
+        if volume_sequence_le <= 0 or volume_sequence_le != volume_sequence_be:
+            failed_checks.append("volume_sequence_number_both_endian")
+        if data_offset < 0 or data_end > evidence_size:
+            failed_checks.append("extent_within_evidence")
+        if data_end > declared_volume_bytes:
+            failed_checks.append("extent_within_declared_volume")
+        if not path_safe:
+            failed_checks.append("file_identifier_path_safe")
+        record.update({
+            "extended_attribute_blocks": extended_attribute_blocks,
+            "logical_block_size": logical_block_size,
+            "extent_block": extent_le,
+            "extent_block_big_endian": extent_be,
+            "extent_both_endian_match": extent_le == extent_be,
+            "data_offset": data_offset,
+            "data_length": data_length_le,
+            "data_length_big_endian": data_length_be,
+            "data_length_both_endian_match": data_length_le == data_length_be,
+            "data_end_offset": data_end,
+            "data_within_evidence": data_end <= evidence_size,
+            "data_within_declared_volume": data_end <= declared_volume_bytes,
+            "recording_time_raw_hex": raw[18:25].hex(),
+            "recording_time_utc": timestamp,
+            "recording_time_valid": timestamp_valid,
+            "gmt_offset_15_minutes": raw[24] - 256 if raw[24] >= 128 else raw[24],
+            "flags_raw": f"0x{flags:02x}",
+            "hidden": bool(flags & 0x01),
+            "directory": bool(flags & 0x02),
+            "associated_file": bool(flags & 0x04),
+            "record_format": bool(flags & 0x08),
+            "protection": bool(flags & 0x10),
+            "multi_extent": bool(flags & 0x80),
+            "file_type": "directory" if flags & 0x02 else "regular",
+            "file_unit_size": raw[26],
+            "interleave_gap_size": raw[27],
+            "volume_sequence_number": volume_sequence_le,
+            "volume_sequence_number_big_endian": volume_sequence_be,
+            "identifier_length": identifier_length,
+            "identifier_raw_hex": raw_identifier.hex(),
+            "file_identifier": identifier,
+            "logical_name": logical_name,
+            "version": version,
+            "identifier_padding_length": identifier_padding,
+            "path_safe": path_safe,
+            "system_use_offset_in_record": system_use_offset,
+            "system_use_length": len(raw) - system_use_offset,
+            "system_use_raw_hex": raw[system_use_offset:].hex(),
+            "failed_checks": failed_checks,
+            "valid": not failed_checks,
+            "extraction_eligible": (
+                not failed_checks
+                and not bool(flags & 0x02)
+                and not bool(flags & 0x80)
+                and raw[26] == 0
+                and raw[27] == 0
+                and logical_name not in {".", ".."}
+            ),
+        })
+        return record, None if not failed_checks else (
+            f"ISO directory record at offset {record_offset} failed: {', '.join(failed_checks)}"
+        )
+
+    @staticmethod
+    def _iso9660_recording_time(raw: bytes) -> tuple[str | None, bool]:
+        if len(raw) != 7:
+            return None, False
+        offset_units = raw[6] - 256 if raw[6] >= 128 else raw[6]
+        try:
+            if not -48 <= offset_units <= 52:
+                return None, False
+            local_time = datetime(
+                raw[0] + 1900, raw[1], raw[2], raw[3], raw[4], raw[5],
+            )
+            utc_time = local_time - timedelta(minutes=offset_units * 15)
+        except ValueError:
+            return None, False
+        return utc_time.replace(tzinfo=UTC).isoformat(), True
 
     def _inspect_disk_memory(
         self, artifact: Artifact, path: Path, header: bytes, size: int
