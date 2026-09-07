@@ -652,6 +652,12 @@ class ExtractionManager:
                     f"archive_path:{name};"
                     f"containing_directory_identity:{record.get('containing_directory_identity')};"
                     f"directory_identity_lineage:{record.get('directory_identity_lineage')};"
+                    f"archive_name_source:{record.get('archive_name_source')};"
+                    f"joliet_alias:{record.get('joliet_alias')};"
+                    f"joliet_containing_directory_identity:"
+                    f"{record.get('joliet_containing_directory_identity')};"
+                    f"joliet_directory_identity_lineage:"
+                    f"{record.get('joliet_directory_identity_lineage')};"
                     f"directory_record:{record}"
                 )
         if result.artifacts:

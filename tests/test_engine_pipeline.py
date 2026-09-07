@@ -240,6 +240,74 @@ def _iso9660_with_nested_file(
     return bytes(image)
 
 
+def _iso9660_with_joliet_alias(payload: bytes) -> bytes:
+    block_size = 2_048
+    image = bytearray(25 * block_size)
+    pvd_offset = 16 * block_size
+    image[pvd_offset] = 1
+    image[pvd_offset + 1:pvd_offset + 6] = b"CD001"
+    image[pvd_offset + 6] = 1
+    image[pvd_offset + 8:pvd_offset + 40] = b"FORENSICKIT".ljust(32, b" ")
+    image[pvd_offset + 40:pvd_offset + 72] = b"JOLIET_PRIMARY".ljust(32, b" ")
+    image[pvd_offset + 80:pvd_offset + 84] = (25).to_bytes(4, "little")
+    image[pvd_offset + 84:pvd_offset + 88] = (25).to_bytes(4, "big")
+    image[pvd_offset + 120:pvd_offset + 122] = (1).to_bytes(2, "little")
+    image[pvd_offset + 122:pvd_offset + 124] = (1).to_bytes(2, "big")
+    image[pvd_offset + 124:pvd_offset + 126] = (1).to_bytes(2, "little")
+    image[pvd_offset + 126:pvd_offset + 128] = (1).to_bytes(2, "big")
+    image[pvd_offset + 128:pvd_offset + 130] = block_size.to_bytes(2, "little")
+    image[pvd_offset + 130:pvd_offset + 132] = block_size.to_bytes(2, "big")
+    primary_root_record = _iso_directory_record(
+        b"\x00", 20, block_size, flags=0x02,
+    )
+    image[pvd_offset + 156:pvd_offset + 156 + len(primary_root_record)] = primary_root_record
+
+    svd_offset = 17 * block_size
+    image[svd_offset] = 2
+    image[svd_offset + 1:svd_offset + 6] = b"CD001"
+    image[svd_offset + 6] = 1
+    volume_identifier = "졸리엣".encode("utf-16-be")
+    image[svd_offset + 40:svd_offset + 72] = volume_identifier.ljust(32, b"\x00")
+    image[svd_offset + 80:svd_offset + 84] = (25).to_bytes(4, "little")
+    image[svd_offset + 84:svd_offset + 88] = (25).to_bytes(4, "big")
+    image[svd_offset + 88:svd_offset + 91] = b"%/E"
+    image[svd_offset + 120:svd_offset + 122] = (1).to_bytes(2, "little")
+    image[svd_offset + 122:svd_offset + 124] = (1).to_bytes(2, "big")
+    image[svd_offset + 124:svd_offset + 126] = (1).to_bytes(2, "little")
+    image[svd_offset + 126:svd_offset + 128] = (1).to_bytes(2, "big")
+    image[svd_offset + 128:svd_offset + 130] = block_size.to_bytes(2, "little")
+    image[svd_offset + 130:svd_offset + 132] = block_size.to_bytes(2, "big")
+    joliet_root_record = _iso_directory_record(
+        b"\x00", 21, block_size, flags=0x02,
+    )
+    image[svd_offset + 156:svd_offset + 156 + len(joliet_root_record)] = joliet_root_record
+    terminator = 18 * block_size
+    image[terminator] = 255
+    image[terminator + 1:terminator + 6] = b"CD001"
+    image[terminator + 6] = 1
+
+    primary_root = (
+        primary_root_record
+        + _iso_directory_record(b"\x01", 20, block_size, flags=0x02)
+        + _iso_directory_record(b"FILE000.TXT;1", 24, len(payload))
+    )
+    image[20 * block_size:20 * block_size + len(primary_root)] = primary_root
+    joliet_root = (
+        joliet_root_record
+        + _iso_directory_record(b"\x01", 21, block_size, flags=0x02)
+        + _iso_directory_record("증거".encode("utf-16-be"), 22, block_size, flags=0x02)
+    )
+    image[21 * block_size:21 * block_size + len(joliet_root)] = joliet_root
+    joliet_directory = (
+        _iso_directory_record(b"\x00", 22, block_size, flags=0x02)
+        + _iso_directory_record(b"\x01", 21, block_size, flags=0x02)
+        + _iso_directory_record("깃발.txt;1".encode("utf-16-be"), 24, len(payload))
+    )
+    image[22 * block_size:22 * block_size + len(joliet_directory)] = joliet_directory
+    image[24 * block_size:24 * block_size + len(payload)] = payload
+    return bytes(image)
+
+
 def test_png_appended_zip_recurses_to_base64_flag(tmp_path: Path) -> None:
     archive = BytesIO()
     with ZipFile(archive, "w") as zip_file:
@@ -583,6 +651,59 @@ def test_iso9660_rock_ridge_name_recurses_while_symlink_stays_metadata_only(
     assert "Evidence Directory/Flag Evidence.txt" in report
     assert "rock_ridge_symlink" in report
     assert "CTF{rock_ridge_recursive_lineage}" in report
+
+
+def test_iso9660_joliet_extent_alias_recurses_once_with_ucs2_lineage(
+    tmp_path: Path,
+) -> None:
+    payload = b"CTF{joliet_recursive_lineage}"
+    evidence = tmp_path / "joliet.iso"
+    evidence.write_bytes(_iso9660_with_joliet_alias(payload))
+
+    result = AnalysisEngine().analyze(
+        evidence, tmp_path / "joliet-cases", mode=AnalysisMode.AUTO,
+        execute=False,
+    )
+
+    assert [item.logical_name for item in result.artifacts] == [
+        "joliet.iso", "증거/깃발.txt",
+    ]
+    child = result.artifacts[1]
+    assert child.parent_id == result.artifacts[0].id
+    assert child.size == len(payload)
+    assert child.artifact_type == "text"
+    assert any(
+        candidate.value == "CTF{joliet_recursive_lineage}"
+        and candidate.artifact_id == child.id
+        for candidate in result.flags
+    )
+    regular_observation = next(
+        item for item in result.observations
+        if item.artifact_id == result.artifacts[0].id
+        and item.key == "archive.iso9660.regular_files"
+    )
+    assert len(regular_observation.value) == 1
+    primary_file = regular_observation.value[0]
+    assert primary_file["file_identifier"] == "FILE000.TXT;1"
+    assert primary_file["archive_path"] == "증거/깃발.txt"
+    assert primary_file["archive_name_source"] == "joliet_extent_alias"
+    assert primary_file["joliet_alias"]["joliet_record_offset"] == 22 * 2_048 + 68
+    assert primary_file["joliet_directory_identity_lineage"][0]["logical_name"] == "증거"
+    recovery = next(
+        item for item in result.findings
+        if item.source == "builtin_iso9660_extractor"
+    )
+    evidence_line = recovery.supporting_evidence[0]
+    assert "archive_path:증거/깃발.txt" in evidence_line
+    assert "archive_name_source:joliet_extent_alias" in evidence_line
+    assert "'joliet_archive_path': '증거/깃발.txt'" in evidence_line
+    assert "joliet_directory_identity_lineage:[{'namespace': 'joliet'" in evidence_line
+    report = next((tmp_path / "joliet-cases").glob("*/reports/report.json")).read_text(
+        encoding="utf-8"
+    )
+    assert "증거/깃발.txt" in report
+    assert "joliet_extent_aliases" in report
+    assert "CTF{joliet_recursive_lineage}" in report
 
 
 def test_ext_root_regular_file_recurses_to_flag_with_inode_lineage(tmp_path: Path) -> None:
