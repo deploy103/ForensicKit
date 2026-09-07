@@ -183,9 +183,15 @@ def _rrip_pn(device_high: int, device_low: int) -> bytes:
     return _susp_entry(b"PN", _iso_both32(device_high) + _iso_both32(device_low))
 
 
+def _rrip_link(signature: bytes, block: int) -> bytes:
+    assert signature in {b"CL", b"PL"}
+    return _susp_entry(signature, _iso_both32(block))
+
+
 def _iso9660_with_rock_ridge(
     *, unsafe_file_name: bool = False, continued_name: bool = False,
     continuation_cycle: bool = False,
+    relocation: bool = False,
 ) -> tuple[bytes, bytes]:
     block_size = 2_048
     image = bytearray(25 * block_size)
@@ -223,6 +229,13 @@ def _iso9660_with_rock_ridge(
         skip_prefix
         + _rrip_px(0o040750, links=2)
         + _susp_entry(b"NM", b"\x00Evidence Directory")
+        + (_rrip_link(b"CL", 22) if relocation else b"")
+        + _susp_entry(b"ST")
+    )
+    parent_system_use = (
+        skip_prefix
+        + _rrip_px(0o040755, links=2)
+        + (_rrip_link(b"PL", 20) if relocation else b"")
         + _susp_entry(b"ST")
     )
     root = (
@@ -231,11 +244,21 @@ def _iso9660_with_rock_ridge(
         )
         + _iso_directory_record(
             b"\x01", 20, block_size, flags=0x02,
-            system_use=skip_prefix + _rrip_px(0o040755, links=2) + _susp_entry(b"ST"),
+            system_use=parent_system_use,
         )
         + _iso_directory_record(
-            b"LONGDIR", 22, block_size, flags=0x02,
+            b"LONGDIR", 21 if relocation else 22, block_size, flags=0x02,
             system_use=directory_system_use,
+        )
+        + (
+            _iso_directory_record(
+                b"RR_MOVED", 22, block_size, flags=0x02,
+                system_use=(
+                    skip_prefix + _rrip_px(0o040700, links=2)
+                    + _susp_entry(b"RE") + _susp_entry(b"ST")
+                ),
+            )
+            if relocation else b""
         )
     )
     image[20 * block_size:20 * block_size + len(root)] = root
@@ -2085,6 +2108,53 @@ def test_iso9660_rock_ridge_tf_long_form_and_pn_mismatch_validate() -> None:
     assert pn_entry["device_high"] == 8
     assert pn_entry["device_high_big_endian"] == 9
     assert pn_entry["device_high_both_endian_match"] is False
+
+
+def test_iso9660_rock_ridge_relocation_links_are_reconciled_without_traversal(
+    tmp_path: Path,
+) -> None:
+    image, _ = _iso9660_with_rock_ridge(relocation=True)
+    evidence = tmp_path / "rock-ridge-relocation.iso"
+    evidence.write_bytes(image)
+    artifact = _artifact(evidence)
+    observations = GenericTriageEngine().analyze(artifact, evidence)
+    values = _values(observations)
+    entries = values["archive.iso9660.directory_entries"]
+    placeholder = next(item for item in entries if item.get("file_identifier") == "LONGDIR")
+    relocated = next(item for item in entries if item.get("file_identifier") == "RR_MOVED")
+    parent = next(item for item in entries if item.get("logical_name") == "..")
+    assert placeholder["rock_ridge_relocation"]["child_links"][0]["target_block"] == 22
+    assert placeholder["rock_ridge_relocation_traversal_suppressed"] is True
+    assert placeholder["directory_traversal"] == "rock_ridge_relocation"
+    assert relocated["rock_ridge_relocation"]["relocated_markers"][0]["valid"] is True
+    assert relocated["rock_ridge_relocation_traversal_suppressed"] is True
+    assert relocated["directory_traversal"] == "rock_ridge_relocation"
+    assert parent["rock_ridge_relocation"]["parent_links"][0]["target_block"] == 20
+    assert values["archive.iso9660.regular_files"] == []
+    relocations = values["archive.iso9660.rock_ridge_relocations"]
+    placeholder_record = next(
+        item for item in relocations if item["source_file_identifier"] == "LONGDIR"
+    )
+    assert placeholder_record["traversal_suppressed"] is True
+    child_link = placeholder_record["child_links"][0]
+    assert child_link["known_directory_match_count"] == 1
+    assert child_link["known_directory_archive_path"] == "RR_MOVED"
+    assert child_link["uniquely_reconciled"] is True
+    parent_record = next(
+        item for item in relocations if item["source_file_identifier"] == ".."
+    )
+    assert parent_record["parent_links"][0]["known_directory_match_count"] == 1
+    assert parent_record["parent_links"][0]["known_directory_archive_path"] == "/"
+    assert values["archive.iso9660.directory_traversal_errors"] == []
+    profile = ProfileEngine().evaluate(artifact, observations)
+    relocation_finding = next(
+        item for item in profile.findings
+        if item.category == "archive_relocated_directory_metadata"
+    )
+    assert relocation_finding.severity == "info"
+    assert not any(
+        item.category == "iso9660_susp_anomaly" for item in profile.findings
+    )
 
 
 def test_iso9660_joliet_tree_reconciles_ucs2_path_to_primary_extent(

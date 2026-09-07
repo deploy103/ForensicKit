@@ -1445,6 +1445,9 @@ class GenericTriageEngine:
                             "entry": entry,
                         })
                         return
+                    if entry.get("rock_ridge_relocation_traversal_suppressed") is True:
+                        entry["directory_traversal"] = "rock_ridge_relocation"
+                        return
                     if (
                         entry.get("multi_extent") is True
                         or entry.get("file_unit_size") not in {0, None}
@@ -1658,6 +1661,64 @@ class GenericTriageEngine:
                         "directory_limit": directory_limit,
                     })
 
+        rock_ridge_relocations: list[dict[str, object]] = []
+        known_directory_extents = [{
+            "logical_name": "/",
+            "record_offset": pvd.get("root_directory_record_offset") if pvd else None,
+            "extent_block": (
+                pvd.get("root_directory_record", {}).get("extent_block")
+                if pvd and isinstance(pvd.get("root_directory_record"), dict) else None
+            ),
+            "archive_path": "/",
+        }]
+        known_directory_extents.extend(
+            entry for entry in all_directory_entries
+            if entry.get("file_type") == "directory"
+            and entry.get("logical_name") not in {".", ".."}
+        )
+        for entry in all_directory_entries:
+            relocation = entry.get("rock_ridge_relocation")
+            if not isinstance(relocation, dict):
+                continue
+            record: dict[str, object] = {
+                "source_record_offset": entry.get("record_offset"),
+                "source_file_identifier": entry.get("file_identifier"),
+                "source_archive_path": entry.get("archive_path"),
+                "source_file_type": entry.get("file_type"),
+                "traversal_suppressed": entry.get(
+                    "rock_ridge_relocation_traversal_suppressed", False
+                ),
+                "child_links": [],
+                "parent_links": [],
+                "relocated_markers": relocation.get("relocated_markers", []),
+            }
+            for role, target_key in (
+                ("child_links", "target_block"), ("parent_links", "target_block"),
+            ):
+                links = relocation.get(role, [])
+                if not isinstance(links, list):
+                    continue
+                for link in links:
+                    if not isinstance(link, dict):
+                        continue
+                    target_block = link.get(target_key)
+                    matches = [
+                        candidate for candidate in known_directory_extents
+                        if candidate.get("extent_block") == target_block
+                    ]
+                    record[role].append({
+                        **link,
+                        "known_directory_match_count": len(matches),
+                        "known_directory_record_offset": (
+                            matches[0].get("record_offset") if len(matches) == 1 else None
+                        ),
+                        "known_directory_archive_path": (
+                            matches[0].get("archive_path") if len(matches) == 1 else None
+                        ),
+                        "uniquely_reconciled": len(matches) == 1,
+                    })
+            rock_ridge_relocations.append(record)
+
         path_tables: list[dict[str, object]] = []
         path_table_comparison: dict[str, object] = {
             "available": False, "consistent": None,
@@ -1806,6 +1867,7 @@ class GenericTriageEngine:
                 key: value for key, value in susp_continuation_state.items()
                 if key != "claimed_ranges"
             }),
+            self._observation(artifact, "archive.iso9660.rock_ridge_relocations", rock_ridge_relocations),
             self._observation(artifact, "archive.iso9660.rock_ridge_detected", rock_ridge_detected),
             self._observation(artifact, "archive.iso9660.rock_ridge_entries", rock_ridge_entries),
             self._observation(artifact, "archive.iso9660.rock_ridge_entry_count", len(rock_ridge_entries)),
@@ -3196,7 +3258,9 @@ class GenericTriageEngine:
                 else:
                     field_names = (
                         ("continuation_block", "continuation_offset", "continuation_length")
-                        if signature == "CE" else ("child_or_parent_block",)
+                        if signature == "CE"
+                        else ("child_link_block",) if signature == "CL"
+                        else ("parent_link_block",)
                     )
                     for field_index, field_name in enumerate(field_names):
                         field_offset = 4 + field_index * 8
@@ -3516,6 +3580,48 @@ class GenericTriageEngine:
             if len(pn_entries) > 1:
                 anomalies.append("duplicate_rock_ridge_device_number")
 
+        cl_entries = [
+            entry for entry in rrip_entries if entry.get("signature") == "CL"
+        ]
+        pl_entries = [
+            entry for entry in rrip_entries if entry.get("signature") == "PL"
+        ]
+        re_entries = [
+            entry for entry in rrip_entries if entry.get("signature") == "RE"
+        ]
+        if cl_entries or pl_entries or re_entries:
+            relocation = {
+                "child_links": [{
+                    "target_block": entry.get("child_link_block"),
+                    "valid": entry.get("valid"),
+                    "source_absolute_offset": entry.get("absolute_offset"),
+                } for entry in cl_entries],
+                "parent_links": [{
+                    "target_block": entry.get("parent_link_block"),
+                    "valid": entry.get("valid"),
+                    "source_absolute_offset": entry.get("absolute_offset"),
+                } for entry in pl_entries],
+                "relocated_markers": [{
+                    "valid": entry.get("valid"),
+                    "source_absolute_offset": entry.get("absolute_offset"),
+                } for entry in re_entries],
+            }
+            record["rock_ridge_relocation"] = relocation
+            if len(cl_entries) > 1:
+                anomalies.append("duplicate_rock_ridge_child_link")
+            if len(pl_entries) > 1:
+                anomalies.append("duplicate_rock_ridge_parent_link")
+            if len(re_entries) > 1:
+                anomalies.append("duplicate_rock_ridge_relocated_marker")
+            if cl_entries and record.get("file_type") != "directory":
+                anomalies.append("rock_ridge_child_link_on_non_directory")
+            if pl_entries and record.get("logical_name") != "..":
+                anomalies.append("rock_ridge_parent_link_outside_parent_entry")
+            if re_entries and record.get("file_type") != "directory":
+                anomalies.append("rock_ridge_relocated_marker_on_non_directory")
+            if cl_entries or re_entries:
+                record["rock_ridge_relocation_traversal_suppressed"] = True
+
         nm_entries = [
             entry for entry in rrip_entries if entry.get("signature") == "NM"
         ]
@@ -3643,6 +3749,7 @@ class GenericTriageEngine:
             or record.get("rock_ridge_name_usable") is False
             or (susp_error is not None and rock_ridge_detected)
             or continuation_unparsed
+            or record.get("rock_ridge_relocation_traversal_suppressed") is True
         ):
             record["extraction_eligible"] = False
         record["rock_ridge_anomalies"] = anomalies
