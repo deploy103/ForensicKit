@@ -308,6 +308,61 @@ def _iso9660_with_joliet_alias(payload: bytes) -> bytes:
     return bytes(image)
 
 
+def _iso9660_with_el_torito(payload: bytes) -> bytes:
+    block_size = 2_048
+    image = bytearray(24 * block_size)
+    boot_record_offset = 16 * block_size
+    image[boot_record_offset] = 0
+    image[boot_record_offset + 1:boot_record_offset + 6] = b"CD001"
+    image[boot_record_offset + 6] = 1
+    image[boot_record_offset + 7:boot_record_offset + 39] = (
+        b"EL TORITO SPECIFICATION".ljust(32, b" ")
+    )
+    image[boot_record_offset + 39:boot_record_offset + 71] = b"FORENSICKIT BOOT".ljust(32, b" ")
+    image[boot_record_offset + 71:boot_record_offset + 75] = (21).to_bytes(4, "little")
+    pvd_offset = 17 * block_size
+    image[pvd_offset] = 1
+    image[pvd_offset + 1:pvd_offset + 6] = b"CD001"
+    image[pvd_offset + 6] = 1
+    image[pvd_offset + 8:pvd_offset + 40] = b"FORENSICKIT".ljust(32, b" ")
+    image[pvd_offset + 40:pvd_offset + 72] = b"BOOT_ISO".ljust(32, b" ")
+    image[pvd_offset + 80:pvd_offset + 84] = (24).to_bytes(4, "little")
+    image[pvd_offset + 84:pvd_offset + 88] = (24).to_bytes(4, "big")
+    image[pvd_offset + 120:pvd_offset + 122] = (1).to_bytes(2, "little")
+    image[pvd_offset + 122:pvd_offset + 124] = (1).to_bytes(2, "big")
+    image[pvd_offset + 124:pvd_offset + 126] = (1).to_bytes(2, "little")
+    image[pvd_offset + 126:pvd_offset + 128] = (1).to_bytes(2, "big")
+    image[pvd_offset + 128:pvd_offset + 130] = block_size.to_bytes(2, "little")
+    image[pvd_offset + 130:pvd_offset + 132] = block_size.to_bytes(2, "big")
+    root_record = _iso_directory_record(b"\x00", 20, block_size, flags=0x02)
+    image[pvd_offset + 156:pvd_offset + 156 + len(root_record)] = root_record
+    terminator = 18 * block_size
+    image[terminator] = 255
+    image[terminator + 1:terminator + 6] = b"CD001"
+    image[terminator + 6] = 1
+    root = root_record + _iso_directory_record(
+        b"\x01", 20, block_size, flags=0x02,
+    )
+    image[20 * block_size:20 * block_size + len(root)] = root
+    validation = bytearray(32)
+    validation[0] = 1
+    validation[4:28] = b"FORENSICKIT EL TORITO".ljust(24, b" ")
+    validation[30:32] = b"\x55\xaa"
+    checksum = -sum(
+        int.from_bytes(validation[index:index + 2], "little")
+        for index in range(0, 32, 2)
+    ) & 0xFFFF
+    validation[28:30] = checksum.to_bytes(2, "little")
+    initial = bytearray(32)
+    initial[0] = 0x88
+    initial[6:8] = (1).to_bytes(2, "little")
+    initial[8:12] = (22).to_bytes(4, "little")
+    image[21 * block_size:21 * block_size + 64] = validation + initial
+    assert len(payload) <= 512
+    image[22 * block_size:22 * block_size + 512] = payload.ljust(512, b"\x00")
+    return bytes(image)
+
+
 def test_png_appended_zip_recurses_to_base64_flag(tmp_path: Path) -> None:
     archive = BytesIO()
     with ZipFile(archive, "w") as zip_file:
@@ -704,6 +759,54 @@ def test_iso9660_joliet_extent_alias_recurses_once_with_ucs2_lineage(
     assert "증거/깃발.txt" in report
     assert "joliet_extent_aliases" in report
     assert "CTF{joliet_recursive_lineage}" in report
+
+
+def test_iso9660_el_torito_boot_image_recurses_with_catalog_lineage(
+    tmp_path: Path,
+) -> None:
+    payload = b"CTF{el_torito_recursive_lineage}"
+    evidence = tmp_path / "bootable.iso"
+    evidence.write_bytes(_iso9660_with_el_torito(payload))
+
+    result = AnalysisEngine().analyze(
+        evidence, tmp_path / "el-torito-cases", mode=AnalysisMode.AUTO,
+        execute=False,
+    )
+
+    assert [item.logical_name for item in result.artifacts] == [
+        "bootable.iso", "eltorito_default_x86_no_emulation.img",
+    ]
+    child = result.artifacts[1]
+    assert child.parent_id == result.artifacts[0].id
+    assert child.size == 512
+    assert any(
+        candidate.value == "CTF{el_torito_recursive_lineage}"
+        and candidate.artifact_id == child.id
+        for candidate in result.flags
+    )
+    observation = next(
+        item for item in result.observations
+        if item.artifact_id == result.artifacts[0].id
+        and item.key == "archive.iso9660.el_torito_boot_images"
+    )
+    assert observation.value[0]["data_offset"] == 22 * 2_048
+    recovery = next(
+        item for item in result.findings
+        if item.source == "builtin_el_torito_extractor"
+    )
+    evidence_line = recovery.supporting_evidence[0]
+    assert f"source_observation_id:{observation.id}" in evidence_line
+    assert "source_observation_key:archive.iso9660.el_torito_boot_images" in evidence_line
+    assert f"catalog_entry_offset:{21 * 2_048 + 32}" in evidence_line
+    assert f"catalog_offset:{21 * 2_048}" in evidence_line
+    assert f"data_offset:{22 * 2_048};data_length:512" in evidence_line
+    assert "data_length_source:catalog_sector_count_512_bytes" in evidence_line
+    report = next((tmp_path / "el-torito-cases").glob("*/reports/report.json")).read_text(
+        encoding="utf-8"
+    )
+    assert "builtin_el_torito_extractor" in report
+    assert "el_torito_boot_images" in report
+    assert "CTF{el_torito_recursive_lineage}" in report
 
 
 def test_ext_root_regular_file_recurses_to_flag_with_inode_lineage(tmp_path: Path) -> None:

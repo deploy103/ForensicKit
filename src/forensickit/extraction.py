@@ -678,6 +678,126 @@ class ExtractionManager:
             ))
         return result
 
+    def extract_iso9660_boot_images(self, artifact: Artifact) -> ExtractionResult:
+        """Copy only size-determinable bootable El Torito default images."""
+        result = ExtractionResult()
+        observation = next(
+            (
+                item for item in self.workspace.database.observations(artifact.id)
+                if item.key == "archive.iso9660.el_torito_boot_images"
+                and isinstance(item.value, list)
+            ),
+            None,
+        )
+        if observation is None:
+            return result
+        source = self.workspace.resolve_stored_path(artifact.path)
+        target_root = self.workspace.path("extracted", artifact.id, "builtin_el_torito")
+        evidence: list[str] = []
+        try:
+            source_stream = source.open("rb")
+        except OSError as exc:
+            result.errors.append(f"El Torito source open failed: {exc}")
+            return result
+        with source_stream:
+            for index, record in enumerate(observation.value):
+                if not isinstance(record, dict) or record.get("extraction_eligible") is not True:
+                    continue
+                output: Path | None = None
+                name = record.get("logical_name")
+                entry_offset = record.get("offset")
+                entry_raw_hex = record.get("raw_hex")
+                data_offset = record.get("data_offset")
+                data_length = record.get("data_length")
+                validation_entry = record.get("catalog_validation_entry")
+                validation_offset = (
+                    validation_entry.get("offset")
+                    if isinstance(validation_entry, dict) else None
+                )
+                validation_raw_hex = (
+                    validation_entry.get("raw_hex")
+                    if isinstance(validation_entry, dict) else None
+                )
+                if (
+                    not isinstance(name, str) or not name or self._unsafe_name(name)
+                    or not isinstance(entry_offset, int) or entry_offset < 0
+                    or not isinstance(entry_raw_hex, str)
+                    or not isinstance(data_offset, int) or data_offset < 0
+                    or not isinstance(data_length, int) or data_length <= 0
+                    or data_offset + data_length > artifact.size
+                    or not isinstance(validation_offset, int) or validation_offset < 0
+                    or not isinstance(validation_raw_hex, str)
+                ):
+                    result.errors.append(f"skipped El Torito image {name!r}: invalid observed range")
+                    continue
+                reason = self.can_register(artifact, data_length)
+                if reason:
+                    result.errors.append(f"skipped El Torito image {name!r}: {reason}")
+                    continue
+                try:
+                    source_stream.seek(validation_offset)
+                    if source_stream.read(32).hex() != validation_raw_hex:
+                        raise RuntimeError(
+                            "catalog validation entry no longer matches triage provenance"
+                        )
+                    source_stream.seek(entry_offset)
+                    if source_stream.read(32).hex() != entry_raw_hex:
+                        raise RuntimeError("catalog entry no longer matches triage provenance")
+                    target_root.mkdir(parents=True, exist_ok=True)
+                    output = target_root / f"{index:03d}_{safe_name(name)}"
+                    source_stream.seek(data_offset)
+                    written = 0
+                    with output.open("xb") as writer:
+                        remaining = data_length
+                        while remaining:
+                            chunk = source_stream.read(min(1024 * 1024, remaining))
+                            if not chunk:
+                                raise RuntimeError("boot-image read ended before declared length")
+                            writer.write(chunk)
+                            written += len(chunk)
+                            remaining -= len(chunk)
+                    if written != data_length:
+                        raise RuntimeError("boot-image length mismatch")
+                except (OSError, RuntimeError) as exc:
+                    if output is not None:
+                        output.unlink(missing_ok=True)
+                    result.errors.append(f"failed El Torito image {name!r}: {exc}")
+                    continue
+                child = self.register_file(output, artifact, name)
+                if child is None:
+                    result.errors.append(
+                        f"skipped El Torito image {name!r}: duplicate or extraction limit"
+                    )
+                    continue
+                result.artifacts.append(child)
+                result.extracted_bytes += child.size
+                evidence.append(
+                    f"child:{child.id};source_observation_id:{observation.id};"
+                    f"source_observation_key:{observation.key};catalog_entry_offset:{entry_offset};"
+                    f"catalog_offset:{record.get('catalog_offset')};"
+                    f"data_offset:{data_offset};data_length:{data_length};"
+                    f"data_length_source:{record.get('data_length_source')};"
+                    f"boot_record:{record.get('boot_record')};"
+                    f"validation_entry:{record.get('catalog_validation_entry')};"
+                    f"initial_entry:{record}"
+                )
+        if result.artifacts:
+            result.findings.append(Finding(
+                artifact_id=artifact.id,
+                title=f"Extracted {len(result.artifacts)} El Torito boot image(s)",
+                category="boot_image_extraction",
+                severity="info",
+                confidence=0.99,
+                explanation=(
+                    "Only bootable default catalog entries with a valid validation checksum/key, "
+                    "an exact catalog record, a deterministic no-emulation or floppy size, and a "
+                    "complete ISO-bounded range were copied."
+                ),
+                source="builtin_el_torito_extractor",
+                supporting_evidence=evidence[:16],
+            ))
+        return result
+
     def extract_single_stream(self, artifact: Artifact) -> ExtractionResult:
         source = self.workspace.resolve_stored_path(artifact.path)
         try:
@@ -3177,7 +3297,15 @@ class ExtractionManager:
         if cpio_result.artifacts or cpio_result.errors:
             return cpio_result
         iso_result = self.extract_iso9660(artifact)
-        if iso_result.artifacts or iso_result.errors:
+        el_torito_result = self.extract_iso9660_boot_images(artifact)
+        if (
+            iso_result.artifacts or iso_result.errors
+            or el_torito_result.artifacts or el_torito_result.errors
+        ):
+            iso_result.artifacts.extend(el_torito_result.artifacts)
+            iso_result.findings.extend(el_torito_result.findings)
+            iso_result.errors.extend(el_torito_result.errors)
+            iso_result.extracted_bytes += el_torito_result.extracted_bytes
             return iso_result
         tar_result = self.extract_tar(artifact)
         if tar_result.artifacts or tar_result.errors:

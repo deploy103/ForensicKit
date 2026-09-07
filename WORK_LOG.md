@@ -1,5 +1,18 @@
 # ForensicKit Work Log
 
+## 2026-09-07 11:04 KST
+
+### El Torito default boot-load extraction
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/profiles/archive.py`, `src/forensickit/extraction.py`, `tests/test_triage.py`, and `tests/test_engine_pipeline.py`.
+- ISO boot-record descriptors with the exact `EL TORITO SPECIFICATION` identifier now preserve descriptor/catalog-block offsets and identifiers. Each bounded catalog read validates the 32-byte validation entry's header/reserved fields, platform, little-endian 16-word checksum, and `55aa` key, then inventories the default entry's boot indicator, media type, load segment/system type, 512-byte sector count, load RBA, and selection bytes.
+- Only bootable default entries with a byte length determined by a nonzero no-emulation sector count or a standard fixed floppy geometry and a complete declared-volume/evidence range become extraction candidates. Hard-disk emulation remains non-error metadata because its full image length is not declared here. The extractor revalidates both raw catalog entries and copies only the catalog-declared initial boot-load extent under normal recursion/count/byte limits; it does not claim this extent is the complete boot filesystem.
+- A checksum-corrupt fixture proves anomaly reporting and extraction suppression. An AUTO E2E proves ISO -> 512-byte `eltorito_default_x86_no_emulation.img` child -> child-attributed FlagCandidate with boot-record, catalog, validation, initial-entry, and byte-range report provenance. Focused triage/Engine regressions passed: 158 passed, 0 failed. The full direct synthetic suite passed: 319 passed, 0 failed. `python -m compileall -q src tests scripts` and `git diff --check` passed.
+
+### Next
+
+- Parse bounded El Torito section headers/entries so non-default platform boot-load records receive the same checksum, range, extraction, and provenance contract.
+
 ## 2026-09-07 10:56 KST
 
 ### Joliet supplementary-volume traversal and extent aliases

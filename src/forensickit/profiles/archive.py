@@ -360,6 +360,29 @@ class ArchiveProfile(BaseProfile):
                     severity="medium",
                 )
             )
+        el_torito_errors = next(
+            (
+                value for value in context.values("archive.iso9660.el_torito_errors")
+                if isinstance(value, list)
+            ),
+            [],
+        )
+        if el_torito_errors:
+            result.findings.append(
+                self.finding(
+                    context,
+                    title="El Torito boot catalog or image range anomaly",
+                    category="iso9660_el_torito_anomaly",
+                    confidence=0.98,
+                    explanation=(
+                        "A declared boot catalog failed its validation-entry checksum/key or default "
+                        "entry/range checks. The catalog remains raw evidence, and no unbounded or "
+                        "size-indeterminate boot image is materialized."
+                    ),
+                    evidence=[str(item)[:2_000] for item in el_torito_errors[:16]],
+                    severity="medium",
+                )
+            )
         iso_entries = next(
             (
                 value for value in context.values("archive.iso9660.directory_entries")
