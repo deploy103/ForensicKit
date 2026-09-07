@@ -115,6 +115,14 @@ def _rrip_px(mode: int, *, links: int = 1) -> bytes:
     return _susp_entry(b"PX", data)
 
 
+def _rrip_ce(block: int, offset: int, length: int) -> bytes:
+    data = b"".join(
+        value.to_bytes(4, "little") + value.to_bytes(4, "big")
+        for value in (block, offset, length)
+    )
+    return _susp_entry(b"CE", data)
+
+
 def _iso9660_with_root_file(name: bytes, payload: bytes) -> bytes:
     block_size = 2_048
     image = bytearray(23 * block_size)
@@ -150,7 +158,7 @@ def _iso9660_with_root_file(name: bytes, payload: bytes) -> bytes:
 
 def _iso9660_with_nested_file(
     name: bytes, payload: bytes, *, rock_ridge: bool = False,
-    path_tables: bool = False,
+    path_tables: bool = False, rock_ridge_continuation: bool = False,
 ) -> bytes:
     block_size = 2_048
     image = bytearray(24 * block_size)
@@ -227,6 +235,18 @@ def _iso9660_with_nested_file(
     root = root_self + parent + directory
     image[20 * block_size:20 * block_size + len(root)] = root
     if rock_ridge:
+        continuation_area = (
+            _susp_entry(b"NM", b"\x00Evidence.txt") + _susp_entry(b"ST")
+        )
+        file_name_system_use = (
+            _susp_entry(b"NM", b"\x01Flag ")
+            + _rrip_ce(21, 256, len(continuation_area))
+            if rock_ridge_continuation
+            else (
+                _susp_entry(b"NM", b"\x01Flag ")
+                + _susp_entry(b"NM", b"\x00Evidence.txt")
+            )
+        )
         subdirectory = (
             _iso_directory_record(
                 b"\x00", 22, block_size, flags=0x02,
@@ -241,8 +261,7 @@ def _iso9660_with_nested_file(
                 system_use=(
                     skip_prefix
                     + _rrip_px(0o100640)
-                    + _susp_entry(b"NM", b"\x01Flag ")
-                    + _susp_entry(b"NM", b"\x00Evidence.txt")
+                    + file_name_system_use
                     + _susp_entry(b"ST")
                 ),
             )
@@ -257,6 +276,11 @@ def _iso9660_with_nested_file(
                 ),
             )
         )
+        if rock_ridge_continuation:
+            continuation_offset = 21 * block_size + 256
+            image[
+                continuation_offset:continuation_offset + len(continuation_area)
+            ] = continuation_area
     else:
         subdirectory = (
             _iso_directory_record(b"\x00", 22, block_size, flags=0x02)
@@ -698,7 +722,10 @@ def test_iso9660_rock_ridge_name_recurses_while_symlink_stays_metadata_only(
     payload = b"CTF{rock_ridge_recursive_lineage}"
     evidence = tmp_path / "rock-ridge.iso"
     evidence.write_bytes(
-        _iso9660_with_nested_file(b"FLAG000.TXT;1", payload, rock_ridge=True)
+        _iso9660_with_nested_file(
+            b"FLAG000.TXT;1", payload, rock_ridge=True,
+            rock_ridge_continuation=True,
+        )
     )
 
     result = AnalysisEngine().analyze(
@@ -737,6 +764,8 @@ def test_iso9660_rock_ridge_name_recurses_while_symlink_stays_metadata_only(
     )
     assert nested["archive_path"] == "Evidence Directory/Flag Evidence.txt"
     assert nested["rock_ridge_posix"]["permissions"] == "0o0640"
+    assert nested["susp_continuation_areas"][0]["absolute_offset"] == 21 * 2_048 + 256
+    assert nested["susp_resolved_continuation_entries"][0]["name"] == "Evidence.txt"
     assert nested["directory_identity_lineage"][0]["logical_name"] == "Evidence Directory"
     assert symlink["archive_path"] == "Evidence Directory/latest"
     assert symlink["extraction_eligible"] is False
@@ -756,6 +785,8 @@ def test_iso9660_rock_ridge_name_recurses_while_symlink_stays_metadata_only(
     )
     assert "Evidence Directory/Flag Evidence.txt" in report
     assert "rock_ridge_symlink" in report
+    assert "susp_continuation_state" in report
+    assert "susp_resolved_continuation_entries" in report
     assert "CTF{rock_ridge_recursive_lineage}" in report
 
 

@@ -46,6 +46,7 @@ Notable user-facing changes are documented here. This project follows Semantic V
 - El Torito boot records and default catalogs now receive validation checksum/key, media, load-RBA, and byte-range checks; only deterministic ISO-bounded initial boot-load extents can recursively re-enter analysis with raw catalog provenance.
 - El Torito final/chained section headers, platform boot entries, and parent-linked extension criteria are parsed under 8-KiB/64-slot bounds; deterministic section load extents retain validation/header/entry provenance during recursion.
 - Primary ISO Type-L/Type-M path-table copies now receive bounded framing, hash, parent/path, endian-independent comparison, and exact active-directory reconciliation; divergent copies remain non-authoritative anomaly evidence.
+- Rock Ridge `CE` continuation areas now resolve under global byte/count/depth and overlap bounds; continued names retain exact source/hash provenance and are revalidated before extraction, while cycles or partial continuations remain metadata-only.
 
 ## [1.1.0] - 2026-09-04
 
