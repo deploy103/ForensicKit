@@ -441,6 +441,69 @@ class ArchiveProfile(BaseProfile):
                     severity="medium",
                 )
             )
+        joliet_path_tables = next(
+            (
+                value for value in context.values(
+                    "archive.iso9660.joliet_path_tables"
+                )
+                if isinstance(value, list)
+            ),
+            [],
+        )
+        joliet_path_table_comparison = next(
+            (
+                value for value in context.values(
+                    "archive.iso9660.joliet_path_table_comparison"
+                )
+                if isinstance(value, dict)
+            ),
+            {},
+        )
+        joliet_path_table_reconciliation = next(
+            (
+                value for value in context.values(
+                    "archive.iso9660.joliet_path_table_reconciliation"
+                )
+                if isinstance(value, list)
+            ),
+            [],
+        )
+        invalid_joliet_path_tables = [
+            table for table in joliet_path_tables
+            if isinstance(table, dict) and table.get("valid") is not True
+        ]
+        unreconciled_joliet_path_entries = [
+            item for item in joliet_path_table_reconciliation
+            if isinstance(item, dict) and item.get("reconciled") is not True
+        ]
+        if joliet_path_tables and (
+            invalid_joliet_path_tables
+            or joliet_path_table_comparison.get("consistent") is not True
+            or unreconciled_joliet_path_entries
+        ):
+            result.findings.append(
+                self.finding(
+                    context,
+                    title="Joliet path-table copy or directory reconciliation anomaly",
+                    category="iso9660_joliet_path_table_anomaly",
+                    confidence=0.97,
+                    explanation=(
+                        "One or more bounded Joliet path-table copies failed framing, strict "
+                        "UCS-2BE, range, or parent checks; cross-endian copies differ; or an extent/name "
+                        "did not uniquely match the active Joliet directory walk. No divergent copy is "
+                        "selected as authoritative."
+                    ),
+                    evidence=(
+                        [f"comparison={joliet_path_table_comparison}"]
+                        + [str(item)[:2_000] for item in invalid_joliet_path_tables[:8]]
+                        + [
+                            str(item)[:2_000]
+                            for item in unreconciled_joliet_path_entries[:8]
+                        ]
+                    ),
+                    severity="medium",
+                )
+            )
         iso_entries = next(
             (
                 value for value in context.values("archive.iso9660.directory_entries")
