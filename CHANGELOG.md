@@ -47,6 +47,7 @@ Notable user-facing changes are documented here. This project follows Semantic V
 - El Torito final/chained section headers, platform boot entries, and parent-linked extension criteria are parsed under 8-KiB/64-slot bounds; deterministic section load extents retain validation/header/entry provenance during recursion.
 - Primary ISO Type-L/Type-M path-table copies now receive bounded framing, hash, parent/path, endian-independent comparison, and exact active-directory reconciliation; divergent copies remain non-authoritative anomaly evidence.
 - Rock Ridge `CE` continuation areas now resolve under global byte/count/depth and overlap bounds; continued names retain exact source/hash provenance and are revalidated before extraction, while cycles or partial continuations remain metadata-only.
+- Rock Ridge short/long `TF` timestamps now retain raw offsets and normalized UTC, while both-endian `PN` device numbers are reported without ever materializing device nodes.
 
 ## [1.1.0] - 2026-09-04
 

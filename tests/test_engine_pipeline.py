@@ -123,6 +123,18 @@ def _rrip_ce(block: int, offset: int, length: int) -> bytes:
     return _susp_entry(b"CE", data)
 
 
+def _rrip_tf_short(modify: bytes) -> bytes:
+    return _susp_entry(b"TF", b"\x02" + modify)
+
+
+def _rrip_pn(device_high: int, device_low: int) -> bytes:
+    data = b"".join(
+        value.to_bytes(4, "little") + value.to_bytes(4, "big")
+        for value in (device_high, device_low)
+    )
+    return _susp_entry(b"PN", data)
+
+
 def _iso9660_with_root_file(name: bytes, payload: bytes) -> bytes:
     block_size = 2_048
     image = bytearray(23 * block_size)
@@ -261,6 +273,7 @@ def _iso9660_with_nested_file(
                 system_use=(
                     skip_prefix
                     + _rrip_px(0o100640)
+                    + _rrip_tf_short(bytes((124, 2, 3, 4, 5, 6, 4)))
                     + file_name_system_use
                     + _susp_entry(b"ST")
                 ),
@@ -270,6 +283,7 @@ def _iso9660_with_nested_file(
                 system_use=(
                     skip_prefix
                     + _rrip_px(0o120777)
+                    + _rrip_pn(8, 1)
                     + _susp_entry(b"NM", b"\x00latest")
                     + _susp_entry(b"SL", b"\x00\x04\x00\x00\x06secret")
                     + _susp_entry(b"ST")
@@ -764,11 +778,16 @@ def test_iso9660_rock_ridge_name_recurses_while_symlink_stays_metadata_only(
     )
     assert nested["archive_path"] == "Evidence Directory/Flag Evidence.txt"
     assert nested["rock_ridge_posix"]["permissions"] == "0o0640"
+    assert nested["rock_ridge_timestamps"][0]["value"]["utc"] == (
+        "2024-02-03T03:05:06+00:00"
+    )
     assert nested["susp_continuation_areas"][0]["absolute_offset"] == 21 * 2_048 + 256
     assert nested["susp_resolved_continuation_entries"][0]["name"] == "Evidence.txt"
     assert nested["directory_identity_lineage"][0]["logical_name"] == "Evidence Directory"
     assert symlink["archive_path"] == "Evidence Directory/latest"
     assert symlink["extraction_eligible"] is False
+    assert symlink["rock_ridge_devices"][0]["device_high"] == 8
+    assert symlink["rock_ridge_devices"][0]["device_low"] == 1
     recovery = next(
         item for item in result.findings
         if item.source == "builtin_iso9660_extractor"
@@ -787,6 +806,8 @@ def test_iso9660_rock_ridge_name_recurses_while_symlink_stays_metadata_only(
     assert "rock_ridge_symlink" in report
     assert "susp_continuation_state" in report
     assert "susp_resolved_continuation_entries" in report
+    assert "rock_ridge_timestamps" in report
+    assert "rock_ridge_devices" in report
     assert "CTF{rock_ridge_recursive_lineage}" in report
 
 

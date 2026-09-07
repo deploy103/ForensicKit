@@ -492,6 +492,26 @@ class ArchiveProfile(BaseProfile):
                     severity="info",
                 )
             )
+        rock_ridge_device_entries = [
+            item for item in iso_entries
+            if isinstance(item, dict) and item.get("rock_ridge_devices")
+        ]
+        if rock_ridge_device_entries:
+            result.findings.append(
+                self.finding(
+                    context,
+                    title="Rock Ridge device-number metadata retained without materialization",
+                    category="archive_device_metadata",
+                    confidence=0.99,
+                    explanation=(
+                        "RRIP PN metadata supplies both-endian device-number components. They are "
+                        "preserved only as archive evidence; the native extractor never creates a "
+                        "device node."
+                    ),
+                    evidence=[str(item)[:2_000] for item in rock_ridge_device_entries[:16]],
+                    severity="info",
+                )
+            )
         unsupported_iso_entries = [
             item for item in iso_entries
             if isinstance(item, dict)

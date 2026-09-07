@@ -1,10 +1,10 @@
 # ForensicKit Work Queue
 
-Last reviewed: 2026-09-07 11:26 KST
+Last reviewed: 2026-09-07 11:35 KST
 
 ## Post-v1.1 backlog
 
-- [ ] Parse Rock Ridge `TF` timestamps and `PN` device metadata with both-endian validation.
+- [ ] Validate Rock Ridge `CL`/`PL`/`RE` relocated-directory references without unsafe inferred traversal.
 
 ## v1.1.0 release gate
 
@@ -17,6 +17,7 @@ Last reviewed: 2026-09-07 11:26 KST
 
 ## Completed this session
 
+- [x] Rock Ridge `TF` short/long timestamp and `PN` both-endian device metadata parsing.
 - [x] Bounded Rock Ridge `CE` continuation-area resolution with range/cycle/overlap/hash provenance.
 - [x] Bounded primary ISO little-/big-endian path-table parsing, copy comparison, and directory reconciliation.
 - [x] Bounded El Torito section header/entry/extension parsing and platform boot-load extraction.

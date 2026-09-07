@@ -1,5 +1,18 @@
 # ForensicKit Work Log
 
+## 2026-09-07 11:35 KST
+
+### Rock Ridge TF timestamps and PN device metadata
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/profiles/archive.py`, `tests/test_triage.py`, and `tests/test_engine_pipeline.py`.
+- RRIP `TF` entries now validate flag-driven field counts for both seven-byte short and 17-byte long forms. Creation/modify/access/attributes/backup/expiration/effective values retain exact raw bytes, form, source absolute offset, signed 15-minute GMT offset, validity, and normalized UTC including centiseconds; invalid calendar/digit/offset/length data enters the existing SUSP anomaly path.
+- RRIP `PN` entries validate their high/low device-number components from both byte orders and retain exact source provenance. Parsed device metadata is report-only and produces a dedicated informational finding; no device node is ever created. Duplicate timestamp types or PN entries remain explicit anomalies rather than being silently overwritten.
+- Synthetic coverage asserts a short modification time with positive GMT adjustment, a long timestamp with centiseconds and negative adjustment, valid PN metadata, and a PN endian mismatch. The Rock Ridge AUTO E2E confirms timestamp/device values survive CE-assisted naming, extraction evidence, recursive flag analysis, and JSON reporting. Focused triage/Engine regressions passed: 163 passed, 0 failed. The full direct synthetic suite passed: 324 passed, 0 failed. `python -m compileall -q src tests scripts` and `git diff --check` passed.
+
+### Next
+
+- Validate RRIP `CL`/`PL`/`RE` relocation roles and referenced directory extents, preserving them as metadata until an unambiguous active-directory relationship can be proven without cycles.
+
 ## 2026-09-07 11:26 KST
 
 ### Rock Ridge SUSP continuation areas
