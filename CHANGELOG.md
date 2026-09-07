@@ -44,6 +44,7 @@ Notable user-facing changes are documented here. This project follows Semantic V
 - Valid root-self SUSP markers now enable bounded inline Rock Ridge parsing: safe continuation-aware `NM` names and `PX` POSIX metadata enrich ISO lineage, while malformed/unsafe metadata, `SL` symlinks, and POSIX special files remain raw evidence and cannot be materialized.
 - Joliet level 1-3 supplementary descriptors and bounded UCS-2BE directory trees are validated independently; exact unique primary/Joliet file extents provide alternate path provenance without duplicate child extraction.
 - El Torito boot records and default catalogs now receive validation checksum/key, media, load-RBA, and byte-range checks; only deterministic ISO-bounded initial boot-load extents can recursively re-enter analysis with raw catalog provenance.
+- El Torito final/chained section headers, platform boot entries, and parent-linked extension criteria are parsed under 8-KiB/64-slot bounds; deterministic section load extents retain validation/header/entry provenance during recursion.
 
 ## [1.1.0] - 2026-09-04
 

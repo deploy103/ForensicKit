@@ -315,7 +315,9 @@ def _iso9660_with_joliet_alias() -> tuple[bytes, bytes]:
     return bytes(image), payload
 
 
-def _iso9660_with_el_torito(*, corrupt_checksum: bool = False) -> tuple[bytes, bytes]:
+def _iso9660_with_el_torito(
+    *, corrupt_checksum: bool = False, with_section: bool = False,
+) -> tuple[bytes, bytes]:
     block_size = 2_048
     image = bytearray(24 * block_size)
     boot_record_offset = 16 * block_size
@@ -369,6 +371,25 @@ def _iso9660_with_el_torito(*, corrupt_checksum: bool = False) -> tuple[bytes, b
     initial[6:8] = (1).to_bytes(2, "little")
     initial[8:12] = (22).to_bytes(4, "little")
     image[21 * block_size:21 * block_size + 64] = validation + initial
+    if with_section:
+        section_header = bytearray(32)
+        section_header[0] = 0x91
+        section_header[1] = 0xEF
+        section_header[2:4] = (2).to_bytes(2, "little")
+        section_header[4:32] = b"FORENSICKIT EFI".ljust(28, b" ")
+        section_entry = bytearray(32)
+        section_entry[0] = 0x88
+        section_entry[6:8] = (1).to_bytes(2, "little")
+        section_entry[8:12] = (23).to_bytes(4, "little")
+        extension_entry = bytearray(32)
+        extension_entry[0] = 0x44
+        extension_entry[2:32] = b"EFI selection metadata".ljust(30, b"\x00")
+        catalog_section_offset = 21 * block_size + 64
+        image[catalog_section_offset:catalog_section_offset + 96] = (
+            section_header + section_entry + extension_entry
+        )
+        section_payload = b"CTF{el_torito_efi_section}".ljust(512, b"\x00")
+        image[23 * block_size:23 * block_size + len(section_payload)] = section_payload
     payload = b"CTF{el_torito_boot_image}".ljust(512, b"\x00")
     image[22 * block_size:22 * block_size + len(payload)] = payload
     return bytes(image), payload
@@ -1930,6 +1951,54 @@ def test_iso9660_el_torito_catalog_validates_declared_boot_image_range(
         item.category == "iso9660_el_torito_anomaly"
         for item in corrupt_profile.findings
     )
+
+
+def test_iso9660_el_torito_section_entry_and_extension_are_bounded(
+    tmp_path: Path,
+) -> None:
+    block_size = 2_048
+    image, _ = _iso9660_with_el_torito(with_section=True)
+    evidence = tmp_path / "sectioned-boot.iso"
+    evidence.write_bytes(image)
+    artifact = _artifact(evidence)
+    observations = GenericTriageEngine().analyze(artifact, evidence)
+    values = _values(observations)
+
+    catalog = values["archive.iso9660.el_torito_catalogs"][0]
+    assert catalog["valid"] is True
+    assert catalog["final_section_header_found"] is True
+    assert catalog["section_parse_error"] is None
+    assert catalog["section_entry_limit"] == 64
+    assert catalog["section_entry_limit_reached"] is False
+    header = catalog["section_headers"][0]
+    assert header["offset"] == 21 * block_size + 64
+    assert header["indicator_raw"] == "0x91"
+    assert header["final"] is True
+    assert header["platform"] == "efi"
+    assert header["entry_count"] == 2
+    assert header["identifier"] == "FORENSICKIT EFI"
+    section_entry = catalog["section_entries"][0]
+    assert section_entry["offset"] == 21 * block_size + 96
+    assert section_entry["section_index"] == 0
+    assert section_entry["section_entry_index"] == 0
+    assert section_entry["platform"] == "efi"
+    assert section_entry["bootable"] is True
+    assert section_entry["data_offset"] == 23 * block_size
+    assert section_entry["data_length"] == 512
+    assert section_entry["extraction_eligible"] is True
+    extension = catalog["extension_entries"][0]
+    assert extension["offset"] == 21 * block_size + 128
+    assert extension["indicator_raw"] == "0x44"
+    assert extension["more_extensions"] is False
+    assert extension["parent_section_entry_offset"] == section_entry["offset"]
+    assert extension["valid"] is True
+    boot_images = values["archive.iso9660.el_torito_boot_images"]
+    assert [item["logical_name"] for item in boot_images] == [
+        "eltorito_default_x86_no_emulation.img",
+        "eltorito_section_00_entry_00_efi_no_emulation.img",
+    ]
+    assert boot_images[1]["section_header"] == header
+    assert values["archive.iso9660.el_torito_errors"] == []
 
 
 def test_ntfs_mft_zero_fixed_header_is_observed_at_boot_geometry_offset(tmp_path: Path) -> None:
