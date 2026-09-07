@@ -1023,6 +1023,7 @@ class GenericTriageEngine:
         descriptor_terminator_found = False
         pvd: dict[str, object] | None = None
         joliet_descriptors: list[dict[str, object]] = []
+        el_torito_boot_records: list[dict[str, object]] = []
 
         try:
             with path.open("rb") as stream:
@@ -1058,6 +1059,24 @@ class GenericTriageEngine:
                     if not signature_valid or not version_valid:
                         descriptor_error = f"invalid ISO volume descriptor header at offset {offset}"
                         break
+                    if descriptor_type == 0:
+                        boot_system_identifier = raw[7:39].decode(
+                            "ascii", errors="replace"
+                        ).rstrip(" \x00")
+                        if boot_system_identifier == "EL TORITO SPECIFICATION":
+                            catalog_block = int.from_bytes(raw[71:75], "little")
+                            el_torito_boot_records.append({
+                                "descriptor_offset": offset,
+                                "descriptor_block": 16 + descriptor_index,
+                                "boot_system_identifier": boot_system_identifier,
+                                "boot_identifier": raw[39:71].decode(
+                                    "ascii", errors="replace"
+                                ).rstrip(" \x00"),
+                                "catalog_block": catalog_block,
+                                "catalog_block_field_offset": offset + 71,
+                                "catalog_block_field_raw_hex": raw[71:75].hex(),
+                                "valid": catalog_block > 0,
+                            })
                     if descriptor_type == 1 and pvd is None:
                         volume_space_le = int.from_bytes(raw[80:84], "little")
                         volume_space_be = int.from_bytes(raw[84:88], "big")
@@ -1221,6 +1240,21 @@ class GenericTriageEngine:
 
         if pvd is None and descriptor_error is None:
             descriptor_error = "ISO descriptor sequence has no primary volume descriptor"
+
+        el_torito_catalogs: list[dict[str, object]] = []
+        el_torito_errors: list[dict[str, object]] = []
+        el_torito_boot_images: list[dict[str, object]] = []
+        if pvd is not None and pvd.get("valid") is True:
+            (
+                el_torito_catalogs,
+                el_torito_errors,
+                el_torito_boot_images,
+            ) = self._iso9660_el_torito_catalogs(
+                path,
+                evidence_size=size,
+                pvd=pvd,
+                boot_records=el_torito_boot_records,
+            )
 
         root_entries: list[dict[str, object]] = []
         root_error: str | None = None
@@ -1731,6 +1765,11 @@ class GenericTriageEngine:
             self._observation(artifact, "archive.iso9660.joliet_directory_scan_bytes", joliet_walk.get("bytes_read", 0)),
             self._observation(artifact, "archive.iso9660.joliet_extent_aliases", joliet_aliases),
             self._observation(artifact, "archive.iso9660.joliet_reconciliation_errors", joliet_reconciliation_errors),
+            self._observation(artifact, "archive.iso9660.el_torito_detected", bool(el_torito_boot_records)),
+            self._observation(artifact, "archive.iso9660.el_torito_boot_records", el_torito_boot_records),
+            self._observation(artifact, "archive.iso9660.el_torito_catalogs", el_torito_catalogs),
+            self._observation(artifact, "archive.iso9660.el_torito_errors", el_torito_errors),
+            self._observation(artifact, "archive.iso9660.el_torito_boot_images", el_torito_boot_images),
             self._observation(artifact, "archive.container_kind", "iso9660"),
         ]
 
@@ -1795,6 +1834,173 @@ class GenericTriageEngine:
                 first_error = record_error
             cursor += record_length
         return entries, first_error, entry_limit_reached
+
+    @staticmethod
+    def _iso9660_el_torito_catalogs(
+        path: Path,
+        *,
+        evidence_size: int,
+        pvd: dict[str, object],
+        boot_records: list[dict[str, object]],
+    ) -> tuple[
+        list[dict[str, object]], list[dict[str, object]], list[dict[str, object]],
+    ]:
+        """Validate El Torito validation/default entries without inferring image size."""
+        catalogs: list[dict[str, object]] = []
+        errors: list[dict[str, object]] = []
+        boot_images: list[dict[str, object]] = []
+        block_size = pvd.get("logical_block_size")
+        declared_volume_bytes = pvd.get("declared_volume_bytes")
+        if not isinstance(block_size, int) or not isinstance(declared_volume_bytes, int):
+            return catalogs, errors, boot_images
+        platform_names = {0x00: "x86", 0x01: "powerpc", 0x02: "mac", 0xEF: "efi"}
+        media_names = {
+            0: "no_emulation", 1: "floppy_1_2m", 2: "floppy_1_44m",
+            3: "floppy_2_88m", 4: "hard_disk",
+        }
+        media_lengths = {1: 1_200 * 1_024, 2: 1_440 * 1_024, 3: 2_880 * 1_024}
+        for boot_record in boot_records[:8]:
+            catalog_block = boot_record.get("catalog_block")
+            if not isinstance(catalog_block, int) or catalog_block <= 0:
+                errors.append({"reason": "invalid_catalog_block", "boot_record": boot_record})
+                continue
+            catalog_offset = catalog_block * block_size
+            if (
+                catalog_offset < 0
+                or catalog_offset + 64 > evidence_size
+                or catalog_offset + 64 > declared_volume_bytes
+            ):
+                errors.append({
+                    "reason": "catalog_out_of_bounds", "boot_record": boot_record,
+                    "catalog_offset": catalog_offset,
+                })
+                continue
+            try:
+                with path.open("rb") as stream:
+                    stream.seek(catalog_offset)
+                    raw = stream.read(64)
+            except OSError as exc:
+                errors.append({
+                    "reason": "catalog_read_error", "boot_record": boot_record,
+                    "error": str(exc)[:2_000],
+                })
+                continue
+            if len(raw) != 64:
+                errors.append({
+                    "reason": "catalog_truncated_read", "boot_record": boot_record,
+                    "received_bytes": len(raw),
+                })
+                continue
+            validation = raw[:32]
+            validation_checksum = sum(
+                int.from_bytes(validation[index:index + 2], "little")
+                for index in range(0, 32, 2)
+            ) & 0xFFFF
+            validation_entry = {
+                "offset": catalog_offset,
+                "raw_hex": validation.hex(),
+                "header_id": validation[0],
+                "platform_id": validation[1],
+                "platform": platform_names.get(validation[1], f"unknown_0x{validation[1]:02x}"),
+                "reserved_raw_hex": validation[2:4].hex(),
+                "identifier": validation[4:28].decode(
+                    "ascii", errors="replace"
+                ).rstrip(" \x00"),
+                "checksum_field": int.from_bytes(validation[28:30], "little"),
+                "checksum_sum_16bit": validation_checksum,
+                "checksum_valid": validation_checksum == 0,
+                "key_bytes_raw_hex": validation[30:32].hex(),
+                "key_bytes_valid": validation[30:32] == b"\x55\xaa",
+            }
+            validation_entry["valid"] = bool(
+                validation_entry["header_id"] == 1
+                and validation_entry["reserved_raw_hex"] == "0000"
+                and validation_entry["checksum_valid"]
+                and validation_entry["key_bytes_valid"]
+            )
+            initial = raw[32:64]
+            boot_indicator = initial[0]
+            media_type = initial[1]
+            sector_count = int.from_bytes(initial[6:8], "little")
+            load_block = int.from_bytes(initial[8:12], "little")
+            data_offset = load_block * block_size
+            if media_type == 0:
+                data_length = sector_count * 512 if sector_count > 0 else None
+                length_source = "catalog_sector_count_512_bytes"
+            elif media_type in media_lengths:
+                data_length = media_lengths[media_type]
+                length_source = "el_torito_fixed_floppy_geometry"
+            else:
+                data_length = None
+                length_source = "not_determinable"
+            within_bounds = bool(
+                isinstance(data_length, int)
+                and data_length > 0
+                and data_offset >= 0
+                and data_offset + data_length <= evidence_size
+                and data_offset + data_length <= declared_volume_bytes
+            )
+            range_invalid = isinstance(data_length, int) and not within_bounds
+            missing_no_emulation_size = media_type == 0 and sector_count == 0
+            initial_entry = {
+                "offset": catalog_offset + 32,
+                "raw_hex": initial.hex(),
+                "boot_indicator_raw": f"0x{boot_indicator:02x}",
+                "bootable": boot_indicator == 0x88,
+                "boot_indicator_valid": boot_indicator in {0x00, 0x88},
+                "media_type": media_type,
+                "media": media_names.get(media_type, f"unknown_{media_type}"),
+                "media_type_valid": media_type in media_names,
+                "load_segment": int.from_bytes(initial[2:4], "little"),
+                "system_type": initial[4],
+                "reserved_byte": initial[5],
+                "sector_count": sector_count,
+                "load_block": load_block,
+                "data_offset": data_offset,
+                "data_length": data_length,
+                "data_length_source": length_source,
+                "data_length_determinable": isinstance(data_length, int),
+                "data_within_evidence_and_volume": within_bounds,
+                "selection_criteria_raw_hex": initial[12:32].hex(),
+            }
+            initial_entry["valid"] = bool(
+                initial_entry["boot_indicator_valid"]
+                and initial_entry["media_type_valid"]
+                and initial_entry["reserved_byte"] == 0
+                and load_block > 0
+            )
+            initial_entry["extraction_eligible"] = bool(
+                validation_entry["valid"]
+                and initial_entry["valid"]
+                and initial_entry["bootable"]
+                and within_bounds
+            )
+            catalog = {
+                "boot_record": boot_record,
+                "catalog_offset": catalog_offset,
+                "bytes_read": len(raw),
+                "validation_entry": validation_entry,
+                "initial_entry": initial_entry,
+                "valid": validation_entry["valid"] and initial_entry["valid"],
+            }
+            catalogs.append(catalog)
+            if (
+                not catalog["valid"]
+                or (initial_entry["bootable"] and range_invalid)
+                or (initial_entry["bootable"] and missing_no_emulation_size)
+            ):
+                errors.append({"reason": "invalid_catalog_or_boot_range", "catalog": catalog})
+            if initial_entry["extraction_eligible"]:
+                platform = str(validation_entry["platform"])
+                media = str(initial_entry["media"])
+                boot_images.append({
+                    **initial_entry,
+                    "logical_name": f"eltorito_default_{platform}_{media}.img",
+                    "catalog_offset": catalog_offset,
+                    "catalog_validation_entry": validation_entry,
+                    "boot_record": boot_record,
+                })
+        return catalogs, errors, boot_images
 
     def _iso9660_walk_namespace(
         self,

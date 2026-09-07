@@ -315,6 +315,65 @@ def _iso9660_with_joliet_alias() -> tuple[bytes, bytes]:
     return bytes(image), payload
 
 
+def _iso9660_with_el_torito(*, corrupt_checksum: bool = False) -> tuple[bytes, bytes]:
+    block_size = 2_048
+    image = bytearray(24 * block_size)
+    boot_record_offset = 16 * block_size
+    image[boot_record_offset] = 0
+    image[boot_record_offset + 1:boot_record_offset + 6] = b"CD001"
+    image[boot_record_offset + 6] = 1
+    image[boot_record_offset + 7:boot_record_offset + 39] = (
+        b"EL TORITO SPECIFICATION".ljust(32, b" ")
+    )
+    image[boot_record_offset + 39:boot_record_offset + 71] = b"FORENSICKIT BOOT".ljust(32, b" ")
+    image[boot_record_offset + 71:boot_record_offset + 75] = (21).to_bytes(4, "little")
+
+    pvd_offset = 17 * block_size
+    pvd = memoryview(image)[pvd_offset:pvd_offset + block_size]
+    pvd[0] = 1
+    pvd[1:6] = b"CD001"
+    pvd[6] = 1
+    pvd[8:40] = b"FORENSICKIT".ljust(32, b" ")
+    pvd[40:72] = b"BOOT_ISO".ljust(32, b" ")
+    pvd[80:88] = _iso_both32(24)
+    pvd[120:124] = _iso_both16(1)
+    pvd[124:128] = _iso_both16(1)
+    pvd[128:132] = _iso_both16(block_size)
+    pvd[132:140] = _iso_both32(0)
+    root_record = _iso_directory_record(b"\x00", 20, block_size, flags=0x02)
+    pvd[156:156 + len(root_record)] = root_record
+    terminator = 18 * block_size
+    image[terminator] = 255
+    image[terminator + 1:terminator + 6] = b"CD001"
+    image[terminator + 6] = 1
+    root = root_record + _iso_directory_record(
+        b"\x01", 20, block_size, flags=0x02,
+    )
+    image[20 * block_size:20 * block_size + len(root)] = root
+
+    validation = bytearray(32)
+    validation[0] = 1
+    validation[1] = 0
+    validation[4:28] = b"FORENSICKIT EL TORITO".ljust(24, b" ")
+    validation[30:32] = b"\x55\xaa"
+    checksum = -sum(
+        int.from_bytes(validation[index:index + 2], "little")
+        for index in range(0, 32, 2)
+    ) & 0xFFFF
+    validation[28:30] = checksum.to_bytes(2, "little")
+    if corrupt_checksum:
+        validation[28] ^= 1
+    initial = bytearray(32)
+    initial[0] = 0x88
+    initial[1] = 0
+    initial[6:8] = (1).to_bytes(2, "little")
+    initial[8:12] = (22).to_bytes(4, "little")
+    image[21 * block_size:21 * block_size + 64] = validation + initial
+    payload = b"CTF{el_torito_boot_image}".ljust(512, b"\x00")
+    image[22 * block_size:22 * block_size + len(payload)] = payload
+    return bytes(image), payload
+
+
 def _iso9660_with_subdirectory(*, shared_extent: bool = False) -> tuple[bytes, bytes]:
     block_size = 2_048
     image = bytearray(25 * block_size)
@@ -1813,6 +1872,63 @@ def test_iso9660_joliet_tree_reconciles_ucs2_path_to_primary_extent(
     assert not any(
         item.category == "iso9660_joliet_anomaly"
         for item in profile.findings
+    )
+
+
+def test_iso9660_el_torito_catalog_validates_declared_boot_image_range(
+    tmp_path: Path,
+) -> None:
+    block_size = 2_048
+    image, payload = _iso9660_with_el_torito()
+    evidence = tmp_path / "bootable.iso"
+    evidence.write_bytes(image)
+    artifact = _artifact(evidence)
+
+    observations = GenericTriageEngine().analyze(artifact, evidence)
+    values = _values(observations)
+    assert values["archive.iso9660.el_torito_detected"] is True
+    boot_record = values["archive.iso9660.el_torito_boot_records"][0]
+    assert boot_record["descriptor_offset"] == 16 * block_size
+    assert boot_record["catalog_block"] == 21
+    assert boot_record["catalog_block_field_offset"] == 16 * block_size + 71
+    catalog = values["archive.iso9660.el_torito_catalogs"][0]
+    assert catalog["catalog_offset"] == 21 * block_size
+    assert catalog["valid"] is True
+    validation = catalog["validation_entry"]
+    assert validation["offset"] == 21 * block_size
+    assert validation["platform"] == "x86"
+    assert validation["checksum_sum_16bit"] == 0
+    assert validation["checksum_valid"] is True
+    assert validation["key_bytes_valid"] is True
+    initial = catalog["initial_entry"]
+    assert initial["offset"] == 21 * block_size + 32
+    assert initial["bootable"] is True
+    assert initial["media"] == "no_emulation"
+    assert initial["sector_count"] == 1
+    assert initial["load_block"] == 22
+    assert initial["data_offset"] == 22 * block_size
+    assert initial["data_length"] == len(payload)
+    assert initial["data_length_source"] == "catalog_sector_count_512_bytes"
+    assert initial["extraction_eligible"] is True
+    boot_image = values["archive.iso9660.el_torito_boot_images"][0]
+    assert boot_image["logical_name"] == "eltorito_default_x86_no_emulation.img"
+    assert boot_image["raw_hex"] == initial["raw_hex"]
+    assert values["archive.iso9660.el_torito_errors"] == []
+
+    corrupt_image, _ = _iso9660_with_el_torito(corrupt_checksum=True)
+    corrupt_path = tmp_path / "corrupt-boot-catalog.iso"
+    corrupt_path.write_bytes(corrupt_image)
+    corrupt_artifact = _artifact(corrupt_path)
+    corrupt_observations = GenericTriageEngine().analyze(corrupt_artifact, corrupt_path)
+    corrupt_values = _values(corrupt_observations)
+    assert corrupt_values["archive.iso9660.el_torito_boot_images"] == []
+    assert corrupt_values["archive.iso9660.el_torito_errors"][0]["reason"] == (
+        "invalid_catalog_or_boot_range"
+    )
+    corrupt_profile = ProfileEngine().evaluate(corrupt_artifact, corrupt_observations)
+    assert any(
+        item.category == "iso9660_el_torito_anomaly"
+        for item in corrupt_profile.findings
     )
 
 
