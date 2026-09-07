@@ -1,5 +1,18 @@
 # ForensicKit Work Log
 
+## 2026-09-07 10:28 KST
+
+### ISO 9660 active subdirectory traversal
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/profiles/archive.py`, `src/forensickit/extraction.py`, `tests/test_triage.py`, and `tests/test_engine_pipeline.py`.
+- Reused one block-boundary-aware directory-record walker for the primary root and bounded active subdirectories. The breadth-first walk reads the root plus at most 32 unique directory extents and at most 8 MiB/4,096 total entries, skips block padding deterministically, and records exact scan/count limits, parse failures, truncated reads, and per-directory `.`/`..` extent consistency.
+- Every nested entry retains its containing-directory identity, ordered directory lineage, component-safe archive path, source directory-record offset, and exact extent range. Ancestor cycles, sibling/shared extents, multi-extent/interleaved directories, and saturated branches are explicitly rejected and produce a dedicated `iso9660_directory_traversal_anomaly` finding instead of inferred recursion.
+- The built-in extractor now consumes the bounded regular-file inventory across active directories, revalidates each raw source record, and registers nested children under their ISO archive path while preserving directory lineage in extraction evidence. Synthetic triage fixtures cover exact nested offsets, dot/dotdot validation, and shared-extent rejection; an AUTO E2E proves ISO -> `SUBDIR/DEEP.TXT` -> child-attributed FlagCandidate/report lineage. Focused triage/Engine regressions passed: 152 passed, 0 failed. The full direct synthetic suite passed: 313 passed, 0 failed. `python -m compileall -q src tests scripts` and `git diff --check` passed.
+
+### Next
+
+- Parse bounded Rock Ridge SUSP/RRIP alternate names and POSIX metadata while retaining raw system-use provenance and never materializing symlinks.
+
 ## 2026-09-07 10:15 KST
 
 ### ISO 9660 primary-volume/root extraction

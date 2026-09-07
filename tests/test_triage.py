@@ -141,6 +141,46 @@ def _iso_directory_record(
     return bytes(record)
 
 
+def _iso9660_with_subdirectory(*, shared_extent: bool = False) -> tuple[bytes, bytes]:
+    block_size = 2_048
+    image = bytearray(25 * block_size)
+    pvd_offset = 16 * block_size
+    pvd = memoryview(image)[pvd_offset:pvd_offset + block_size]
+    pvd[0] = 1
+    pvd[1:6] = b"CD001"
+    pvd[6] = 1
+    pvd[8:40] = b"FORENSICKIT".ljust(32, b" ")
+    pvd[40:72] = b"NESTED_ISO".ljust(32, b" ")
+    pvd[80:88] = _iso_both32(25)
+    pvd[120:124] = _iso_both16(1)
+    pvd[124:128] = _iso_both16(1)
+    pvd[128:132] = _iso_both16(block_size)
+    pvd[132:140] = _iso_both32(0)
+    root_record = _iso_directory_record(b"\x00", 20, block_size, flags=0x02)
+    pvd[156:156 + len(root_record)] = root_record
+    terminator = 17 * block_size
+    image[terminator] = 255
+    image[terminator + 1:terminator + 6] = b"CD001"
+    image[terminator + 6] = 1
+
+    root = bytearray(root_record)
+    root.extend(_iso_directory_record(b"\x01", 20, block_size, flags=0x02))
+    root.extend(_iso_directory_record(b"SUBDIR", 22, block_size, flags=0x02))
+    if shared_extent:
+        root.extend(_iso_directory_record(b"ALIAS", 22, block_size, flags=0x02))
+    image[20 * block_size:20 * block_size + len(root)] = root
+
+    payload = b"CTF{iso9660_nested_file}"
+    subdirectory = (
+        _iso_directory_record(b"\x00", 22, block_size, flags=0x02)
+        + _iso_directory_record(b"\x01", 20, block_size, flags=0x02)
+        + _iso_directory_record(b"DEEP.TXT;1", 23, len(payload))
+    )
+    image[22 * block_size:22 * block_size + len(subdirectory)] = subdirectory
+    image[23 * block_size:23 * block_size + len(payload)] = payload
+    return bytes(image), payload
+
+
 def test_png_appended_zip_is_observed_and_classified(tmp_path: Path) -> None:
     zip_path = tmp_path / "payload.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
@@ -1358,6 +1398,73 @@ def test_iso9660_primary_volume_and_root_records_preserve_both_endian_extents(tm
     assert any(
         item.category == "archive_structure_anomaly"
         for item in malformed_profile.findings
+    )
+
+
+def test_iso9660_subdirectory_traversal_preserves_paths_and_rejects_shared_extents(
+    tmp_path: Path,
+) -> None:
+    block_size = 2_048
+    image, payload = _iso9660_with_subdirectory()
+    evidence = tmp_path / "nested.iso"
+    evidence.write_bytes(image)
+    artifact = _artifact(evidence)
+
+    observations = GenericTriageEngine().analyze(artifact, evidence)
+    values = _values(observations)
+    entries = values["archive.iso9660.directory_entries"]
+    subdirectory = next(item for item in entries if item.get("archive_path") == "SUBDIR")
+    nested = next(item for item in entries if item.get("archive_path") == "SUBDIR/DEEP.TXT")
+
+    assert subdirectory["record_offset"] == 20 * block_size + 68
+    assert subdirectory["directory_traversal"] == "parsed"
+    assert nested["record_offset"] == 22 * block_size + 68
+    assert nested["directory_relative_offset"] == 68
+    assert nested["file_identifier"] == "DEEP.TXT;1"
+    assert nested["logical_name"] == "DEEP.TXT"
+    assert nested["archive_path"] == "SUBDIR/DEEP.TXT"
+    assert nested["data_offset"] == 23 * block_size
+    assert nested["data_length"] == len(payload)
+    containing_identity = nested["containing_directory_identity"]
+    assert containing_identity == {
+        "logical_name": "SUBDIR",
+        "file_identifier": "SUBDIR",
+        "directory_record_offset": 20 * block_size + 68,
+        "extent_block": 22,
+        "data_offset": 22 * block_size,
+        "data_length": block_size,
+    }
+    assert nested["directory_identity_lineage"] == [containing_identity]
+    assert values["archive.iso9660.regular_files"] == [nested]
+    assert values["archive.iso9660.regular_file_count"] == 1
+    assert values["archive.iso9660.subdirectory_count"] == 1
+    assert values["archive.iso9660.directory_scan_bytes"] == 2 * block_size
+    assert values["archive.iso9660.directory_traversal_truncated"] is False
+    assert values["archive.iso9660.directory_traversal_errors"] == []
+    inventory = values["archive.iso9660.subdirectory_inventory"][0]
+    assert inventory["source_entry_offset"] == subdirectory["record_offset"]
+    assert inventory["dot_entry_matches_self"] is True
+    assert inventory["dotdot_entry_matches_parent"] is True
+    assert inventory["parse_error"] is None
+
+    shared_image, _ = _iso9660_with_subdirectory(shared_extent=True)
+    shared_path = tmp_path / "shared-directory-extent.iso"
+    shared_path.write_bytes(shared_image)
+    shared_artifact = _artifact(shared_path)
+    shared_observations = GenericTriageEngine().analyze(shared_artifact, shared_path)
+    shared_values = _values(shared_observations)
+    alias = next(
+        item for item in shared_values["archive.iso9660.directory_entries"]
+        if item.get("archive_path") == "ALIAS"
+    )
+    assert alias["directory_traversal"] == "shared_extent"
+    traversal_errors = shared_values["archive.iso9660.directory_traversal_errors"]
+    assert any(item.get("reason") == "shared_extent" for item in traversal_errors)
+    shared_profile = ProfileEngine().evaluate(shared_artifact, shared_observations)
+    assert any(
+        item.category == "iso9660_directory_traversal_anomaly"
+        and "shared_extent" in " ".join(item.supporting_evidence)
+        for item in shared_profile.findings
     )
 
 

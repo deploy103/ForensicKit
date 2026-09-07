@@ -120,6 +120,45 @@ def _iso9660_with_root_file(name: bytes, payload: bytes) -> bytes:
     return bytes(image)
 
 
+def _iso9660_with_nested_file(name: bytes, payload: bytes) -> bytes:
+    block_size = 2_048
+    image = bytearray(24 * block_size)
+    pvd_offset = 16 * block_size
+    image[pvd_offset] = 1
+    image[pvd_offset + 1:pvd_offset + 6] = b"CD001"
+    image[pvd_offset + 6] = 1
+    image[pvd_offset + 8:pvd_offset + 40] = b"FORENSICKIT".ljust(32, b" ")
+    image[pvd_offset + 40:pvd_offset + 72] = b"NESTED_ISO".ljust(32, b" ")
+    image[pvd_offset + 80:pvd_offset + 84] = (24).to_bytes(4, "little")
+    image[pvd_offset + 84:pvd_offset + 88] = (24).to_bytes(4, "big")
+    image[pvd_offset + 120:pvd_offset + 122] = (1).to_bytes(2, "little")
+    image[pvd_offset + 122:pvd_offset + 124] = (1).to_bytes(2, "big")
+    image[pvd_offset + 124:pvd_offset + 126] = (1).to_bytes(2, "little")
+    image[pvd_offset + 126:pvd_offset + 128] = (1).to_bytes(2, "big")
+    image[pvd_offset + 128:pvd_offset + 130] = block_size.to_bytes(2, "little")
+    image[pvd_offset + 130:pvd_offset + 132] = block_size.to_bytes(2, "big")
+    root_record = _iso_directory_record(b"\x00", 20, block_size, flags=0x02)
+    image[pvd_offset + 156:pvd_offset + 156 + len(root_record)] = root_record
+    terminator = 17 * block_size
+    image[terminator] = 255
+    image[terminator + 1:terminator + 6] = b"CD001"
+    image[terminator + 6] = 1
+    root = (
+        root_record
+        + _iso_directory_record(b"\x01", 20, block_size, flags=0x02)
+        + _iso_directory_record(b"SUBDIR", 22, block_size, flags=0x02)
+    )
+    image[20 * block_size:20 * block_size + len(root)] = root
+    subdirectory = (
+        _iso_directory_record(b"\x00", 22, block_size, flags=0x02)
+        + _iso_directory_record(b"\x01", 20, block_size, flags=0x02)
+        + _iso_directory_record(name, 23, len(payload))
+    )
+    image[22 * block_size:22 * block_size + len(subdirectory)] = subdirectory
+    image[23 * block_size:23 * block_size + len(payload)] = payload
+    return bytes(image)
+
+
 def test_png_appended_zip_recurses_to_base64_flag(tmp_path: Path) -> None:
     archive = BytesIO()
     with ZipFile(archive, "w") as zip_file:
@@ -306,12 +345,18 @@ def test_iso9660_root_file_recurses_with_descriptor_and_extent_lineage(tmp_path:
     pvd = pvd_observation.value
     assert pvd["descriptor_offset"] == 16 * 2_048
     assert pvd["root_directory_record"]["data_offset"] == 20 * 2_048
-    entries_observation = next(
+    root_entries_observation = next(
         item for item in result.observations
         if item.artifact_id == result.artifacts[0].id
         and item.key == "archive.iso9660.root_directory_entries"
     )
-    file_entry = entries_observation.value[2]
+    assert root_entries_observation.value[2]["archive_path"] == "FLAG.TXT"
+    entries_observation = next(
+        item for item in result.observations
+        if item.artifact_id == result.artifacts[0].id
+        and item.key == "archive.iso9660.regular_files"
+    )
+    file_entry = entries_observation.value[0]
     assert file_entry["file_identifier"] == "FLAG.TXT;1"
     assert file_entry["logical_name"] == "FLAG.TXT"
     assert file_entry["record_offset"] == 20 * 2_048 + 68
@@ -323,7 +368,7 @@ def test_iso9660_root_file_recurses_with_descriptor_and_extent_lineage(tmp_path:
         if item.source == "builtin_iso9660_extractor"
     )
     assert f"source_observation_id:{entries_observation.id}" in recovery.supporting_evidence[0]
-    assert "source_observation_key:archive.iso9660.root_directory_entries" in recovery.supporting_evidence[0]
+    assert "source_observation_key:archive.iso9660.regular_files" in recovery.supporting_evidence[0]
     assert f"pvd_observation_id:{pvd_observation.id}" in recovery.supporting_evidence[0]
     assert "pvd_observation_key:archive.iso9660.primary_volume_descriptor" in recovery.supporting_evidence[0]
     assert f"pvd_descriptor_offset:{16 * 2_048}" in recovery.supporting_evidence[0]
@@ -336,6 +381,60 @@ def test_iso9660_root_file_recurses_with_descriptor_and_extent_lineage(tmp_path:
     assert "ISO 9660 filesystem image" in report
     assert "builtin_iso9660_extractor" in report
     assert "CTF{iso9660_recursive_lineage}" in report
+
+
+def test_iso9660_nested_file_recurses_with_directory_identity_lineage(tmp_path: Path) -> None:
+    payload = b"CTF{iso9660_nested_recursive_lineage}"
+    evidence = tmp_path / "nested.iso"
+    evidence.write_bytes(_iso9660_with_nested_file(b"DEEP.TXT;1", payload))
+
+    result = AnalysisEngine().analyze(
+        evidence, tmp_path / "nested-iso-cases", mode=AnalysisMode.AUTO,
+        execute=False,
+    )
+
+    assert [item.logical_name for item in result.artifacts] == [
+        "nested.iso", "SUBDIR/DEEP.TXT",
+    ]
+    child = result.artifacts[1]
+    assert child.parent_id == result.artifacts[0].id
+    assert child.size == len(payload)
+    assert child.artifact_type == "text"
+    assert any(
+        candidate.value == "CTF{iso9660_nested_recursive_lineage}"
+        and candidate.artifact_id == child.id
+        for candidate in result.flags
+    )
+    files_observation = next(
+        item for item in result.observations
+        if item.artifact_id == result.artifacts[0].id
+        and item.key == "archive.iso9660.regular_files"
+    )
+    nested = files_observation.value[0]
+    assert nested["archive_path"] == "SUBDIR/DEEP.TXT"
+    assert nested["record_offset"] == 22 * 2_048 + 68
+    assert nested["data_offset"] == 23 * 2_048
+    assert nested["containing_directory_identity"]["logical_name"] == "SUBDIR"
+    assert nested["containing_directory_identity"]["directory_record_offset"] == 20 * 2_048 + 68
+    assert nested["directory_identity_lineage"] == [
+        nested["containing_directory_identity"]
+    ]
+    recovery = next(
+        item for item in result.findings
+        if item.source == "builtin_iso9660_extractor"
+    )
+    evidence_line = recovery.supporting_evidence[0]
+    assert f"source_observation_id:{files_observation.id}" in evidence_line
+    assert "source_observation_key:archive.iso9660.regular_files" in evidence_line
+    assert "archive_path:SUBDIR/DEEP.TXT" in evidence_line
+    assert "containing_directory_identity:{'logical_name': 'SUBDIR'" in evidence_line
+    assert "directory_identity_lineage:[{'logical_name': 'SUBDIR'" in evidence_line
+    report = next((tmp_path / "nested-iso-cases").glob("*/reports/report.json")).read_text(
+        encoding="utf-8"
+    )
+    assert "SUBDIR/DEEP.TXT" in report
+    assert "directory_identity_lineage" in report
+    assert "CTF{iso9660_nested_recursive_lineage}" in report
 
 
 def test_ext_root_regular_file_recurses_to_flag_with_inode_lineage(tmp_path: Path) -> None:

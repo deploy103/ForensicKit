@@ -1006,7 +1006,7 @@ class GenericTriageEngine:
     def _inspect_iso9660(
         self, artifact: Artifact, path: Path, size: int,
     ) -> list[Observation]:
-        """Parse bounded ISO 9660 descriptors and one primary root directory."""
+        """Parse bounded ISO 9660 descriptors and active primary-volume directories."""
         physical_block_size = 2_048
         descriptor_start = 16 * physical_block_size
         descriptor_budget = min(self.limits.signature_scan_bytes, 64 * physical_block_size)
@@ -1167,42 +1167,278 @@ class GenericTriageEngine:
                 except OSError as exc:
                     root_error = str(exc)[:2_000]
                     directory_data = b""
-                cursor = 0
                 entry_limit = min(self.limits.max_artifact_count + 2, 4_096)
-                while cursor < len(directory_data):
-                    record_length = directory_data[cursor]
-                    if record_length == 0:
-                        cursor = ((cursor // logical_block_size) + 1) * logical_block_size
-                        continue
-                    if len(root_entries) >= entry_limit:
-                        root_entry_limit_reached = True
-                        root_scan_truncated = True
-                        break
-                    if (
-                        record_length < 34
-                        or cursor + record_length > len(directory_data)
-                        or cursor % logical_block_size + record_length > logical_block_size
-                    ):
-                        if root_scan_truncated and cursor + record_length > len(directory_data):
-                            break
-                        root_error = (
-                            f"invalid ISO root directory record length {record_length} "
-                            f"at offset {root_offset + cursor}"
+                if root_error is None and len(directory_data) != root_scan_bytes:
+                    root_error = (
+                        f"truncated ISO root directory read at offset {root_offset}: "
+                        f"expected {root_scan_bytes} bytes, received {len(directory_data)}"
+                    )
+                if root_error is None:
+                    root_entries, parse_error, root_entry_limit_reached = (
+                        self._iso9660_directory_records(
+                            directory_data,
+                            directory_offset=root_offset,
+                            logical_block_size=logical_block_size,
+                            evidence_size=size,
+                            declared_volume_bytes=int(pvd["declared_volume_bytes"]),
+                            entry_limit=entry_limit,
                         )
+                    )
+                    for record in root_entries:
+                        record["root_directory_relative_offset"] = record.get(
+                            "directory_relative_offset"
+                        )
+                    if not (
+                        root_scan_truncated
+                        and parse_error is not None
+                        and parse_error.startswith("truncated ISO directory record")
+                    ):
+                        root_error = parse_error
+                    if root_entry_limit_reached:
+                        root_scan_truncated = True
+
+        all_directory_entries = list(root_entries)
+        directory_inventory: list[dict[str, object]] = []
+        directory_traversal_errors: list[dict[str, object]] = []
+        directory_scan_bytes = root_scan_bytes
+        directory_scan_byte_limit = min(self.limits.signature_scan_bytes, 8 * _MIB)
+        directory_limit = 32
+        directory_traversal_truncated = root_scan_truncated
+        total_entry_limit = min(self.limits.max_artifact_count + 64, 4_096)
+        if pvd is not None and pvd.get("valid") is True:
+            root_record = pvd.get("root_directory_record")
+            logical_block_size = pvd.get("logical_block_size")
+            declared_volume_bytes = pvd.get("declared_volume_bytes")
+            if (
+                isinstance(root_record, dict)
+                and isinstance(logical_block_size, int)
+                and isinstance(declared_volume_bytes, int)
+            ):
+                root_extent = (
+                    root_record.get("data_offset"), root_record.get("data_length"),
+                )
+                root_identity = {
+                    "logical_name": "/",
+                    "file_identifier": ".",
+                    "directory_record_offset": root_record.get("record_offset"),
+                    "extent_block": root_record.get("extent_block"),
+                    "data_offset": root_record.get("data_offset"),
+                    "data_length": root_record.get("data_length"),
+                }
+                for entry in root_entries:
+                    entry["containing_directory_identity"] = root_identity
+                    entry["directory_identity_lineage"] = []
+                    if entry.get("logical_name") not in {".", ".."}:
+                        entry["archive_path"] = entry.get("logical_name")
+
+                queue: list[
+                    tuple[
+                        dict[str, object], list[dict[str, object]],
+                        set[tuple[object, object]], tuple[object, object],
+                    ]
+                ] = []
+                claimed_extents: set[tuple[object, object]] = {root_extent}
+
+                def schedule_directory(
+                    entry: dict[str, object],
+                    parent_lineage: list[dict[str, object]],
+                    ancestor_extents: set[tuple[object, object]],
+                    parent_extent: tuple[object, object],
+                ) -> None:
+                    if (
+                        entry.get("file_type") != "directory"
+                        or entry.get("logical_name") in {".", ".."}
+                        or entry.get("valid") is not True
+                    ):
+                        return
+                    if (
+                        entry.get("multi_extent") is True
+                        or entry.get("file_unit_size") not in {0, None}
+                        or entry.get("interleave_gap_size") not in {0, None}
+                    ):
+                        entry["directory_traversal"] = "unsupported_layout"
+                        directory_traversal_errors.append({
+                            "reason": "unsupported_directory_layout",
+                            "entry": entry,
+                        })
+                        return
+                    extent = (entry.get("data_offset"), entry.get("data_length"))
+                    identity = {
+                        "logical_name": entry.get("logical_name"),
+                        "file_identifier": entry.get("file_identifier"),
+                        "directory_record_offset": entry.get("record_offset"),
+                        "extent_block": entry.get("extent_block"),
+                        "data_offset": entry.get("data_offset"),
+                        "data_length": entry.get("data_length"),
+                    }
+                    if extent in ancestor_extents:
+                        entry["directory_traversal"] = "ancestor_cycle"
+                        directory_traversal_errors.append({
+                            "reason": "ancestor_cycle",
+                            "entry": entry,
+                            "conflicting_extent": extent,
+                        })
+                        return
+                    if extent in claimed_extents:
+                        entry["directory_traversal"] = "shared_extent"
+                        directory_traversal_errors.append({
+                            "reason": "shared_extent",
+                            "entry": entry,
+                            "conflicting_extent": extent,
+                        })
+                        return
+                    claimed_extents.add(extent)
+                    entry["directory_traversal"] = "scheduled"
+                    queue.append((
+                        entry,
+                        [*parent_lineage, identity],
+                        {*ancestor_extents, extent},
+                        parent_extent,
+                    ))
+
+                for entry in root_entries:
+                    schedule_directory(entry, [], {root_extent}, root_extent)
+
+                processed_directories = 0
+                while queue and processed_directories < directory_limit:
+                    directory_entry, lineage, ancestor_extents, parent_extent = queue.pop(0)
+                    data_offset = directory_entry.get("data_offset")
+                    data_length = directory_entry.get("data_length")
+                    if (
+                        not isinstance(data_offset, int)
+                        or not isinstance(data_length, int)
+                        or data_length <= 0
+                        or data_offset < 0
+                        or data_offset + data_length > size
+                    ):
+                        directory_entry["directory_traversal"] = "invalid_range"
+                        directory_traversal_errors.append({
+                            "reason": "invalid_range", "entry": directory_entry,
+                        })
+                        continue
+                    if directory_scan_bytes + data_length > directory_scan_byte_limit:
+                        directory_entry["directory_traversal"] = "byte_limit"
+                        directory_traversal_errors.append({
+                            "reason": "byte_limit", "entry": directory_entry,
+                        })
+                        directory_traversal_truncated = True
+                        continue
+                    remaining_entries = total_entry_limit - len(all_directory_entries)
+                    if remaining_entries <= 0:
+                        directory_entry["directory_traversal"] = "entry_limit"
+                        directory_traversal_truncated = True
+                        directory_traversal_errors.append({
+                            "reason": "entry_limit", "entry": directory_entry,
+                            "entry_limit": total_entry_limit,
+                        })
                         break
-                    record, record_error = self._iso9660_directory_record(
-                        directory_data[cursor:cursor + record_length],
-                        record_offset=root_offset + cursor,
+                    try:
+                        with path.open("rb") as stream:
+                            stream.seek(data_offset)
+                            directory_data = stream.read(data_length)
+                    except OSError as exc:
+                        directory_entry["directory_traversal"] = "read_error"
+                        directory_traversal_errors.append({
+                            "reason": "read_error", "error": str(exc)[:2_000],
+                            "entry": directory_entry,
+                        })
+                        continue
+                    directory_scan_bytes += len(directory_data)
+                    if len(directory_data) != data_length:
+                        directory_entry["directory_traversal"] = "truncated_read"
+                        directory_traversal_errors.append({
+                            "reason": "truncated_read", "entry": directory_entry,
+                            "expected_bytes": data_length,
+                            "received_bytes": len(directory_data),
+                        })
+                        continue
+                    child_entries, child_error, child_limit = self._iso9660_directory_records(
+                        directory_data,
+                        directory_offset=data_offset,
                         logical_block_size=logical_block_size,
                         evidence_size=size,
-                        declared_volume_bytes=int(pvd["declared_volume_bytes"]),
+                        declared_volume_bytes=declared_volume_bytes,
+                        entry_limit=remaining_entries,
                     )
-                    record["root_directory_relative_offset"] = cursor
-                    root_entries.append(record)
-                    if record_error is not None and root_error is None:
-                        root_error = record_error
-                    cursor += record_length
+                    processed_directories += 1
+                    directory_entry["directory_traversal"] = (
+                        "parsed" if child_error is None and not child_limit else "parsed_with_anomaly"
+                    )
+                    current_identity = lineage[-1]
+                    for child_entry in child_entries:
+                        child_entry["containing_directory_identity"] = current_identity
+                        child_entry["directory_identity_lineage"] = lineage
+                        if child_entry.get("logical_name") not in {".", ".."}:
+                            child_entry["archive_path"] = "/".join(
+                                [
+                                    *[
+                                        str(identity.get("logical_name"))
+                                        for identity in lineage
+                                    ],
+                                    str(child_entry.get("logical_name")),
+                                ]
+                            )
+                    all_directory_entries.extend(child_entries)
+                    dot_entry = next(
+                        (entry for entry in child_entries if entry.get("logical_name") == "."),
+                        None,
+                    )
+                    dotdot_entry = next(
+                        (entry for entry in child_entries if entry.get("logical_name") == ".."),
+                        None,
+                    )
+                    self_extent = (data_offset, data_length)
+                    dot_matches_self = bool(
+                        dot_entry
+                        and dot_entry.get("valid") is True
+                        and dot_entry.get("file_type") == "directory"
+                        and (dot_entry.get("data_offset"), dot_entry.get("data_length")) == self_extent
+                    )
+                    dotdot_matches_parent = bool(
+                        dotdot_entry
+                        and dotdot_entry.get("valid") is True
+                        and dotdot_entry.get("file_type") == "directory"
+                        and (dotdot_entry.get("data_offset"), dotdot_entry.get("data_length")) == parent_extent
+                    )
+                    inventory_record = {
+                        "directory_identity": current_identity,
+                        "directory_identity_lineage": lineage,
+                        "ancestor_extents": sorted(
+                            [list(extent) for extent in ancestor_extents],
+                            key=lambda item: (str(item[0]), str(item[1])),
+                        ),
+                        "source_entry_offset": directory_entry.get("record_offset"),
+                        "data_offset": data_offset,
+                        "data_length": data_length,
+                        "entry_count": len(child_entries),
+                        "dot_entry_matches_self": dot_matches_self,
+                        "dotdot_entry_matches_parent": dotdot_matches_parent,
+                        "parse_error": child_error,
+                        "entry_limit_reached": child_limit,
+                    }
+                    directory_inventory.append(inventory_record)
+                    if child_error or child_limit or not dot_matches_self or not dotdot_matches_parent:
+                        directory_traversal_errors.append({
+                            "reason": "directory_consistency",
+                            "inventory": inventory_record,
+                        })
+                    for child_entry in child_entries:
+                        schedule_directory(
+                            child_entry, lineage, ancestor_extents, self_extent,
+                        )
+                if queue:
+                    directory_traversal_truncated = True
+                    directory_traversal_errors.append({
+                        "reason": "directory_limit",
+                        "remaining_directory_count": len(queue),
+                        "directory_limit": directory_limit,
+                    })
 
+        regular_files = [
+            entry for entry in all_directory_entries
+            if entry.get("file_type") == "regular"
+            and entry.get("logical_name") not in {".", ".."}
+        ]
         return [
             self._observation(artifact, "archive.iso9660.signature", True),
             self._observation(artifact, "archive.iso9660.physical_descriptor_block_size", physical_block_size),
@@ -1217,8 +1453,78 @@ class GenericTriageEngine:
             self._observation(artifact, "archive.iso9660.root_directory_scan_truncated", root_scan_truncated),
             self._observation(artifact, "archive.iso9660.root_directory_entry_limit_reached", root_entry_limit_reached),
             self._observation(artifact, "archive.iso9660.root_directory_error", root_error),
+            self._observation(artifact, "archive.iso9660.directory_entries", all_directory_entries),
+            self._observation(artifact, "archive.iso9660.regular_files", regular_files),
+            self._observation(artifact, "archive.iso9660.regular_file_count", len(regular_files)),
+            self._observation(artifact, "archive.iso9660.subdirectory_inventory", directory_inventory),
+            self._observation(artifact, "archive.iso9660.subdirectory_count", len(directory_inventory)),
+            self._observation(artifact, "archive.iso9660.directory_scan_bytes", directory_scan_bytes),
+            self._observation(artifact, "archive.iso9660.directory_scan_byte_limit", directory_scan_byte_limit),
+            self._observation(artifact, "archive.iso9660.directory_limit", directory_limit),
+            self._observation(artifact, "archive.iso9660.directory_traversal_truncated", directory_traversal_truncated),
+            self._observation(artifact, "archive.iso9660.directory_traversal_errors", directory_traversal_errors),
             self._observation(artifact, "archive.container_kind", "iso9660"),
         ]
+
+    @staticmethod
+    def _iso9660_directory_records(
+        directory_data: bytes,
+        *,
+        directory_offset: int,
+        logical_block_size: int,
+        evidence_size: int,
+        declared_volume_bytes: int,
+        entry_limit: int,
+    ) -> tuple[list[dict[str, object]], str | None, bool]:
+        """Decode block-bounded records from one already bounded directory extent."""
+        entries: list[dict[str, object]] = []
+        first_error: str | None = None
+        entry_limit_reached = False
+        cursor = 0
+        if logical_block_size <= 0:
+            return entries, "invalid ISO logical block size for directory parsing", False
+        while cursor < len(directory_data):
+            record_length = directory_data[cursor]
+            if record_length == 0:
+                next_block = ((cursor // logical_block_size) + 1) * logical_block_size
+                if next_block <= cursor:
+                    return entries, "ISO directory padding did not advance parsing", False
+                cursor = next_block
+                continue
+            if len(entries) >= entry_limit:
+                entry_limit_reached = True
+                break
+            record_offset = directory_offset + cursor
+            if record_length < 34:
+                first_error = (
+                    f"invalid ISO directory record length {record_length} "
+                    f"at offset {record_offset}"
+                )
+                break
+            if cursor % logical_block_size + record_length > logical_block_size:
+                first_error = (
+                    f"ISO directory record at offset {record_offset} crosses a logical-block boundary"
+                )
+                break
+            if cursor + record_length > len(directory_data):
+                first_error = (
+                    f"truncated ISO directory record at offset {record_offset}: "
+                    f"declared length {record_length} exceeds available directory bytes"
+                )
+                break
+            record, record_error = GenericTriageEngine._iso9660_directory_record(
+                directory_data[cursor:cursor + record_length],
+                record_offset=record_offset,
+                logical_block_size=logical_block_size,
+                evidence_size=evidence_size,
+                declared_volume_bytes=declared_volume_bytes,
+            )
+            record["directory_relative_offset"] = cursor
+            entries.append(record)
+            if record_error is not None and first_error is None:
+                first_error = record_error
+            cursor += record_length
+        return entries, first_error, entry_limit_reached
 
     @staticmethod
     def _iso9660_directory_record(

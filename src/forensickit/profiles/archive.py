@@ -225,9 +225,58 @@ class ArchiveProfile(BaseProfile):
                     severity="medium",
                 )
             )
+        iso_traversal_errors = next(
+            (
+                value for value in context.values(
+                    "archive.iso9660.directory_traversal_errors"
+                )
+                if isinstance(value, list)
+            ),
+            [],
+        )
+        iso_traversal_truncated = next(
+            (
+                value for value in context.values(
+                    "archive.iso9660.directory_traversal_truncated"
+                )
+                if isinstance(value, bool)
+            ),
+            False,
+        )
+        if iso_signature and (iso_traversal_errors or iso_traversal_truncated):
+            traversal_metrics = []
+            for key in (
+                "archive.iso9660.directory_scan_bytes",
+                "archive.iso9660.directory_scan_byte_limit",
+                "archive.iso9660.directory_limit",
+                "archive.iso9660.subdirectory_count",
+            ):
+                values = context.values(key)
+                if values:
+                    traversal_metrics.append(f"{key}={values[0]}")
+            result.findings.append(
+                self.finding(
+                    context,
+                    title="ISO 9660 directory traversal was incomplete or ambiguous",
+                    category="iso9660_directory_traversal_anomaly",
+                    confidence=0.97,
+                    explanation=(
+                        "A bounded active-directory walk encountered a shared/cyclic extent, "
+                        "directory consistency failure, malformed record, read problem, or a "
+                        "configured byte, entry, or directory limit. Affected branches remain "
+                        "metadata-only rather than being inferred or recursively extracted."
+                    ),
+                    evidence=(
+                        [str(item)[:2_000] for item in iso_traversal_errors[:16]]
+                        + [f"directory_traversal_truncated={iso_traversal_truncated}"]
+                        + traversal_metrics
+                    ),
+                    severity="medium",
+                )
+            )
         iso_entries = next(
             (
-                value for value in context.values("archive.iso9660.root_directory_entries")
+                value for value in context.values("archive.iso9660.directory_entries")
                 if isinstance(value, list)
             ),
             [],
@@ -240,11 +289,11 @@ class ArchiveProfile(BaseProfile):
             result.findings.append(
                 self.finding(
                     context,
-                    title="ISO 9660 contains unsafe root member name(s)",
+                    title="ISO 9660 contains unsafe member name(s)",
                     category="archive_unsafe_member_path",
                     confidence=0.99,
                     explanation=(
-                        "A root directory identifier is absolute, drive-rooted, contains a path separator, "
+                        "A directory identifier is absolute, drive-rooted, contains a path separator, "
                         "or contains a parent component. It remains metadata-only."
                     ),
                     evidence=[str(item)[:2_000] for item in unsafe_iso_entries[:16]],
@@ -265,7 +314,7 @@ class ArchiveProfile(BaseProfile):
             result.findings.append(
                 self.finding(
                     context,
-                    title="ISO 9660 root file uses an unsupported multi-extent/interleaved layout",
+                    title="ISO 9660 file uses an unsupported multi-extent/interleaved layout",
                     category="archive_unsupported_layout",
                     confidence=0.99,
                     explanation=(
