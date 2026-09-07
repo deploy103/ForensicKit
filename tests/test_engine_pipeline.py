@@ -70,9 +70,10 @@ def _iso_directory_record(
     data_length: int,
     *,
     flags: int = 0,
+    system_use: bytes = b"",
 ) -> bytes:
     padding = 1 if len(identifier) % 2 == 0 else 0
-    record = bytearray(33 + len(identifier) + padding)
+    record = bytearray(33 + len(identifier) + padding + len(system_use))
     record[0] = len(record)
     record[2:6] = extent_block.to_bytes(4, "little")
     record[6:10] = extent_block.to_bytes(4, "big")
@@ -84,7 +85,22 @@ def _iso_directory_record(
     record[30:32] = (1).to_bytes(2, "big")
     record[32] = len(identifier)
     record[33:33 + len(identifier)] = identifier
+    system_use_offset = 33 + len(identifier) + padding
+    record[system_use_offset:] = system_use
     return bytes(record)
+
+
+def _susp_entry(signature: bytes, data: bytes = b"") -> bytes:
+    return signature + bytes((4 + len(data), 1)) + data
+
+
+def _rrip_px(mode: int, *, links: int = 1) -> bytes:
+    values = (mode, links, 1000, 1000, 1)
+    data = b"".join(
+        value.to_bytes(4, "little") + value.to_bytes(4, "big")
+        for value in values
+    )
+    return _susp_entry(b"PX", data)
 
 
 def _iso9660_with_root_file(name: bytes, payload: bytes) -> bytes:
@@ -120,7 +136,9 @@ def _iso9660_with_root_file(name: bytes, payload: bytes) -> bytes:
     return bytes(image)
 
 
-def _iso9660_with_nested_file(name: bytes, payload: bytes) -> bytes:
+def _iso9660_with_nested_file(
+    name: bytes, payload: bytes, *, rock_ridge: bool = False,
+) -> bytes:
     block_size = 2_048
     image = bytearray(24 * block_size)
     pvd_offset = 16 * block_size
@@ -143,17 +161,80 @@ def _iso9660_with_nested_file(name: bytes, payload: bytes) -> bytes:
     image[terminator] = 255
     image[terminator + 1:terminator + 6] = b"CD001"
     image[terminator + 6] = 1
-    root = (
-        root_record
-        + _iso_directory_record(b"\x01", 20, block_size, flags=0x02)
-        + _iso_directory_record(b"SUBDIR", 22, block_size, flags=0x02)
-    )
+    skip_prefix = b"\x00\x00"
+    rrip_identifier = b"RRIP_1991A"
+    if rock_ridge:
+        root_self_system_use = (
+            skip_prefix
+            + _susp_entry(b"SP", b"\xbe\xef\x02")
+            + _susp_entry(
+                b"ER", bytes((len(rrip_identifier), 0, 0, 1)) + rrip_identifier,
+            )
+            + _rrip_px(0o040755, links=2)
+            + _susp_entry(b"ST")
+        )
+        parent_system_use = (
+            skip_prefix + _rrip_px(0o040755, links=2) + _susp_entry(b"ST")
+        )
+        directory_system_use = (
+            skip_prefix
+            + _rrip_px(0o040750, links=2)
+            + _susp_entry(b"NM", b"\x00Evidence Directory")
+            + _susp_entry(b"ST")
+        )
+        root_self = _iso_directory_record(
+            b"\x00", 20, block_size, flags=0x02, system_use=root_self_system_use,
+        )
+        parent = _iso_directory_record(
+            b"\x01", 20, block_size, flags=0x02, system_use=parent_system_use,
+        )
+        directory = _iso_directory_record(
+            b"LONGDIR", 22, block_size, flags=0x02,
+            system_use=directory_system_use,
+        )
+    else:
+        root_self = root_record
+        parent = _iso_directory_record(b"\x01", 20, block_size, flags=0x02)
+        directory = _iso_directory_record(b"SUBDIR", 22, block_size, flags=0x02)
+    root = root_self + parent + directory
     image[20 * block_size:20 * block_size + len(root)] = root
-    subdirectory = (
-        _iso_directory_record(b"\x00", 22, block_size, flags=0x02)
-        + _iso_directory_record(b"\x01", 20, block_size, flags=0x02)
-        + _iso_directory_record(name, 23, len(payload))
-    )
+    if rock_ridge:
+        subdirectory = (
+            _iso_directory_record(
+                b"\x00", 22, block_size, flags=0x02,
+                system_use=skip_prefix + _rrip_px(0o040750, links=2) + _susp_entry(b"ST"),
+            )
+            + _iso_directory_record(
+                b"\x01", 20, block_size, flags=0x02,
+                system_use=skip_prefix + _rrip_px(0o040755, links=2) + _susp_entry(b"ST"),
+            )
+            + _iso_directory_record(
+                name, 23, len(payload),
+                system_use=(
+                    skip_prefix
+                    + _rrip_px(0o100640)
+                    + _susp_entry(b"NM", b"\x01Flag ")
+                    + _susp_entry(b"NM", b"\x00Evidence.txt")
+                    + _susp_entry(b"ST")
+                ),
+            )
+            + _iso_directory_record(
+                b"LINK.;1", 23, 0,
+                system_use=(
+                    skip_prefix
+                    + _rrip_px(0o120777)
+                    + _susp_entry(b"NM", b"\x00latest")
+                    + _susp_entry(b"SL", b"\x00\x04\x00\x00\x06secret")
+                    + _susp_entry(b"ST")
+                ),
+            )
+        )
+    else:
+        subdirectory = (
+            _iso_directory_record(b"\x00", 22, block_size, flags=0x02)
+            + _iso_directory_record(b"\x01", 20, block_size, flags=0x02)
+            + _iso_directory_record(name, 23, len(payload))
+        )
     image[22 * block_size:22 * block_size + len(subdirectory)] = subdirectory
     image[23 * block_size:23 * block_size + len(payload)] = payload
     return bytes(image)
@@ -435,6 +516,73 @@ def test_iso9660_nested_file_recurses_with_directory_identity_lineage(tmp_path: 
     assert "SUBDIR/DEEP.TXT" in report
     assert "directory_identity_lineage" in report
     assert "CTF{iso9660_nested_recursive_lineage}" in report
+
+
+def test_iso9660_rock_ridge_name_recurses_while_symlink_stays_metadata_only(
+    tmp_path: Path,
+) -> None:
+    payload = b"CTF{rock_ridge_recursive_lineage}"
+    evidence = tmp_path / "rock-ridge.iso"
+    evidence.write_bytes(
+        _iso9660_with_nested_file(b"FLAG000.TXT;1", payload, rock_ridge=True)
+    )
+
+    result = AnalysisEngine().analyze(
+        evidence, tmp_path / "rock-ridge-cases", mode=AnalysisMode.AUTO,
+        execute=False,
+    )
+
+    assert [item.logical_name for item in result.artifacts] == [
+        "rock-ridge.iso", "Evidence Directory/Flag Evidence.txt",
+    ]
+    child = result.artifacts[1]
+    assert child.parent_id == result.artifacts[0].id
+    assert child.size == len(payload)
+    assert child.artifact_type == "text"
+    assert any(
+        candidate.value == "CTF{rock_ridge_recursive_lineage}"
+        and candidate.artifact_id == child.id
+        for candidate in result.flags
+    )
+    assert any(
+        "Rock Ridge symbolic link is metadata-only" in error
+        for error in result.errors
+    )
+    files_observation = next(
+        item for item in result.observations
+        if item.artifact_id == result.artifacts[0].id
+        and item.key == "archive.iso9660.regular_files"
+    )
+    nested = next(
+        item for item in files_observation.value
+        if item.get("rock_ridge_name") == "Flag Evidence.txt"
+    )
+    symlink = next(
+        item for item in files_observation.value
+        if item.get("rock_ridge_symlink") is True
+    )
+    assert nested["archive_path"] == "Evidence Directory/Flag Evidence.txt"
+    assert nested["rock_ridge_posix"]["permissions"] == "0o0640"
+    assert nested["directory_identity_lineage"][0]["logical_name"] == "Evidence Directory"
+    assert symlink["archive_path"] == "Evidence Directory/latest"
+    assert symlink["extraction_eligible"] is False
+    recovery = next(
+        item for item in result.findings
+        if item.source == "builtin_iso9660_extractor"
+    )
+    evidence_line = recovery.supporting_evidence[0]
+    assert "archive_path:Evidence Directory/Flag Evidence.txt" in evidence_line
+    assert "'rock_ridge_name': 'Flag Evidence.txt'" in evidence_line
+    assert any(
+        item.category == "archive_link_metadata"
+        for item in result.findings
+    )
+    report = next((tmp_path / "rock-ridge-cases").glob("*/reports/report.json")).read_text(
+        encoding="utf-8"
+    )
+    assert "Evidence Directory/Flag Evidence.txt" in report
+    assert "rock_ridge_symlink" in report
+    assert "CTF{rock_ridge_recursive_lineage}" in report
 
 
 def test_ext_root_regular_file_recurses_to_flag_with_inode_lineage(tmp_path: Path) -> None:

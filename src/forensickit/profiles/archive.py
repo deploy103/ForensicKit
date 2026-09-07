@@ -274,6 +274,29 @@ class ArchiveProfile(BaseProfile):
                     severity="medium",
                 )
             )
+        iso_susp_errors = next(
+            (
+                value for value in context.values("archive.iso9660.susp_errors")
+                if isinstance(value, list)
+            ),
+            [],
+        )
+        if iso_susp_errors:
+            result.findings.append(
+                self.finding(
+                    context,
+                    title="ISO 9660 SUSP/Rock Ridge metadata anomaly",
+                    category="iso9660_susp_anomaly",
+                    confidence=0.97,
+                    explanation=(
+                        "An inline SUSP entry failed framing/version/both-endian validation, or "
+                        "RRIP supplied an unsafe/inconsistent name or POSIX file type. Raw system-use "
+                        "bytes remain evidence and the affected metadata is not trusted for extraction."
+                    ),
+                    evidence=[str(item)[:2_000] for item in iso_susp_errors[:16]],
+                    severity="medium",
+                )
+            )
         iso_entries = next(
             (
                 value for value in context.values("archive.iso9660.directory_entries")
@@ -283,7 +306,11 @@ class ArchiveProfile(BaseProfile):
         )
         unsafe_iso_entries = [
             item for item in iso_entries
-            if isinstance(item, dict) and item.get("path_safe") is False
+            if isinstance(item, dict)
+            and (
+                item.get("path_safe") is False
+                or item.get("rock_ridge_name_path_safe") is False
+            )
         ]
         if unsafe_iso_entries:
             result.findings.append(
@@ -293,11 +320,32 @@ class ArchiveProfile(BaseProfile):
                     category="archive_unsafe_member_path",
                     confidence=0.99,
                     explanation=(
-                        "A directory identifier is absolute, drive-rooted, contains a path separator, "
-                        "or contains a parent component. It remains metadata-only."
+                        "An ISO identifier or Rock Ridge alternate name is absolute, drive-rooted, "
+                        "contains a path separator, or contains a parent component. It remains "
+                        "metadata-only."
                     ),
                     evidence=[str(item)[:2_000] for item in unsafe_iso_entries[:16]],
                     severity="medium",
+                )
+            )
+        iso_symlinks = [
+            item for item in iso_entries
+            if isinstance(item, dict) and item.get("rock_ridge_symlink") is True
+        ]
+        if iso_symlinks:
+            result.findings.append(
+                self.finding(
+                    context,
+                    title="Rock Ridge symbolic link metadata retained without traversal",
+                    category="archive_link_metadata",
+                    confidence=0.99,
+                    explanation=(
+                        "RRIP PX/SL metadata identifies one or more symbolic links. Their raw target "
+                        "components are inventoried, but the native extractor never follows or "
+                        "materializes them."
+                    ),
+                    evidence=[str(item)[:2_000] for item in iso_symlinks[:16]],
+                    severity="info",
                 )
             )
         unsupported_iso_entries = [

@@ -1,5 +1,18 @@
 # ForensicKit Work Log
 
+## 2026-09-07 10:44 KST
+
+### Rock Ridge SUSP/RRIP metadata and safe names
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/profiles/archive.py`, `src/forensickit/extraction.py`, `tests/test_triage.py`, and `tests/test_engine_pipeline.py`.
+- SUSP activation now requires an exact `SP` check-byte/version marker in the primary root's `.` record and honors its declared skip prefix. The bounded record parser preserves raw and absolute offsets for every inline entry; validates `ER`, `RR`, both-endian `PX`, continuation-aware UTF-8 `NM`, component-framed `SL`, `CE`, `CL`/`PL`, `RE`, and `ST` structures; and retains unknown entry bytes without executing or dereferencing them.
+- Complete, component-safe `NM` chains now supply archive names while the original ISO identifier remains intact. `PX` mode/link/UID/GID/serial values and readable permissions/file type are retained. Unsafe, malformed, incomplete-without-CE, or ISO/PX-inconsistent metadata suppresses the affected extraction/traversal branch. `SL` targets are evidence-only component inventories; symlinks and POSIX special files are never followed or materialized.
+- The archive profile emits dedicated SUSP anomaly and link-metadata findings. Synthetic fixtures validate a two-byte SUSP skip, `RRIP_1991A`, split `NM`, exact entry offsets, nested alternate directory/file paths, POSIX metadata, an unsafe `../` name, and a `../secret` symlink target. An AUTO E2E proves ISO -> `Evidence Directory/Flag Evidence.txt` -> child-attributed FlagCandidate/report lineage while the sibling symlink remains metadata-only. Focused triage/Engine regressions passed: 154 passed, 0 failed. The full direct synthetic suite passed: 315 passed, 0 failed. `python -m compileall -q src tests scripts` and `git diff --check` passed.
+
+### Next
+
+- Parse a bounded valid Joliet supplementary-volume tree and reconcile its UCS-2 names with primary-volume extents without duplicating extracted content.
+
 ## 2026-09-07 10:28 KST
 
 ### ISO 9660 active subdirectory traversal

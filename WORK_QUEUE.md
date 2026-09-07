@@ -1,10 +1,10 @@
 # ForensicKit Work Queue
 
-Last reviewed: 2026-09-07 10:28 KST
+Last reviewed: 2026-09-07 10:44 KST
 
 ## Post-v1.1 backlog
 
-- [ ] Add bounded Rock Ridge SUSP/RRIP alternate-name and POSIX metadata parsing without following symlinks.
+- [ ] Add bounded Joliet supplementary-volume descriptor and UCS-2 directory-name traversal with duplicate-extent reconciliation.
 
 ## v1.1.0 release gate
 
@@ -17,6 +17,7 @@ Last reviewed: 2026-09-07 10:28 KST
 
 ## Completed this session
 
+- [x] Bounded Rock Ridge SUSP/RRIP alternate-name/POSIX metadata parsing with symlink non-materialization.
 - [x] Bounded ISO 9660 active subdirectory traversal with shared-extent/cycle protection and directory lineage.
 - [x] Bounded ISO 9660 primary-volume/root directory parsing and safe single-extent regular-file recursive extraction.
 - [x] Portable ASCII CPIO `odc` strict-octal parsing and two-byte-aligned recursive regular-file extraction.

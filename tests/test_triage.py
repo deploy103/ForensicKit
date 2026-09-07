@@ -124,9 +124,10 @@ def _iso_directory_record(
     extended_attribute_blocks: int = 0,
     file_unit_size: int = 0,
     interleave_gap_size: int = 0,
+    system_use: bytes = b"",
 ) -> bytes:
     padding = 1 if len(identifier) % 2 == 0 else 0
-    record = bytearray(33 + len(identifier) + padding)
+    record = bytearray(33 + len(identifier) + padding + len(system_use))
     record[0] = len(record)
     record[1] = extended_attribute_blocks
     record[2:10] = _iso_both32(extent_block)
@@ -138,7 +139,114 @@ def _iso_directory_record(
     record[28:32] = _iso_both16(1)
     record[32] = len(identifier)
     record[33:33 + len(identifier)] = identifier
+    system_use_offset = 33 + len(identifier) + padding
+    record[system_use_offset:] = system_use
     return bytes(record)
+
+
+def _susp_entry(signature: bytes, data: bytes = b"") -> bytes:
+    length = 4 + len(data)
+    assert len(signature) == 2 and length <= 255
+    return signature + bytes((length, 1)) + data
+
+
+def _rrip_px(mode: int, *, links: int = 1, uid: int = 1000, gid: int = 1000) -> bytes:
+    fields = (mode, links, uid, gid, 1)
+    return _susp_entry(b"PX", b"".join(_iso_both32(value) for value in fields))
+
+
+def _iso9660_with_rock_ridge(*, unsafe_file_name: bool = False) -> tuple[bytes, bytes]:
+    block_size = 2_048
+    image = bytearray(25 * block_size)
+    pvd_offset = 16 * block_size
+    pvd = memoryview(image)[pvd_offset:pvd_offset + block_size]
+    pvd[0] = 1
+    pvd[1:6] = b"CD001"
+    pvd[6] = 1
+    pvd[8:40] = b"FORENSICKIT".ljust(32, b" ")
+    pvd[40:72] = b"ROCK_RIDGE".ljust(32, b" ")
+    pvd[80:88] = _iso_both32(25)
+    pvd[120:124] = _iso_both16(1)
+    pvd[124:128] = _iso_both16(1)
+    pvd[128:132] = _iso_both16(block_size)
+    pvd[132:140] = _iso_both32(0)
+    root_record = _iso_directory_record(b"\x00", 20, block_size, flags=0x02)
+    pvd[156:156 + len(root_record)] = root_record
+    terminator = 17 * block_size
+    image[terminator] = 255
+    image[terminator + 1:terminator + 6] = b"CD001"
+    image[terminator + 6] = 1
+
+    skip_prefix = b"\x00\x00"
+    rrip_identifier = b"RRIP_1991A"
+    root_system_use = (
+        skip_prefix
+        + _susp_entry(b"SP", b"\xbe\xef\x02")
+        + _susp_entry(
+            b"ER", bytes((len(rrip_identifier), 0, 0, 1)) + rrip_identifier,
+        )
+        + _rrip_px(0o040755, links=2, uid=0, gid=0)
+        + _susp_entry(b"ST")
+    )
+    directory_system_use = (
+        skip_prefix
+        + _rrip_px(0o040750, links=2)
+        + _susp_entry(b"NM", b"\x00Evidence Directory")
+        + _susp_entry(b"ST")
+    )
+    root = (
+        _iso_directory_record(
+            b"\x00", 20, block_size, flags=0x02, system_use=root_system_use,
+        )
+        + _iso_directory_record(
+            b"\x01", 20, block_size, flags=0x02,
+            system_use=skip_prefix + _rrip_px(0o040755, links=2) + _susp_entry(b"ST"),
+        )
+        + _iso_directory_record(
+            b"LONGDIR", 22, block_size, flags=0x02,
+            system_use=directory_system_use,
+        )
+    )
+    image[20 * block_size:20 * block_size + len(root)] = root
+
+    payload = b"CTF{rock_ridge_alternate_name}"
+    file_name_entries = (
+        _susp_entry(b"NM", b"\x00../escape.txt")
+        if unsafe_file_name
+        else (
+            _susp_entry(b"NM", b"\x01Flag ")
+            + _susp_entry(b"NM", b"\x00Evidence.txt")
+        )
+    )
+    file_system_use = (
+        skip_prefix + _rrip_px(0o100640) + file_name_entries + _susp_entry(b"ST")
+    )
+    symlink_system_use = (
+        skip_prefix
+        + _rrip_px(0o120777)
+        + _susp_entry(b"NM", b"\x00latest")
+        + _susp_entry(b"SL", b"\x00\x04\x00\x00\x06secret")
+        + _susp_entry(b"ST")
+    )
+    subdirectory = (
+        _iso_directory_record(
+            b"\x00", 22, block_size, flags=0x02,
+            system_use=skip_prefix + _rrip_px(0o040750, links=2) + _susp_entry(b"ST"),
+        )
+        + _iso_directory_record(
+            b"\x01", 20, block_size, flags=0x02,
+            system_use=skip_prefix + _rrip_px(0o040755, links=2) + _susp_entry(b"ST"),
+        )
+        + _iso_directory_record(
+            b"FLAG000.TXT;1", 23, len(payload), system_use=file_system_use,
+        )
+        + _iso_directory_record(
+            b"LINK.;1", 24, 0, system_use=symlink_system_use,
+        )
+    )
+    image[22 * block_size:22 * block_size + len(subdirectory)] = subdirectory
+    image[23 * block_size:23 * block_size + len(payload)] = payload
+    return bytes(image), payload
 
 
 def _iso9660_with_subdirectory(*, shared_extent: bool = False) -> tuple[bytes, bytes]:
@@ -1465,6 +1573,110 @@ def test_iso9660_subdirectory_traversal_preserves_paths_and_rejects_shared_exten
         item.category == "iso9660_directory_traversal_anomaly"
         and "shared_extent" in " ".join(item.supporting_evidence)
         for item in shared_profile.findings
+    )
+
+
+def test_iso9660_rock_ridge_names_posix_metadata_and_symlinks_are_bounded(
+    tmp_path: Path,
+) -> None:
+    image, payload = _iso9660_with_rock_ridge()
+    evidence = tmp_path / "rock-ridge.iso"
+    evidence.write_bytes(image)
+    artifact = _artifact(evidence)
+
+    observations = GenericTriageEngine().analyze(artifact, evidence)
+    values = _values(observations)
+    susp = values["archive.iso9660.susp"]
+    assert susp["detected"] is True
+    assert susp["skip_bytes"] == 2
+    assert susp["skipped_prefix_raw_hex"] == "0000"
+    assert susp["extension_identifiers"] == ["RRIP_1991A"]
+    assert susp["rock_ridge_detected"] is True
+    assert values["archive.iso9660.rock_ridge_detected"] is True
+    assert values["archive.iso9660.susp_errors"] == []
+
+    entries = values["archive.iso9660.directory_entries"]
+    directory = next(item for item in entries if item.get("file_identifier") == "LONGDIR")
+    nested = next(item for item in entries if item.get("file_identifier") == "FLAG000.TXT;1")
+    symlink = next(item for item in entries if item.get("file_identifier") == "LINK.;1")
+    assert directory["logical_name"] == "LONGDIR"
+    assert directory["rock_ridge_name"] == "Evidence Directory"
+    assert directory["archive_name"] == "Evidence Directory"
+    assert directory["archive_path"] == "Evidence Directory"
+    assert directory["rock_ridge_posix"] == {
+        "mode": 0o040750,
+        "permissions": "0o0750",
+        "file_type": "directory",
+        "link_count": 2,
+        "user_id": 1000,
+        "group_id": 1000,
+        "serial_number": 1,
+        "source_system_use_offset": 2,
+    }
+    assert nested["logical_name"] == "FLAG000.TXT"
+    assert nested["rock_ridge_name"] == "Flag Evidence.txt"
+    assert nested["rock_ridge_name_chain_complete"] is True
+    assert nested["rock_ridge_name_encoding_valid"] is True
+    assert nested["rock_ridge_name_path_safe"] is True
+    assert nested["archive_path"] == "Evidence Directory/Flag Evidence.txt"
+    assert nested["data_length"] == len(payload)
+    assert nested["rock_ridge_posix"]["file_type"] == "regular"
+    assert nested["rock_ridge_posix"]["permissions"] == "0o0640"
+    assert nested["containing_directory_identity"]["logical_name"] == "Evidence Directory"
+    assert nested["extraction_eligible"] is True
+    for susp_entry in nested["susp_entries"]:
+        assert susp_entry["absolute_offset"] == (
+            nested["record_offset"]
+            + nested["system_use_offset_in_record"]
+            + susp_entry["system_use_offset"]
+        )
+
+    assert symlink["archive_path"] == "Evidence Directory/latest"
+    assert symlink["rock_ridge_posix"]["file_type"] == "symlink"
+    assert symlink["rock_ridge_symlink"] is True
+    assert symlink["extraction_eligible"] is False
+    sl_entry = symlink["rock_ridge_symlink_entries"][0]
+    assert sl_entry["valid"] is True
+    assert sl_entry["components"][0]["parent"] is True
+    assert sl_entry["components"][1]["text"] == "secret"
+    assert symlink["rock_ridge_symlink_targets"] == [{
+        "target": "../secret",
+        "complete": True,
+        "source_absolute_offset": sl_entry["absolute_offset"],
+    }]
+    assert values["archive.iso9660.rock_ridge_entry_count"] == 7
+    assert values["archive.iso9660.rock_ridge_symlink_count"] == 1
+    profile = ProfileEngine().evaluate(artifact, observations)
+    assert any(item.category == "archive_link_metadata" for item in profile.findings)
+    assert not any(item.category == "iso9660_susp_anomaly" for item in profile.findings)
+
+    unsafe_image, _ = _iso9660_with_rock_ridge(unsafe_file_name=True)
+    unsafe_path = tmp_path / "unsafe-rock-ridge-name.iso"
+    unsafe_path.write_bytes(unsafe_image)
+    unsafe_artifact = _artifact(unsafe_path)
+    unsafe_observations = GenericTriageEngine().analyze(unsafe_artifact, unsafe_path)
+    unsafe_values = _values(unsafe_observations)
+    unsafe_entry = next(
+        item for item in unsafe_values["archive.iso9660.directory_entries"]
+        if item.get("file_identifier") == "FLAG000.TXT;1"
+    )
+    assert unsafe_entry["rock_ridge_name"] == "../escape.txt"
+    assert unsafe_entry["rock_ridge_name_path_safe"] is False
+    assert unsafe_entry["rock_ridge_name_usable"] is False
+    assert unsafe_entry["archive_path"] == "Evidence Directory/FLAG000.TXT"
+    assert unsafe_entry["extraction_eligible"] is False
+    assert any(
+        "unsafe_rock_ridge_name" in item["rock_ridge_anomalies"]
+        for item in unsafe_values["archive.iso9660.susp_errors"]
+    )
+    unsafe_profile = ProfileEngine().evaluate(unsafe_artifact, unsafe_observations)
+    assert any(
+        item.category == "iso9660_susp_anomaly"
+        for item in unsafe_profile.findings
+    )
+    assert any(
+        item.category == "archive_unsafe_member_path"
+        for item in unsafe_profile.findings
     )
 
 

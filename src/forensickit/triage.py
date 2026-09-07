@@ -1197,6 +1197,37 @@ class GenericTriageEngine:
                     if root_entry_limit_reached:
                         root_scan_truncated = True
 
+        susp_config: dict[str, object] = {
+            "detected": False,
+            "skip_bytes": None,
+            "source_record_offset": None,
+            "extension_identifiers": [],
+            "rock_ridge_detected": False,
+        }
+        susp_errors: list[dict[str, object]] = []
+        root_self_entry = next(
+            (entry for entry in root_entries if entry.get("logical_name") == "."),
+            None,
+        )
+        if root_self_entry is not None:
+            susp_config = self._iso9660_susp_configuration(root_self_entry)
+        susp_skip = susp_config.get("skip_bytes")
+        rock_ridge_detected = susp_config.get("rock_ridge_detected") is True
+        if susp_config.get("detected") is True and isinstance(susp_skip, int):
+            for entry in root_entries:
+                susp_error, rrip_anomalies = self._iso9660_enrich_susp_record(
+                    entry,
+                    skip_bytes=susp_skip,
+                    rock_ridge_detected=rock_ridge_detected,
+                )
+                if susp_error or rrip_anomalies:
+                    susp_errors.append({
+                        "record_offset": entry.get("record_offset"),
+                        "file_identifier": entry.get("file_identifier"),
+                        "susp_error": susp_error,
+                        "rock_ridge_anomalies": rrip_anomalies,
+                    })
+
         all_directory_entries = list(root_entries)
         directory_inventory: list[dict[str, object]] = []
         directory_traversal_errors: list[dict[str, object]] = []
@@ -1229,7 +1260,9 @@ class GenericTriageEngine:
                     entry["containing_directory_identity"] = root_identity
                     entry["directory_identity_lineage"] = []
                     if entry.get("logical_name") not in {".", ".."}:
-                        entry["archive_path"] = entry.get("logical_name")
+                        entry["archive_path"] = entry.get(
+                            "archive_name", entry.get("logical_name")
+                        )
 
                 queue: list[
                     tuple[
@@ -1251,6 +1284,27 @@ class GenericTriageEngine:
                         or entry.get("valid") is not True
                     ):
                         return
+                    if entry.get("rock_ridge_type_mismatch") is True:
+                        entry["directory_traversal"] = "rock_ridge_type_mismatch"
+                        directory_traversal_errors.append({
+                            "reason": "rock_ridge_type_mismatch",
+                            "entry": entry,
+                        })
+                        return
+                    if entry.get("susp_error"):
+                        entry["directory_traversal"] = "susp_anomaly"
+                        directory_traversal_errors.append({
+                            "reason": "susp_anomaly",
+                            "entry": entry,
+                        })
+                        return
+                    if entry.get("rock_ridge_name_usable") is False:
+                        entry["directory_traversal"] = "rock_ridge_name_unusable"
+                        directory_traversal_errors.append({
+                            "reason": "rock_ridge_name_unusable",
+                            "entry": entry,
+                        })
+                        return
                     if (
                         entry.get("multi_extent") is True
                         or entry.get("file_unit_size") not in {0, None}
@@ -1264,7 +1318,7 @@ class GenericTriageEngine:
                         return
                     extent = (entry.get("data_offset"), entry.get("data_length"))
                     identity = {
-                        "logical_name": entry.get("logical_name"),
+                        "logical_name": entry.get("archive_name", entry.get("logical_name")),
                         "file_identifier": entry.get("file_identifier"),
                         "directory_record_offset": entry.get("record_offset"),
                         "extent_block": entry.get("extent_block"),
@@ -1360,6 +1414,20 @@ class GenericTriageEngine:
                         declared_volume_bytes=declared_volume_bytes,
                         entry_limit=remaining_entries,
                     )
+                    if susp_config.get("detected") is True and isinstance(susp_skip, int):
+                        for child_entry in child_entries:
+                            susp_error, rrip_anomalies = self._iso9660_enrich_susp_record(
+                                child_entry,
+                                skip_bytes=susp_skip,
+                                rock_ridge_detected=rock_ridge_detected,
+                            )
+                            if susp_error or rrip_anomalies:
+                                susp_errors.append({
+                                    "record_offset": child_entry.get("record_offset"),
+                                    "file_identifier": child_entry.get("file_identifier"),
+                                    "susp_error": susp_error,
+                                    "rock_ridge_anomalies": rrip_anomalies,
+                                })
                     processed_directories += 1
                     directory_entry["directory_traversal"] = (
                         "parsed" if child_error is None and not child_limit else "parsed_with_anomaly"
@@ -1375,7 +1443,9 @@ class GenericTriageEngine:
                                         str(identity.get("logical_name"))
                                         for identity in lineage
                                     ],
-                                    str(child_entry.get("logical_name")),
+                                    str(child_entry.get(
+                                        "archive_name", child_entry.get("logical_name")
+                                    )),
                                 ]
                             )
                     all_directory_entries.extend(child_entries)
@@ -1439,6 +1509,14 @@ class GenericTriageEngine:
             if entry.get("file_type") == "regular"
             and entry.get("logical_name") not in {".", ".."}
         ]
+        rock_ridge_entries = [
+            entry for entry in all_directory_entries
+            if entry.get("rock_ridge_present") is True
+        ]
+        rock_ridge_symlinks = [
+            entry for entry in all_directory_entries
+            if entry.get("rock_ridge_symlink") is True
+        ]
         return [
             self._observation(artifact, "archive.iso9660.signature", True),
             self._observation(artifact, "archive.iso9660.physical_descriptor_block_size", physical_block_size),
@@ -1463,6 +1541,13 @@ class GenericTriageEngine:
             self._observation(artifact, "archive.iso9660.directory_limit", directory_limit),
             self._observation(artifact, "archive.iso9660.directory_traversal_truncated", directory_traversal_truncated),
             self._observation(artifact, "archive.iso9660.directory_traversal_errors", directory_traversal_errors),
+            self._observation(artifact, "archive.iso9660.susp", susp_config),
+            self._observation(artifact, "archive.iso9660.susp_errors", susp_errors),
+            self._observation(artifact, "archive.iso9660.rock_ridge_detected", rock_ridge_detected),
+            self._observation(artifact, "archive.iso9660.rock_ridge_entries", rock_ridge_entries),
+            self._observation(artifact, "archive.iso9660.rock_ridge_entry_count", len(rock_ridge_entries)),
+            self._observation(artifact, "archive.iso9660.rock_ridge_symlinks", rock_ridge_symlinks),
+            self._observation(artifact, "archive.iso9660.rock_ridge_symlink_count", len(rock_ridge_symlinks)),
             self._observation(artifact, "archive.container_kind", "iso9660"),
         ]
 
@@ -1525,6 +1610,523 @@ class GenericTriageEngine:
                 first_error = record_error
             cursor += record_length
         return entries, first_error, entry_limit_reached
+
+    @staticmethod
+    def _iso9660_susp_configuration(record: dict[str, object]) -> dict[str, object]:
+        """Recognize SUSP only from its mandatory marker in the root self entry."""
+        config: dict[str, object] = {
+            "detected": False,
+            "skip_bytes": None,
+            "source_record_offset": record.get("record_offset"),
+            "extension_identifiers": [],
+            "rock_ridge_detected": False,
+        }
+        raw_hex = record.get("system_use_raw_hex")
+        if not isinstance(raw_hex, str):
+            return config
+        try:
+            system_use = bytes.fromhex(raw_hex)
+        except ValueError:
+            return config
+        for skip_bytes in range(max(0, len(system_use) - 6)):
+            if (
+                system_use[skip_bytes:skip_bytes + 2] != b"SP"
+                or system_use[skip_bytes + 2] != 7
+                or system_use[skip_bytes + 3] != 1
+                or system_use[skip_bytes + 4:skip_bytes + 6] != b"\xbe\xef"
+                or system_use[skip_bytes + 6] != skip_bytes
+            ):
+                continue
+            entries, parse_error = GenericTriageEngine._iso9660_susp_records(
+                system_use, skip_bytes=skip_bytes,
+            )
+            extension_identifiers = [
+                str(entry["extension_identifier"])
+                for entry in entries
+                if entry.get("signature") == "ER"
+                and entry.get("valid") is True
+                and isinstance(entry.get("extension_identifier"), str)
+            ]
+            rrip_signatures = {
+                str(entry.get("signature")) for entry in entries
+                if entry.get("signature") in {
+                    "RR", "PX", "NM", "SL", "TF", "CL", "PL", "RE", "PN",
+                }
+            }
+            rock_ridge_detected = bool(rrip_signatures) or any(
+                identifier == "RRIP_1991A" or identifier.startswith("IEEE_P1282")
+                for identifier in extension_identifiers
+            )
+            config.update({
+                "detected": True,
+                "skip_bytes": skip_bytes,
+                "source_record_offset": record.get("record_offset"),
+                "sp_system_use_offset": skip_bytes,
+                "skipped_prefix_raw_hex": system_use[:skip_bytes].hex(),
+                "extension_identifiers": extension_identifiers,
+                "root_entry_signatures": [
+                    entry.get("signature") for entry in entries
+                ],
+                "root_entry_parse_error": parse_error,
+                "rock_ridge_signatures": sorted(rrip_signatures),
+                "rock_ridge_detected": rock_ridge_detected,
+            })
+            return config
+        return config
+
+    @staticmethod
+    def _iso9660_susp_records(
+        system_use: bytes, *, skip_bytes: int,
+    ) -> tuple[list[dict[str, object]], str | None]:
+        """Frame inline SUSP entries while retaining every bounded raw field."""
+        entries: list[dict[str, object]] = []
+        first_error: str | None = None
+        cursor = skip_bytes
+
+        def fail(entry: dict[str, object], message: str) -> None:
+            nonlocal first_error
+            entry["valid"] = False
+            entry.setdefault("errors", []).append(message)
+            if first_error is None:
+                first_error = message
+
+        while cursor < len(system_use):
+            if not any(system_use[cursor:]):
+                break
+            if cursor + 4 > len(system_use):
+                first_error = first_error or (
+                    f"truncated SUSP entry header at system-use offset {cursor}"
+                )
+                break
+            signature_raw = system_use[cursor:cursor + 2]
+            entry_length = system_use[cursor + 2]
+            version = system_use[cursor + 3]
+            if entry_length < 4:
+                first_error = first_error or (
+                    f"invalid SUSP entry length {entry_length} at system-use offset {cursor}"
+                )
+                break
+            if cursor + entry_length > len(system_use):
+                first_error = first_error or (
+                    f"truncated SUSP entry at system-use offset {cursor}: "
+                    f"declared length {entry_length}"
+                )
+                break
+            raw = system_use[cursor:cursor + entry_length]
+            signature = signature_raw.decode("ascii", errors="replace")
+            entry: dict[str, object] = {
+                "signature": signature,
+                "signature_raw_hex": signature_raw.hex(),
+                "length": entry_length,
+                "version": version,
+                "system_use_offset": cursor,
+                "raw_hex": raw.hex(),
+                "data_raw_hex": raw[4:].hex(),
+                "valid": version == 1,
+                "errors": [],
+            }
+            if version != 1:
+                fail(entry, f"unsupported SUSP {signature} version {version}")
+
+            if signature == "SP":
+                if entry_length != 7 or raw[4:6] != b"\xbe\xef":
+                    fail(entry, "invalid SUSP SP marker")
+                else:
+                    entry["check_bytes_raw_hex"] = raw[4:6].hex()
+                    entry["skip_bytes"] = raw[6]
+            elif signature == "ER":
+                if entry_length < 8:
+                    fail(entry, "truncated SUSP ER entry")
+                else:
+                    identifier_length = raw[4]
+                    descriptor_length = raw[5]
+                    source_length = raw[6]
+                    expected_length = 8 + identifier_length + descriptor_length + source_length
+                    entry.update({
+                        "identifier_length": identifier_length,
+                        "descriptor_length": descriptor_length,
+                        "source_length": source_length,
+                        "extension_version": raw[7],
+                    })
+                    if expected_length != entry_length:
+                        fail(entry, "invalid SUSP ER string lengths")
+                    else:
+                        identifier_end = 8 + identifier_length
+                        descriptor_end = identifier_end + descriptor_length
+                        try:
+                            extension_identifier = raw[8:identifier_end].decode("ascii")
+                            extension_descriptor = raw[
+                                identifier_end:descriptor_end
+                            ].decode("utf-8")
+                            extension_source = raw[descriptor_end:].decode("utf-8")
+                        except UnicodeDecodeError:
+                            fail(entry, "invalid SUSP ER text encoding")
+                        else:
+                            entry.update({
+                                "extension_identifier": extension_identifier,
+                                "extension_descriptor": extension_descriptor,
+                                "extension_source": extension_source,
+                            })
+            elif signature == "RR":
+                if entry_length != 5:
+                    fail(entry, "invalid RRIP RR entry length")
+                else:
+                    flags = raw[4]
+                    flag_names = (
+                        "PX", "PN", "SL", "NM", "CL", "PL", "RE", "TF",
+                    )
+                    entry["flags_raw"] = f"0x{flags:02x}"
+                    entry["fields_present"] = [
+                        name for bit, name in enumerate(flag_names) if flags & (1 << bit)
+                    ]
+            elif signature == "NM":
+                if entry_length < 5:
+                    fail(entry, "truncated RRIP NM entry")
+                else:
+                    flags = raw[4]
+                    name_raw = raw[5:]
+                    entry.update({
+                        "flags_raw": f"0x{flags:02x}",
+                        "continuation": bool(flags & 0x01),
+                        "current": bool(flags & 0x02),
+                        "parent": bool(flags & 0x04),
+                        "root": bool(flags & 0x08),
+                        "name_raw_hex": name_raw.hex(),
+                    })
+                    try:
+                        entry["name"] = name_raw.decode("utf-8")
+                        entry["name_encoding_valid"] = True
+                    except UnicodeDecodeError:
+                        entry["name"] = name_raw.decode("utf-8", errors="replace")
+                        entry["name_encoding_valid"] = False
+            elif signature == "PX":
+                if entry_length not in {36, 44}:
+                    fail(entry, "invalid RRIP PX entry length")
+                else:
+                    field_names = ("mode", "link_count", "user_id", "group_id")
+                    if entry_length == 44:
+                        field_names += ("serial_number",)
+                    for field_index, field_name in enumerate(field_names):
+                        field_offset = 4 + field_index * 8
+                        little = int.from_bytes(raw[field_offset:field_offset + 4], "little")
+                        big = int.from_bytes(raw[field_offset + 4:field_offset + 8], "big")
+                        entry[field_name] = little
+                        entry[f"{field_name}_big_endian"] = big
+                        entry[f"{field_name}_both_endian_match"] = little == big
+                        if little != big:
+                            fail(entry, f"RRIP PX {field_name} both-endian mismatch")
+            elif signature == "SL":
+                if entry_length < 5:
+                    fail(entry, "truncated RRIP SL entry")
+                else:
+                    entry_flags = raw[4]
+                    component_cursor = 5
+                    components: list[dict[str, object]] = []
+                    while component_cursor < entry_length:
+                        if component_cursor + 2 > entry_length:
+                            fail(entry, "truncated RRIP SL component header")
+                            break
+                        component_flags = raw[component_cursor]
+                        component_length = raw[component_cursor + 1]
+                        component_end = component_cursor + 2 + component_length
+                        if component_end > entry_length:
+                            fail(entry, "truncated RRIP SL component")
+                            break
+                        component_raw = raw[component_cursor + 2:component_end]
+                        component: dict[str, object] = {
+                            "flags_raw": f"0x{component_flags:02x}",
+                            "continuation": bool(component_flags & 0x01),
+                            "current": bool(component_flags & 0x02),
+                            "parent": bool(component_flags & 0x04),
+                            "root": bool(component_flags & 0x08),
+                            "volume_root": bool(component_flags & 0x10),
+                            "host": bool(component_flags & 0x20),
+                            "length": component_length,
+                            "raw_hex": component_raw.hex(),
+                        }
+                        try:
+                            component["text"] = component_raw.decode("utf-8")
+                            component["text_encoding_valid"] = True
+                        except UnicodeDecodeError:
+                            component["text"] = component_raw.decode(
+                                "utf-8", errors="replace"
+                            )
+                            component["text_encoding_valid"] = False
+                        components.append(component)
+                        component_cursor = component_end
+                    entry.update({
+                        "flags_raw": f"0x{entry_flags:02x}",
+                        "continuation": bool(entry_flags & 0x01),
+                        "components": components,
+                    })
+            elif signature in {"CE", "CL", "PL"}:
+                expected_length = 28 if signature == "CE" else 12
+                if entry_length != expected_length:
+                    fail(entry, f"invalid SUSP {signature} entry length")
+                else:
+                    field_names = (
+                        ("continuation_block", "continuation_offset", "continuation_length")
+                        if signature == "CE" else ("child_or_parent_block",)
+                    )
+                    for field_index, field_name in enumerate(field_names):
+                        field_offset = 4 + field_index * 8
+                        little = int.from_bytes(raw[field_offset:field_offset + 4], "little")
+                        big = int.from_bytes(raw[field_offset + 4:field_offset + 8], "big")
+                        entry[field_name] = little
+                        entry[f"{field_name}_big_endian"] = big
+                        entry[f"{field_name}_both_endian_match"] = little == big
+                        if little != big:
+                            fail(entry, f"SUSP {signature} {field_name} both-endian mismatch")
+            elif signature == "RE":
+                if entry_length != 4:
+                    fail(entry, "invalid RRIP RE entry length")
+            elif signature == "ST" and entry_length != 4:
+                fail(entry, "invalid SUSP ST entry length")
+
+            entries.append(entry)
+            cursor += entry_length
+            if signature == "ST":
+                break
+        return entries, first_error
+
+    @staticmethod
+    def _iso9660_enrich_susp_record(
+        record: dict[str, object], *, skip_bytes: int, rock_ridge_detected: bool,
+    ) -> tuple[str | None, list[str]]:
+        """Attach inline SUSP/RRIP semantics without dereferencing continuation areas."""
+        raw_hex = record.get("system_use_raw_hex")
+        if not isinstance(raw_hex, str):
+            return "missing ISO system-use bytes", []
+        try:
+            system_use = bytes.fromhex(raw_hex)
+        except ValueError:
+            return "invalid ISO system-use hex", []
+        if not system_use:
+            record.update({
+                "susp_skip_bytes": skip_bytes,
+                "susp_skipped_prefix_raw_hex": "",
+                "susp_entries": [],
+                "susp_error": None,
+                "susp_continuation_entries": [],
+                "susp_continuation_unparsed": False,
+                "rock_ridge_present": False,
+                "rock_ridge_symlink": False,
+                "rock_ridge_anomalies": [],
+            })
+            return None, []
+        if len(system_use) < skip_bytes:
+            record.update({
+                "susp_entries": [],
+                "susp_error": "system-use area is shorter than the declared SUSP skip",
+                "rock_ridge_present": False,
+            })
+            return str(record["susp_error"]), []
+        entries, susp_error = GenericTriageEngine._iso9660_susp_records(
+            system_use, skip_bytes=skip_bytes,
+        )
+        record_offset = record.get("record_offset")
+        system_use_offset_in_record = record.get("system_use_offset_in_record")
+        for entry in entries:
+            system_use_offset = entry.get("system_use_offset")
+            if (
+                isinstance(record_offset, int)
+                and isinstance(system_use_offset_in_record, int)
+                and isinstance(system_use_offset, int)
+            ):
+                entry["record_relative_offset"] = (
+                    system_use_offset_in_record + system_use_offset
+                )
+                entry["absolute_offset"] = (
+                    record_offset + system_use_offset_in_record + system_use_offset
+                )
+        rrip_signatures = {"RR", "PX", "NM", "SL", "TF", "CL", "PL", "RE", "PN"}
+        rrip_entries = [
+            entry for entry in entries if entry.get("signature") in rrip_signatures
+        ]
+        continuation_entries = [
+            entry for entry in entries if entry.get("signature") == "CE"
+        ]
+        anomalies: list[str] = []
+        record.update({
+            "susp_skip_bytes": skip_bytes,
+            "susp_skipped_prefix_raw_hex": system_use[:skip_bytes].hex(),
+            "susp_entries": entries,
+            "susp_error": susp_error,
+            "susp_continuation_entries": continuation_entries,
+            "susp_continuation_unparsed": bool(continuation_entries),
+            "rock_ridge_present": rock_ridge_detected and bool(rrip_entries),
+        })
+
+        px_entry = next(
+            (
+                entry for entry in rrip_entries
+                if entry.get("signature") == "PX" and entry.get("valid") is True
+            ),
+            None,
+        )
+        if px_entry is not None and isinstance(px_entry.get("mode"), int):
+            mode = int(px_entry["mode"])
+            mode_type = mode & 0o170000
+            file_type = {
+                0o010000: "fifo",
+                0o020000: "character_device",
+                0o040000: "directory",
+                0o060000: "block_device",
+                0o100000: "regular",
+                0o120000: "symlink",
+                0o140000: "socket",
+            }.get(mode_type, "unknown")
+            record["rock_ridge_posix"] = {
+                "mode": mode,
+                "permissions": f"0o{mode & 0o7777:04o}",
+                "file_type": file_type,
+                "link_count": px_entry.get("link_count"),
+                "user_id": px_entry.get("user_id"),
+                "group_id": px_entry.get("group_id"),
+                "serial_number": px_entry.get("serial_number"),
+                "source_system_use_offset": px_entry.get("system_use_offset"),
+            }
+            iso_file_type = record.get("file_type")
+            type_mismatch = (
+                (file_type == "directory" and iso_file_type != "directory")
+                or (file_type != "directory" and iso_file_type == "directory")
+            )
+            record["rock_ridge_type_mismatch"] = type_mismatch
+            if type_mismatch:
+                anomalies.append("rock_ridge_iso_file_type_mismatch")
+            if file_type not in {"regular", "directory"}:
+                record["rock_ridge_non_regular"] = True
+
+        nm_entries = [
+            entry for entry in rrip_entries if entry.get("signature") == "NM"
+        ]
+        if nm_entries:
+            special_name = None
+            if len(nm_entries) == 1 and nm_entries[0].get("valid") is True:
+                nm_flags = int(str(nm_entries[0].get("flags_raw", "0x00")), 16)
+                if nm_flags == 0x02 and record.get("logical_name") == ".":
+                    special_name = "."
+                elif nm_flags == 0x04 and record.get("logical_name") == "..":
+                    special_name = ".."
+            normal_flags = all(
+                int(str(entry.get("flags_raw", "0x00")), 16) & ~0x01 == 0
+                for entry in nm_entries
+            )
+            chain_complete = (
+                special_name is not None
+                or (
+                    all(entry.get("valid") is True for entry in nm_entries)
+                    and normal_flags
+                    and all(entry.get("continuation") is True for entry in nm_entries[:-1])
+                    and nm_entries[-1].get("continuation") is False
+                )
+            )
+            name_raw = b"".join(
+                bytes.fromhex(str(entry.get("name_raw_hex", "")))
+                for entry in nm_entries
+            )
+            if special_name is not None:
+                alternate_name = special_name
+                encoding_valid = True
+            else:
+                try:
+                    alternate_name = name_raw.decode("utf-8")
+                    encoding_valid = True
+                except UnicodeDecodeError:
+                    alternate_name = name_raw.decode("utf-8", errors="replace")
+                    encoding_valid = False
+            normalized_name = alternate_name.replace("\\", "/")
+            path_safe = bool(
+                alternate_name in {".", ".."}
+                or (
+                    alternate_name
+                    and "\x00" not in alternate_name
+                    and not normalized_name.startswith("/")
+                    and re.match(r"^[A-Za-z]:/", normalized_name) is None
+                    and ".." not in normalized_name.split("/")
+                    and "/" not in normalized_name
+                )
+            )
+            name_usable = chain_complete and encoding_valid and path_safe
+            record.update({
+                "rock_ridge_name_raw_hex": name_raw.hex(),
+                "rock_ridge_name": alternate_name,
+                "rock_ridge_name_encoding_valid": encoding_valid,
+                "rock_ridge_name_chain_complete": chain_complete,
+                "rock_ridge_name_path_safe": path_safe,
+                "rock_ridge_name_usable": name_usable,
+            })
+            if not encoding_valid:
+                anomalies.append("rock_ridge_name_encoding")
+            if chain_complete and not path_safe:
+                anomalies.append("unsafe_rock_ridge_name")
+            if (
+                name_usable
+                and alternate_name not in {".", ".."}
+                and rock_ridge_detected
+            ):
+                record["archive_name"] = alternate_name
+            elif not chain_complete and not continuation_entries:
+                anomalies.append("invalid_rock_ridge_name_chain")
+
+        sl_entries = [
+            entry for entry in rrip_entries if entry.get("signature") == "SL"
+        ]
+        rock_ridge_symlink = rock_ridge_detected and (
+            bool(sl_entries)
+            or record.get("rock_ridge_posix", {}).get("file_type") == "symlink"
+        )
+        if sl_entries:
+            record["rock_ridge_symlink_entries"] = sl_entries
+            symlink_targets: list[dict[str, object]] = []
+            for sl_entry in sl_entries:
+                target_parts: list[str] = []
+                absolute = False
+                components = sl_entry.get("components", [])
+                if not isinstance(components, list):
+                    components = []
+                for component in components:
+                    if not isinstance(component, dict):
+                        continue
+                    if component.get("root") is True or component.get("volume_root") is True:
+                        absolute = True
+                    elif component.get("current") is True:
+                        target_parts.append(".")
+                    elif component.get("parent") is True:
+                        target_parts.append("..")
+                    elif component.get("host") is True:
+                        target_parts.append(f"<host:{component.get('text', '')}>")
+                    else:
+                        target_parts.append(str(component.get("text", "")))
+                target = "/".join(target_parts)
+                if absolute:
+                    target = f"/{target}"
+                symlink_targets.append({
+                    "target": target,
+                    "complete": (
+                        sl_entry.get("valid") is True
+                        and sl_entry.get("continuation") is False
+                        and all(
+                            isinstance(component, dict)
+                            and component.get("continuation") is False
+                            and component.get("text_encoding_valid") is True
+                            for component in components
+                        )
+                    ),
+                    "source_absolute_offset": sl_entry.get("absolute_offset"),
+                })
+            record["rock_ridge_symlink_targets"] = symlink_targets
+        record["rock_ridge_symlink"] = rock_ridge_symlink
+        if (
+            rock_ridge_symlink
+            or record.get("rock_ridge_non_regular") is True
+            or record.get("rock_ridge_type_mismatch") is True
+            or record.get("rock_ridge_name_usable") is False
+            or (susp_error is not None and rock_ridge_detected)
+        ):
+            record["extraction_eligible"] = False
+        record["rock_ridge_anomalies"] = anomalies
+        return susp_error, anomalies
 
     @staticmethod
     def _iso9660_directory_record(
@@ -1627,6 +2229,7 @@ class GenericTriageEngine:
             "identifier_raw_hex": raw_identifier.hex(),
             "file_identifier": identifier,
             "logical_name": logical_name,
+            "archive_name": logical_name,
             "version": version,
             "identifier_padding_length": identifier_padding,
             "path_safe": path_safe,
