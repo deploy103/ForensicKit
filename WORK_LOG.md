@@ -1,5 +1,18 @@
 # ForensicKit Work Log
 
+## 2026-09-07 11:18 KST
+
+### ISO 9660 path-table copy validation
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/profiles/archive.py`, `tests/test_triage.py`, and `tests/test_engine_pipeline.py`.
+- A nonzero primary `path_table_size` now drives independent mandatory and present optional Type-L/Type-M reads under configured signature, 8-MiB, and 4,096-entry bounds. Each entry preserves table/absolute/relative offsets, raw bytes, byte order, directory number, identifier, padding, extended-attribute blocks, extent/data offset, parent number, constructed bounded path, and individual encoding/path/parent/range/root checks; each raw table also retains a SHA-256 digest.
+- The mandatory little-/big-endian semantic entry sequences and every present optional copy are compared without choosing an authoritative table. Only fully valid identical copies are reconciled to the already validated active directory walk by exact extent block and original ISO identifier; unique directory-record offsets/paths and unmatched counts remain explicit. Divergent, invalid, or unreconciled tables produce a dedicated `iso9660_path_table_anomaly` finding and never alter extraction paths.
+- Synthetic fixtures cover a root/subdirectory Type-L/Type-M pair, odd root padding, exact entry offsets, parent/path construction, active-record reconciliation, and a big-endian extent divergence. The nested ISO AUTO E2E confirms comparison/reconciliation and raw hashes persist in `report.json` while normal child extraction remains unchanged. Focused triage/Engine regressions passed: 161 passed, 0 failed. The full direct synthetic suite passed: 322 passed, 0 failed. `python -m compileall -q src tests scripts` and `git diff --check` passed.
+
+### Next
+
+- Resolve RRIP `CE` continuation areas under a separate total byte/count budget, rejecting cycles/overlaps and retaining inline-to-continuation provenance before accepting continued `NM`/`SL` data.
+
 ## 2026-09-07 11:10 KST
 
 ### El Torito section catalog traversal

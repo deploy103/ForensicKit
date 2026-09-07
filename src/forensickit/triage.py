@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import math
 import plistlib
 import re
@@ -1622,6 +1623,23 @@ class GenericTriageEngine:
                         "directory_limit": directory_limit,
                     })
 
+        path_tables: list[dict[str, object]] = []
+        path_table_comparison: dict[str, object] = {
+            "available": False, "consistent": None,
+            "reason": "primary_volume_descriptor_invalid_or_unavailable",
+        }
+        path_table_reconciliation: list[dict[str, object]] = []
+        if pvd is not None and pvd.get("valid") is True:
+            (
+                path_tables,
+                path_table_comparison,
+                path_table_reconciliation,
+            ) = self._iso9660_path_tables(
+                path,
+                evidence_size=size,
+                pvd=pvd,
+                directory_entries=all_directory_entries,
+            )
         regular_files = [
             entry for entry in all_directory_entries
             if entry.get("file_type") == "regular"
@@ -1770,6 +1788,9 @@ class GenericTriageEngine:
             self._observation(artifact, "archive.iso9660.el_torito_catalogs", el_torito_catalogs),
             self._observation(artifact, "archive.iso9660.el_torito_errors", el_torito_errors),
             self._observation(artifact, "archive.iso9660.el_torito_boot_images", el_torito_boot_images),
+            self._observation(artifact, "archive.iso9660.path_tables", path_tables),
+            self._observation(artifact, "archive.iso9660.path_table_comparison", path_table_comparison),
+            self._observation(artifact, "archive.iso9660.path_table_reconciliation", path_table_reconciliation),
             self._observation(artifact, "archive.container_kind", "iso9660"),
         ]
 
@@ -2214,6 +2235,316 @@ class GenericTriageEngine:
             if section_error:
                 errors.append({"reason": "section_structure", "catalog": catalog})
         return catalogs, errors, boot_images
+
+    def _iso9660_path_tables(
+        self,
+        path: Path,
+        *,
+        evidence_size: int,
+        pvd: dict[str, object],
+        directory_entries: list[dict[str, object]],
+    ) -> tuple[list[dict[str, object]], dict[str, object], list[dict[str, object]]]:
+        """Parse bounded primary path-table copies without selecting a divergent copy."""
+        tables: list[dict[str, object]] = []
+        reconciliation: list[dict[str, object]] = []
+        path_table_size = pvd.get("path_table_size")
+        block_size = pvd.get("logical_block_size")
+        declared_volume_bytes = pvd.get("declared_volume_bytes")
+        if (
+            not isinstance(path_table_size, int)
+            or not isinstance(block_size, int)
+            or not isinstance(declared_volume_bytes, int)
+            or path_table_size <= 0
+        ):
+            return tables, {
+                "available": False,
+                "consistent": None,
+                "reason": "path_table_size_is_zero_or_invalid",
+            }, reconciliation
+        byte_limit = min(self.limits.signature_scan_bytes, 8 * _MIB)
+        entry_limit = min(self.limits.max_artifact_count + 64, 4_096)
+        locations = (
+            ("little", "mandatory", pvd.get("little_endian_path_table_block")),
+            ("little", "optional", pvd.get("optional_little_endian_path_table_block")),
+            ("big", "mandatory", pvd.get("big_endian_path_table_block")),
+            ("big", "optional", pvd.get("optional_big_endian_path_table_block")),
+        )
+        for byte_order, copy_kind, table_block in locations:
+            if copy_kind == "optional" and table_block == 0:
+                continue
+            table: dict[str, object] = {
+                "byte_order": byte_order,
+                "copy_kind": copy_kind,
+                "table_block": table_block,
+                "declared_size": path_table_size,
+                "byte_limit": byte_limit,
+                "entry_limit": entry_limit,
+                "entries": [],
+                "error": None,
+                "truncated": False,
+                "valid": False,
+            }
+            tables.append(table)
+            if not isinstance(table_block, int) or table_block <= 0:
+                table["error"] = "required path-table block is zero or invalid"
+                continue
+            table_offset = table_block * block_size
+            table["table_offset"] = table_offset
+            if path_table_size > byte_limit:
+                table["error"] = "path table exceeds configured byte limit"
+                table["truncated"] = True
+                continue
+            if (
+                table_offset < 0
+                or table_offset + path_table_size > evidence_size
+                or table_offset + path_table_size > declared_volume_bytes
+            ):
+                table["error"] = "path table exceeds evidence or declared volume"
+                continue
+            try:
+                with path.open("rb") as stream:
+                    stream.seek(table_offset)
+                    raw = stream.read(path_table_size)
+            except OSError as exc:
+                table["error"] = str(exc)[:2_000]
+                continue
+            table["bytes_read"] = len(raw)
+            table["raw_sha256"] = hashlib.sha256(raw).hexdigest()
+            if len(raw) != path_table_size:
+                table["error"] = "truncated path-table read"
+                table["truncated"] = True
+                continue
+            entries: list[dict[str, object]] = []
+            cursor = 0
+            first_error: str | None = None
+            while cursor < len(raw):
+                if len(entries) >= entry_limit:
+                    first_error = "path-table entry limit reached"
+                    table["truncated"] = True
+                    break
+                if cursor + 8 > len(raw):
+                    first_error = f"truncated path-table header at offset {table_offset + cursor}"
+                    break
+                identifier_length = raw[cursor]
+                extended_attribute_blocks = raw[cursor + 1]
+                entry_length = 8 + identifier_length + (identifier_length % 2)
+                if identifier_length == 0 or cursor + entry_length > len(raw):
+                    first_error = f"invalid path-table entry at offset {table_offset + cursor}"
+                    break
+                if byte_order == "little":
+                    extent_block = int.from_bytes(raw[cursor + 2:cursor + 6], "little")
+                    parent_number = int.from_bytes(raw[cursor + 6:cursor + 8], "little")
+                else:
+                    extent_block = int.from_bytes(raw[cursor + 2:cursor + 6], "big")
+                    parent_number = int.from_bytes(raw[cursor + 6:cursor + 8], "big")
+                identifier_raw = raw[cursor + 8:cursor + 8 + identifier_length]
+                identifier = (
+                    "." if identifier_raw == b"\x00"
+                    else identifier_raw.decode("ascii", errors="replace")
+                )
+                normalized = identifier.replace("\\", "/")
+                path_safe = bool(
+                    identifier == "."
+                    or (
+                        identifier
+                        and "\x00" not in identifier
+                        and not normalized.startswith("/")
+                        and re.match(r"^[A-Za-z]:/", normalized) is None
+                        and ".." not in normalized.split("/")
+                        and "/" not in normalized
+                    )
+                )
+                directory_number = len(entries) + 1
+                parent_valid = (
+                    parent_number == 1 if directory_number == 1
+                    else 1 <= parent_number < directory_number
+                )
+                data_offset = (extent_block + extended_attribute_blocks) * block_size
+                extent_valid = 0 <= data_offset < min(evidence_size, declared_volume_bytes)
+                encoding_valid = "\ufffd" not in identifier
+                entry = {
+                    "directory_number": directory_number,
+                    "offset": table_offset + cursor,
+                    "relative_offset": cursor,
+                    "raw_hex": raw[cursor:cursor + entry_length].hex(),
+                    "entry_length": entry_length,
+                    "identifier_length": identifier_length,
+                    "identifier_raw_hex": identifier_raw.hex(),
+                    "identifier": identifier,
+                    "identifier_encoding_valid": encoding_valid,
+                    "path_safe": path_safe,
+                    "extended_attribute_blocks": extended_attribute_blocks,
+                    "extent_block": extent_block,
+                    "data_offset": data_offset,
+                    "extent_start_within_evidence_and_volume": extent_valid,
+                    "parent_directory_number": parent_number,
+                    "parent_directory_number_valid": parent_valid,
+                    "padding_length": identifier_length % 2,
+                    "padding_raw_hex": raw[
+                        cursor + 8 + identifier_length:cursor + entry_length
+                    ].hex(),
+                }
+                padding_valid = (
+                    identifier_length % 2 == 0
+                    or entry["padding_raw_hex"] == "00"
+                )
+                entry["padding_valid"] = padding_valid
+                if directory_number == 1:
+                    archive_path = "/" if identifier == "." else None
+                else:
+                    parent = entries[parent_number - 1] if parent_valid else None
+                    parent_path = parent.get("archive_path") if isinstance(parent, dict) else None
+                    archive_path = (
+                        identifier if parent_path == "/"
+                        else f"{parent_path}/{identifier}" if isinstance(parent_path, str) else None
+                    )
+                entry["archive_path"] = archive_path
+                entry["valid"] = bool(
+                    encoding_valid and path_safe and parent_valid and extent_valid
+                    and padding_valid
+                    and (directory_number != 1 or identifier == ".")
+                    and (directory_number != 1 or extent_block == pvd.get(
+                        "root_directory_record", {}
+                    ).get("extent_block"))
+                )
+                if not entry["valid"] and first_error is None:
+                    first_error = f"path-table entry {directory_number} failed validation"
+                entries.append(entry)
+                cursor += entry_length
+            table["entries"] = entries
+            table["entry_count"] = len(entries)
+            table["parse_end_offset"] = table_offset + cursor
+            table["error"] = first_error
+            table["valid"] = first_error is None and cursor == len(raw)
+
+        mandatory_little = next((
+            table for table in tables
+            if table.get("byte_order") == "little" and table.get("copy_kind") == "mandatory"
+        ), None)
+        mandatory_big = next((
+            table for table in tables
+            if table.get("byte_order") == "big" and table.get("copy_kind") == "mandatory"
+        ), None)
+        comparison: dict[str, object] = {
+            "available": mandatory_little is not None and mandatory_big is not None,
+            "consistent": False,
+            "little_table_offset": mandatory_little.get("table_offset") if mandatory_little else None,
+            "big_table_offset": mandatory_big.get("table_offset") if mandatory_big else None,
+            "first_difference_index": None,
+            "copy_comparisons": [],
+        }
+        if mandatory_little and mandatory_big:
+            little_entries = mandatory_little.get("entries", [])
+            big_entries = mandatory_big.get("entries", [])
+            canonical_little = [
+                (
+                    entry.get("extended_attribute_blocks"), entry.get("extent_block"),
+                    entry.get("parent_directory_number"), entry.get("identifier_raw_hex"),
+                )
+                for entry in little_entries if isinstance(entry, dict)
+            ]
+            canonical_big = [
+                (
+                    entry.get("extended_attribute_blocks"), entry.get("extent_block"),
+                    entry.get("parent_directory_number"), entry.get("identifier_raw_hex"),
+                )
+                for entry in big_entries if isinstance(entry, dict)
+            ]
+            comparison["little_entry_count"] = len(canonical_little)
+            comparison["big_entry_count"] = len(canonical_big)
+            comparison["consistent"] = bool(
+                mandatory_little.get("valid") is True
+                and mandatory_big.get("valid") is True
+                and canonical_little == canonical_big
+            )
+            if canonical_little != canonical_big:
+                common = min(len(canonical_little), len(canonical_big))
+                comparison["first_difference_index"] = next(
+                    (
+                        index for index in range(common)
+                        if canonical_little[index] != canonical_big[index]
+                    ),
+                    common,
+                )
+
+            for table in tables:
+                if table is mandatory_little:
+                    continue
+                entries = table.get("entries", [])
+                canonical = [
+                    (
+                        entry.get("extended_attribute_blocks"),
+                        entry.get("extent_block"),
+                        entry.get("parent_directory_number"),
+                        entry.get("identifier_raw_hex"),
+                    )
+                    for entry in entries if isinstance(entry, dict)
+                ]
+                copy_match = bool(
+                    table.get("valid") is True and canonical == canonical_little
+                )
+                comparison["copy_comparisons"].append({
+                    "byte_order": table.get("byte_order"),
+                    "copy_kind": table.get("copy_kind"),
+                    "table_offset": table.get("table_offset"),
+                    "entry_count": len(canonical),
+                    "matches_mandatory_little": copy_match,
+                })
+            comparison["consistent"] = bool(
+                comparison["consistent"]
+                and all(
+                    item["matches_mandatory_little"]
+                    for item in comparison["copy_comparisons"]
+                )
+            )
+
+        if comparison.get("consistent") is True and mandatory_little:
+            root = pvd.get("root_directory_record", {})
+            root_self = next((
+                entry for entry in directory_entries
+                if entry.get("logical_name") == "."
+                and entry.get("extent_block") == root.get("extent_block")
+            ), None)
+            candidates = [{
+                "record_offset": (
+                    root_self.get("record_offset") if root_self else root.get("record_offset")
+                ),
+                "extent_block": root.get("extent_block"),
+                "file_identifier": ".",
+                "archive_path": "/",
+            }]
+            candidates.extend(
+                entry for entry in directory_entries
+                if entry.get("file_type") == "directory"
+                and entry.get("logical_name") not in {".", ".."}
+            )
+            for path_entry in mandatory_little.get("entries", []):
+                if not isinstance(path_entry, dict):
+                    continue
+                matches = [
+                    candidate for candidate in candidates
+                    if candidate.get("extent_block") == path_entry.get("extent_block")
+                    and candidate.get("file_identifier") == path_entry.get("identifier")
+                ]
+                record = {
+                    "directory_number": path_entry.get("directory_number"),
+                    "path_table_entry_offset": path_entry.get("offset"),
+                    "path_table_archive_path": path_entry.get("archive_path"),
+                    "extent_block": path_entry.get("extent_block"),
+                    "directory_record_match_count": len(matches),
+                    "directory_record_offset": (
+                        matches[0].get("record_offset") if len(matches) == 1 else None
+                    ),
+                    "directory_record_archive_path": (
+                        matches[0].get("archive_path") if len(matches) == 1 else None
+                    ),
+                    "reconciled": len(matches) == 1,
+                }
+                reconciliation.append(record)
+        comparison["all_entries_reconciled"] = bool(
+            reconciliation and all(item["reconciled"] for item in reconciliation)
+        ) if comparison.get("consistent") is True else False
+        return tables, comparison, reconciliation
 
     def _iso9660_walk_namespace(
         self,

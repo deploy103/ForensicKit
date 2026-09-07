@@ -1,10 +1,10 @@
 # ForensicKit Work Queue
 
-Last reviewed: 2026-09-07 11:10 KST
+Last reviewed: 2026-09-07 11:18 KST
 
 ## Post-v1.1 backlog
 
-- [ ] Add bounded ISO 9660 little-/big-endian path-table parsing and directory-extent reconciliation.
+- [ ] Resolve bounded Rock Ridge `CE` continuation areas with cycle/range/byte protection.
 
 ## v1.1.0 release gate
 
@@ -17,6 +17,7 @@ Last reviewed: 2026-09-07 11:10 KST
 
 ## Completed this session
 
+- [x] Bounded primary ISO little-/big-endian path-table parsing, copy comparison, and directory reconciliation.
 - [x] Bounded El Torito section header/entry/extension parsing and platform boot-load extraction.
 - [x] Bounded El Torito boot-record/default-catalog validation and deterministic boot-load child extraction.
 - [x] Bounded Joliet supplementary-volume/UCS-2 tree traversal with exact primary-extent alias reconciliation.
