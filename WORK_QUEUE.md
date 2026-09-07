@@ -1,10 +1,10 @@
 # ForensicKit Work Queue
 
-Last reviewed: 2026-09-07 11:04 KST
+Last reviewed: 2026-09-07 11:10 KST
 
 ## Post-v1.1 backlog
 
-- [ ] Extend El Torito parsing to bounded section headers/entries and platform-specific boot-load extents.
+- [ ] Add bounded ISO 9660 little-/big-endian path-table parsing and directory-extent reconciliation.
 
 ## v1.1.0 release gate
 
@@ -17,6 +17,7 @@ Last reviewed: 2026-09-07 11:04 KST
 
 ## Completed this session
 
+- [x] Bounded El Torito section header/entry/extension parsing and platform boot-load extraction.
 - [x] Bounded El Torito boot-record/default-catalog validation and deterministic boot-load child extraction.
 - [x] Bounded Joliet supplementary-volume/UCS-2 tree traversal with exact primary-extent alias reconciliation.
 - [x] Bounded Rock Ridge SUSP/RRIP alternate-name/POSIX metadata parsing with symlink non-materialization.

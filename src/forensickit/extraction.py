@@ -718,6 +718,15 @@ class ExtractionManager:
                     validation_entry.get("raw_hex")
                     if isinstance(validation_entry, dict) else None
                 )
+                section_header = record.get("section_header")
+                section_header_offset = (
+                    section_header.get("offset")
+                    if isinstance(section_header, dict) else None
+                )
+                section_header_raw_hex = (
+                    section_header.get("raw_hex")
+                    if isinstance(section_header, dict) else None
+                )
                 if (
                     not isinstance(name, str) or not name or self._unsafe_name(name)
                     or not isinstance(entry_offset, int) or entry_offset < 0
@@ -740,6 +749,12 @@ class ExtractionManager:
                         raise RuntimeError(
                             "catalog validation entry no longer matches triage provenance"
                         )
+                    if isinstance(section_header_offset, int):
+                        source_stream.seek(section_header_offset)
+                        if source_stream.read(32).hex() != section_header_raw_hex:
+                            raise RuntimeError(
+                                "catalog section header no longer matches triage provenance"
+                            )
                     source_stream.seek(entry_offset)
                     if source_stream.read(32).hex() != entry_raw_hex:
                         raise RuntimeError("catalog entry no longer matches triage provenance")
@@ -779,6 +794,7 @@ class ExtractionManager:
                     f"data_length_source:{record.get('data_length_source')};"
                     f"boot_record:{record.get('boot_record')};"
                     f"validation_entry:{record.get('catalog_validation_entry')};"
+                    f"section_header:{record.get('section_header')};"
                     f"initial_entry:{record}"
                 )
         if result.artifacts:

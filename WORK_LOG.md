@@ -1,5 +1,18 @@
 # ForensicKit Work Log
 
+## 2026-09-07 11:10 KST
+
+### El Torito section catalog traversal
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/extraction.py`, `tests/test_triage.py`, and `tests/test_engine_pipeline.py`.
+- Catalog reads are now capped at 8 KiB and parse chained `0x90`/final `0x91` section headers under a shared 64-entry limit. Each header retains its exact offset/raw bytes, platform, identifier, entry count, and final state. Section boot entries receive the same media/load-RBA/deterministic-length/range contract as the default entry; `0x44` extensions retain criteria bytes, parent boot-entry offset, reserved flags, and bounded continuation state without interpreting vendor criteria.
+- Empty/truncated/non-final sections, invalid indicators, entry-limit saturation, invalid extension placement/flags, and unterminated extension chains produce the existing El Torito anomaly path. Platform-specific section boot loads are registered only after the extractor revalidates the catalog validation entry, section header, and exact section entry from the immutable ISO.
+- Synthetic triage covers a final EFI section with one bootable no-emulation entry and one parent-linked extension. An AUTO E2E proves the default x86 and EFI section load extents become two distinct children and produce separately attributed FlagCandidates with validation/header/entry/range provenance. Focused triage/Engine regressions passed: 160 passed, 0 failed. The full direct synthetic suite passed: 321 passed, 0 failed. `python -m compileall -q src tests scripts` and `git diff --check` passed.
+
+### Next
+
+- Parse bounded primary ISO little-/big-endian path tables and reconcile each directory number/name/parent/extent against the active directory walk without treating a divergent table as authoritative.
+
 ## 2026-09-07 11:04 KST
 
 ### El Torito default boot-load extraction

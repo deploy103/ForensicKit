@@ -1878,14 +1878,19 @@ class GenericTriageEngine:
             try:
                 with path.open("rb") as stream:
                     stream.seek(catalog_offset)
-                    raw = stream.read(64)
+                    catalog_read_length = min(
+                        8 * 1_024,
+                        evidence_size - catalog_offset,
+                        declared_volume_bytes - catalog_offset,
+                    )
+                    raw = stream.read(catalog_read_length)
             except OSError as exc:
                 errors.append({
                     "reason": "catalog_read_error", "boot_record": boot_record,
                     "error": str(exc)[:2_000],
                 })
                 continue
-            if len(raw) != 64:
+            if len(raw) < 64:
                 errors.append({
                     "reason": "catalog_truncated_read", "boot_record": boot_record,
                     "received_bytes": len(raw),
@@ -1975,21 +1980,6 @@ class GenericTriageEngine:
                 and initial_entry["bootable"]
                 and within_bounds
             )
-            catalog = {
-                "boot_record": boot_record,
-                "catalog_offset": catalog_offset,
-                "bytes_read": len(raw),
-                "validation_entry": validation_entry,
-                "initial_entry": initial_entry,
-                "valid": validation_entry["valid"] and initial_entry["valid"],
-            }
-            catalogs.append(catalog)
-            if (
-                not catalog["valid"]
-                or (initial_entry["bootable"] and range_invalid)
-                or (initial_entry["bootable"] and missing_no_emulation_size)
-            ):
-                errors.append({"reason": "invalid_catalog_or_boot_range", "catalog": catalog})
             if initial_entry["extraction_eligible"]:
                 platform = str(validation_entry["platform"])
                 media = str(initial_entry["media"])
@@ -2000,6 +1990,229 @@ class GenericTriageEngine:
                     "catalog_validation_entry": validation_entry,
                     "boot_record": boot_record,
                 })
+            catalog = {
+                "boot_record": boot_record,
+                "catalog_offset": catalog_offset,
+                "bytes_read": len(raw),
+                "validation_entry": validation_entry,
+                "initial_entry": initial_entry,
+                "section_headers": [],
+                "section_entries": [],
+                "extension_entries": [],
+                "section_entry_limit": 64,
+                "section_entry_limit_reached": False,
+                "final_section_header_found": False,
+                "valid": validation_entry["valid"] and initial_entry["valid"],
+            }
+            cursor = 64
+            section_index = 0
+            section_slots = 0
+            section_error: str | None = None
+            while cursor + 32 <= len(raw) and any(raw[cursor:cursor + 32]):
+                header_raw = raw[cursor:cursor + 32]
+                header_indicator = header_raw[0]
+                if header_indicator not in {0x90, 0x91}:
+                    section_error = (
+                        f"invalid El Torito section header indicator 0x{header_indicator:02x} "
+                        f"at offset {catalog_offset + cursor}"
+                    )
+                    break
+                section_count = int.from_bytes(header_raw[2:4], "little")
+                section_platform = header_raw[1]
+                header = {
+                    "section_index": section_index,
+                    "offset": catalog_offset + cursor,
+                    "raw_hex": header_raw.hex(),
+                    "indicator_raw": f"0x{header_indicator:02x}",
+                    "final": header_indicator == 0x91,
+                    "platform_id": section_platform,
+                    "platform": platform_names.get(
+                        section_platform, f"unknown_0x{section_platform:02x}"
+                    ),
+                    "entry_count": section_count,
+                    "identifier": header_raw[4:32].decode(
+                        "ascii", errors="replace"
+                    ).rstrip(" \x00"),
+                    "valid": section_count > 0,
+                }
+                catalog["section_headers"].append(header)
+                cursor += 32
+                if section_count <= 0:
+                    section_error = (
+                        f"empty El Torito section at offset {header['offset']}"
+                    )
+                    break
+                if section_slots + section_count > 64:
+                    catalog["section_entry_limit_reached"] = True
+                    section_error = "El Torito section entries exceed the bounded 64-entry limit"
+                    break
+                if cursor + section_count * 32 > len(raw):
+                    section_error = (
+                        f"truncated El Torito section at offset {header['offset']}: "
+                        f"declares {section_count} entries"
+                    )
+                    break
+                last_boot_entry: dict[str, object] | None = None
+                extension_chain_open = False
+                for section_entry_index in range(section_count):
+                    entry_raw = raw[cursor:cursor + 32]
+                    entry_offset = catalog_offset + cursor
+                    section_slots += 1
+                    if entry_raw[0] == 0x44:
+                        extension_entry = {
+                            "section_index": section_index,
+                            "section_entry_index": section_entry_index,
+                            "offset": entry_offset,
+                            "raw_hex": entry_raw.hex(),
+                            "indicator_raw": "0x44",
+                            "flags_raw": f"0x{entry_raw[1]:02x}",
+                            "more_extensions": bool(entry_raw[1] & 0x20),
+                            "reserved_flags_raw": f"0x{entry_raw[1] & ~0x20:02x}",
+                            "criteria_raw_hex": entry_raw[2:32].hex(),
+                            "parent_section_entry_offset": (
+                                last_boot_entry.get("offset")
+                                if last_boot_entry is not None else None
+                            ),
+                            "valid": (
+                                entry_raw[1] & ~0x20 == 0
+                                and last_boot_entry is not None
+                            ),
+                        }
+                        catalog["extension_entries"].append(extension_entry)
+                        if not extension_entry["valid"]:
+                            section_error = section_error or (
+                                f"invalid El Torito extension flags at offset {entry_offset}"
+                            )
+                        extension_chain_open = extension_entry["more_extensions"] is True
+                        cursor += 32
+                        continue
+                    if extension_chain_open:
+                        section_error = section_error or (
+                            f"incomplete El Torito extension chain before offset {entry_offset}"
+                        )
+                    section_boot_indicator = entry_raw[0]
+                    section_media_type = entry_raw[1]
+                    section_sector_count = int.from_bytes(entry_raw[6:8], "little")
+                    section_load_block = int.from_bytes(entry_raw[8:12], "little")
+                    section_data_offset = section_load_block * block_size
+                    if section_media_type == 0:
+                        section_data_length = (
+                            section_sector_count * 512 if section_sector_count > 0 else None
+                        )
+                        section_length_source = "catalog_sector_count_512_bytes"
+                    elif section_media_type in media_lengths:
+                        section_data_length = media_lengths[section_media_type]
+                        section_length_source = "el_torito_fixed_floppy_geometry"
+                    else:
+                        section_data_length = None
+                        section_length_source = "not_determinable"
+                    section_within_bounds = bool(
+                        isinstance(section_data_length, int)
+                        and section_data_length > 0
+                        and section_data_offset >= 0
+                        and section_data_offset + section_data_length <= evidence_size
+                        and section_data_offset + section_data_length <= declared_volume_bytes
+                    )
+                    section_entry = {
+                        "section_index": section_index,
+                        "section_entry_index": section_entry_index,
+                        "section_header_offset": header["offset"],
+                        "platform_id": section_platform,
+                        "platform": header["platform"],
+                        "offset": entry_offset,
+                        "raw_hex": entry_raw.hex(),
+                        "boot_indicator_raw": f"0x{section_boot_indicator:02x}",
+                        "bootable": section_boot_indicator == 0x88,
+                        "boot_indicator_valid": section_boot_indicator in {0x00, 0x88},
+                        "media_type": section_media_type,
+                        "media": media_names.get(
+                            section_media_type, f"unknown_{section_media_type}"
+                        ),
+                        "media_type_valid": section_media_type in media_names,
+                        "load_segment": int.from_bytes(entry_raw[2:4], "little"),
+                        "system_type": entry_raw[4],
+                        "reserved_byte": entry_raw[5],
+                        "sector_count": section_sector_count,
+                        "load_block": section_load_block,
+                        "data_offset": section_data_offset,
+                        "data_length": section_data_length,
+                        "data_length_source": section_length_source,
+                        "data_length_determinable": isinstance(section_data_length, int),
+                        "data_within_evidence_and_volume": section_within_bounds,
+                        "selection_criteria_raw_hex": entry_raw[12:32].hex(),
+                    }
+                    section_entry["valid"] = bool(
+                        section_entry["boot_indicator_valid"]
+                        and section_entry["media_type_valid"]
+                        and section_entry["reserved_byte"] == 0
+                        and section_load_block > 0
+                    )
+                    section_entry["extraction_eligible"] = bool(
+                        validation_entry["valid"]
+                        and header["valid"]
+                        and section_entry["valid"]
+                        and section_entry["bootable"]
+                        and section_within_bounds
+                    )
+                    catalog["section_entries"].append(section_entry)
+                    last_boot_entry = section_entry
+                    if (
+                        not section_entry["valid"]
+                        or (
+                            section_entry["bootable"]
+                            and isinstance(section_data_length, int)
+                            and not section_within_bounds
+                        )
+                        or (
+                            section_entry["bootable"]
+                            and section_media_type == 0
+                            and section_sector_count == 0
+                        )
+                    ):
+                        section_error = section_error or (
+                            f"invalid El Torito section entry at offset {entry_offset}"
+                        )
+                    if section_entry["extraction_eligible"]:
+                        platform = str(section_entry["platform"])
+                        media = str(section_entry["media"])
+                        boot_images.append({
+                            **section_entry,
+                            "logical_name": (
+                                f"eltorito_section_{section_index:02d}_entry_"
+                                f"{section_entry_index:02d}_{platform}_{media}.img"
+                            ),
+                            "catalog_offset": catalog_offset,
+                            "catalog_validation_entry": validation_entry,
+                            "section_header": header,
+                            "boot_record": boot_record,
+                        })
+                    cursor += 32
+                if extension_chain_open:
+                    section_error = section_error or (
+                        f"incomplete El Torito extension chain in section {section_index}"
+                    )
+                if section_error:
+                    break
+                if header["final"]:
+                    catalog["final_section_header_found"] = True
+                    break
+                section_index += 1
+            catalog["section_parse_end_offset"] = catalog_offset + cursor
+            catalog["section_parse_error"] = section_error
+            if catalog["section_headers"] and not catalog["final_section_header_found"]:
+                section_error = section_error or "El Torito section sequence has no final header"
+                catalog["section_parse_error"] = section_error
+            if section_error:
+                catalog["valid"] = False
+            catalogs.append(catalog)
+            if (
+                not catalog["valid"]
+                or (initial_entry["bootable"] and range_invalid)
+                or (initial_entry["bootable"] and missing_no_emulation_size)
+            ):
+                errors.append({"reason": "invalid_catalog_or_boot_range", "catalog": catalog})
+            if section_error:
+                errors.append({"reason": "section_structure", "catalog": catalog})
         return catalogs, errors, boot_images
 
     def _iso9660_walk_namespace(

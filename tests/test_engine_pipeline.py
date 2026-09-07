@@ -308,7 +308,9 @@ def _iso9660_with_joliet_alias(payload: bytes) -> bytes:
     return bytes(image)
 
 
-def _iso9660_with_el_torito(payload: bytes) -> bytes:
+def _iso9660_with_el_torito(
+    payload: bytes, *, section_payload: bytes | None = None,
+) -> bytes:
     block_size = 2_048
     image = bytearray(24 * block_size)
     boot_record_offset = 16 * block_size
@@ -358,6 +360,22 @@ def _iso9660_with_el_torito(payload: bytes) -> bytes:
     initial[6:8] = (1).to_bytes(2, "little")
     initial[8:12] = (22).to_bytes(4, "little")
     image[21 * block_size:21 * block_size + 64] = validation + initial
+    if section_payload is not None:
+        section_header = bytearray(32)
+        section_header[0] = 0x91
+        section_header[1] = 0xEF
+        section_header[2:4] = (1).to_bytes(2, "little")
+        section_header[4:32] = b"FORENSICKIT EFI".ljust(28, b" ")
+        section_entry = bytearray(32)
+        section_entry[0] = 0x88
+        section_entry[6:8] = (1).to_bytes(2, "little")
+        section_entry[8:12] = (23).to_bytes(4, "little")
+        catalog_section_offset = 21 * block_size + 64
+        image[catalog_section_offset:catalog_section_offset + 64] = (
+            section_header + section_entry
+        )
+        assert len(section_payload) <= 512
+        image[23 * block_size:23 * block_size + 512] = section_payload.ljust(512, b"\x00")
     assert len(payload) <= 512
     image[22 * block_size:22 * block_size + 512] = payload.ljust(512, b"\x00")
     return bytes(image)
@@ -807,6 +825,60 @@ def test_iso9660_el_torito_boot_image_recurses_with_catalog_lineage(
     assert "builtin_el_torito_extractor" in report
     assert "el_torito_boot_images" in report
     assert "CTF{el_torito_recursive_lineage}" in report
+
+
+def test_iso9660_el_torito_section_boot_load_recurses_with_header_lineage(
+    tmp_path: Path,
+) -> None:
+    default_payload = b"CTF{el_torito_default_sectioned}"
+    section_payload = b"CTF{el_torito_efi_sectioned}"
+    evidence = tmp_path / "sectioned-boot.iso"
+    evidence.write_bytes(_iso9660_with_el_torito(
+        default_payload, section_payload=section_payload,
+    ))
+
+    result = AnalysisEngine().analyze(
+        evidence, tmp_path / "sectioned-el-torito-cases", mode=AnalysisMode.AUTO,
+        execute=False,
+    )
+
+    assert [item.logical_name for item in result.artifacts] == [
+        "sectioned-boot.iso",
+        "eltorito_default_x86_no_emulation.img",
+        "eltorito_section_00_entry_00_efi_no_emulation.img",
+    ]
+    assert any(
+        candidate.value == "CTF{el_torito_default_sectioned}"
+        and candidate.artifact_id == result.artifacts[1].id
+        for candidate in result.flags
+    )
+    assert any(
+        candidate.value == "CTF{el_torito_efi_sectioned}"
+        and candidate.artifact_id == result.artifacts[2].id
+        for candidate in result.flags
+    )
+    observation = next(
+        item for item in result.observations
+        if item.artifact_id == result.artifacts[0].id
+        and item.key == "archive.iso9660.el_torito_boot_images"
+    )
+    assert len(observation.value) == 2
+    recovery = next(
+        item for item in result.findings
+        if item.source == "builtin_el_torito_extractor"
+    )
+    assert len(recovery.supporting_evidence) == 2
+    section_evidence = recovery.supporting_evidence[1]
+    assert f"catalog_entry_offset:{21 * 2_048 + 96}" in section_evidence
+    assert f"'offset': {21 * 2_048 + 64}" in section_evidence
+    assert "'platform': 'efi'" in section_evidence
+    assert f"data_offset:{23 * 2_048};data_length:512" in section_evidence
+    report = next(
+        (tmp_path / "sectioned-el-torito-cases").glob("*/reports/report.json")
+    ).read_text(encoding="utf-8")
+    assert "section_headers" in report
+    assert "eltorito_section_00_entry_00_efi_no_emulation.img" in report
+    assert "CTF{el_torito_efi_sectioned}" in report
 
 
 def test_ext_root_regular_file_recurses_to_flag_with_inode_lineage(tmp_path: Path) -> None:
