@@ -57,6 +57,8 @@ _SIGNATURES = (
     # requiring an external command or parser.
     _Signature("rar4", "rar", b"Rar!\x1a\x07\x00"),
     _Signature("rar5", "rar", b"Rar!\x1a\x07\x01\x00"),
+    _Signature("cpio_newc", "cpio", b"070701"),
+    _Signature("cpio_crc", "cpio", b"070702"),
     _Signature("bzip2", "bzip2", b"BZh"),
     _Signature("xz", "xz", b"\xfd7zXZ\x00"),
     _Signature("ewf", "ewf", b"EVF\x09\x0d\x0a\xff\x00"),
@@ -96,6 +98,7 @@ _EXPECTED_EXTENSIONS: dict[str, frozenset[str]] = {
     "gzip": frozenset({".gz", ".gzip", ".tgz"}),
     "tar": frozenset({".tar", ".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.bz2"}),
     "rar": frozenset({".rar"}),
+    "cpio": frozenset({".cpio", ".newc"}),
     "bzip2": frozenset({".bz2", ".tbz", ".tbz2"}),
     "xz": frozenset({".xz", ".txz"}),
     "pdf": frozenset({".pdf"}),
@@ -254,6 +257,8 @@ class GenericTriageEngine:
             observations.extend(self._inspect_apk(artifact, path))
         if detected_format == "gzip":
             observations.extend(self._inspect_gzip_header(artifact, header))
+        if detected_format == "cpio":
+            observations.extend(self._inspect_cpio_newc(artifact, path, actual_size))
         if detected_format in {"pcap", "pcapng"}:
             observations.extend(PcapObservationEngine(max_bytes=self.limits.signature_scan_bytes).analyze(artifact, path))
         if detected_format == "sqlite":
@@ -716,6 +721,235 @@ class GenericTriageEngine:
             self._observation(artifact, "archive.tar.scan_truncated", scanned < size and not terminated and error is None),
             self._observation(artifact, "archive.tar.terminated", terminated),
             self._observation(artifact, "archive.tar.structure_error", error),
+        ]
+
+    def _inspect_cpio_newc(
+        self, artifact: Artifact, path: Path, size: int,
+    ) -> list[Observation]:
+        """Walk a bounded SVR4 newc/CRC archive without materializing members."""
+        entries: list[dict[str, object]] = []
+        invalid_checksums: list[dict[str, object]] = []
+        formats: set[str] = set()
+        trailer: dict[str, object] | None = None
+        structure_error: str | None = None
+        scan_truncated = False
+        entry_limit_reached = False
+        cursor = 0
+        scan_limit = min(size, self.limits.signature_scan_bytes)
+        entry_limit = min(self.limits.max_artifact_count, 4_096)
+        checksum_budget = min(self.limits.signature_scan_bytes, 16 * _MIB)
+        checksum_bytes_read = 0
+        bytes_read = 0
+        magic_names = {b"070701": "newc", b"070702": "crc"}
+        type_names = {
+            0o010000: "fifo",
+            0o020000: "character",
+            0o040000: "directory",
+            0o060000: "block",
+            0o100000: "regular",
+            0o120000: "symlink",
+            0o140000: "socket",
+        }
+        field_names = (
+            "inode", "mode", "uid", "gid", "link_count", "mtime",
+            "file_size", "device_major", "device_minor",
+            "rdevice_major", "rdevice_minor", "name_size", "checksum",
+        )
+        try:
+            with path.open("rb") as stream:
+                while len(entries) < entry_limit:
+                    if cursor + 110 > size:
+                        structure_error = f"truncated CPIO header at offset {cursor}"
+                        break
+                    if cursor + 110 > scan_limit:
+                        scan_truncated = True
+                        break
+                    stream.seek(cursor)
+                    header = stream.read(110)
+                    bytes_read += len(header)
+                    if len(header) != 110:
+                        structure_error = f"truncated CPIO header at offset {cursor}"
+                        break
+                    magic = header[:6]
+                    format_name = magic_names.get(magic)
+                    if format_name is None:
+                        structure_error = f"invalid CPIO newc magic at offset {cursor}"
+                        break
+                    formats.add(format_name)
+                    try:
+                        values = [
+                            int(header[6 + field * 8:14 + field * 8], 16)
+                            for field in range(13)
+                        ]
+                    except ValueError:
+                        structure_error = f"non-hex CPIO header field at offset {cursor}"
+                        break
+                    fields = dict(zip(field_names, values, strict=True))
+                    name_size = int(fields["name_size"])
+                    file_size = int(fields["file_size"])
+                    if not 1 <= name_size <= 4_096:
+                        structure_error = (
+                            f"invalid CPIO pathname length {name_size} at offset {cursor}"
+                        )
+                        break
+                    name_offset = cursor + 110
+                    name_end = name_offset + name_size
+                    if name_end > size:
+                        structure_error = f"CPIO pathname at offset {name_offset} exceeds evidence"
+                        break
+                    if name_end > scan_limit:
+                        scan_truncated = True
+                        break
+                    stream.seek(name_offset)
+                    raw_name = stream.read(name_size)
+                    bytes_read += len(raw_name)
+                    if (
+                        len(raw_name) != name_size
+                        or not raw_name.endswith(b"\x00")
+                        or b"\x00" in raw_name[:-1]
+                    ):
+                        structure_error = f"invalid CPIO pathname terminator at offset {name_offset}"
+                        break
+                    name = raw_name[:-1].decode("utf-8", errors="replace")
+                    if not name:
+                        structure_error = f"empty CPIO pathname at offset {name_offset}"
+                        break
+                    name_padding_length = (-name_end) % 4
+                    data_offset = name_end + name_padding_length
+                    data_end = data_offset + file_size
+                    data_padding_length = (-data_end) % 4
+                    next_header_offset = data_end + data_padding_length
+                    mode = int(fields["mode"])
+                    file_type_code = mode & 0o170000
+                    normalized_name = name.replace("\\", "/")
+                    path_safe = (
+                        not normalized_name.startswith("/")
+                        and re.match(r"^[A-Za-z]:/", normalized_name) is None
+                        and ".." not in normalized_name.split("/")
+                    )
+                    record: dict[str, object] = {
+                        "index": len(entries),
+                        "format": format_name,
+                        "magic": magic.decode("ascii"),
+                        "header_offset": cursor,
+                        "header_length": 110,
+                        "name": name[:4_095],
+                        "name_raw_hex": raw_name[:-1].hex(),
+                        "name_offset": name_offset,
+                        "name_size_including_nul": name_size,
+                        "name_padding_length": name_padding_length,
+                        "data_offset": data_offset,
+                        "data_length": file_size,
+                        "data_end_offset": data_end,
+                        "data_padding_length": data_padding_length,
+                        "next_header_offset": next_header_offset,
+                        "data_within_evidence": data_end <= size,
+                        "path_safe": path_safe,
+                        "inode": int(fields["inode"]),
+                        "mode": f"0o{mode:o}",
+                        "permissions": f"0o{mode & 0o7777:04o}",
+                        "file_type": type_names.get(file_type_code, f"unknown_0o{file_type_code:o}"),
+                        "uid": int(fields["uid"]),
+                        "gid": int(fields["gid"]),
+                        "link_count": int(fields["link_count"]),
+                        "mtime_unix": int(fields["mtime"]),
+                        "device_major": int(fields["device_major"]),
+                        "device_minor": int(fields["device_minor"]),
+                        "rdevice_major": int(fields["rdevice_major"]),
+                        "rdevice_minor": int(fields["rdevice_minor"]),
+                        "stored_checksum": int(fields["checksum"]),
+                        "calculated_checksum": None,
+                        "checksum_valid": None,
+                        "checksum_verification": (
+                            "not_applicable" if format_name == "newc" else "not_checked"
+                        ),
+                    }
+                    if format_name == "newc":
+                        record["checksum_field_zero"] = int(fields["checksum"]) == 0
+                    if data_end > size:
+                        entries.append(record)
+                        structure_error = (
+                            f"CPIO member {name!r} at offset {cursor} exceeds evidence"
+                        )
+                        break
+                    if next_header_offset > size:
+                        entries.append(record)
+                        structure_error = (
+                            f"CPIO member {name!r} padding at offset {data_end} exceeds evidence"
+                        )
+                        break
+                    stream.seek(name_end)
+                    name_padding = stream.read(name_padding_length)
+                    bytes_read += len(name_padding)
+                    stream.seek(data_end)
+                    data_padding = stream.read(data_padding_length)
+                    bytes_read += len(data_padding)
+                    record["name_padding_nonzero"] = any(name_padding)
+                    record["data_padding_nonzero"] = any(data_padding)
+
+                    if format_name == "crc":
+                        checksum_remaining = checksum_budget - checksum_bytes_read
+                        if file_size <= checksum_remaining:
+                            calculated = 0
+                            remaining = file_size
+                            stream.seek(data_offset)
+                            while remaining:
+                                chunk = stream.read(min(1024 * 1024, remaining))
+                                if not chunk:
+                                    break
+                                calculated = (calculated + sum(chunk)) & 0xFFFFFFFF
+                                checksum_bytes_read += len(chunk)
+                                bytes_read += len(chunk)
+                                remaining -= len(chunk)
+                            if remaining:
+                                record["checksum_verification"] = "truncated_read"
+                            else:
+                                record["calculated_checksum"] = calculated
+                                record["checksum_valid"] = calculated == int(fields["checksum"])
+                                record["checksum_verification"] = "complete"
+                                if record["checksum_valid"] is False:
+                                    invalid_checksums.append(record)
+                        else:
+                            record["checksum_verification"] = "skipped_archive_checksum_byte_limit"
+
+                    if name == "TRAILER!!!":
+                        trailer = {**record, "valid_zero_length": file_size == 0}
+                        if file_size != 0:
+                            structure_error = "CPIO TRAILER!!! entry has nonzero data length"
+                        cursor = next_header_offset
+                        break
+                    entries.append(record)
+                    cursor = next_header_offset
+                    if cursor > scan_limit:
+                        scan_truncated = True
+                        break
+                else:
+                    entry_limit_reached = True
+                    scan_truncated = True
+        except OSError as exc:
+            structure_error = str(exc)[:2_000]
+
+        if trailer is None and structure_error is None and not scan_truncated:
+            structure_error = "CPIO archive ended without a TRAILER!!! entry"
+        return [
+            self._observation(artifact, "archive.cpio.detected", True),
+            self._observation(artifact, "archive.cpio.formats", sorted(formats)),
+            self._observation(artifact, "archive.cpio.format_consistent", len(formats) <= 1),
+            self._observation(artifact, "archive.cpio.entry_count", len(entries)),
+            self._observation(artifact, "archive.cpio.entries", entries),
+            self._observation(artifact, "archive.cpio.invalid_checksums", invalid_checksums),
+            self._observation(artifact, "archive.cpio.checksum_bytes_read", checksum_bytes_read),
+            self._observation(artifact, "archive.cpio.checksum_byte_limit", checksum_budget),
+            self._observation(artifact, "archive.cpio.trailer_found", trailer is not None),
+            self._observation(artifact, "archive.cpio.trailer", trailer),
+            self._observation(artifact, "archive.cpio.complete", trailer is not None and structure_error is None),
+            self._observation(artifact, "archive.cpio.scan_limit", scan_limit),
+            self._observation(artifact, "archive.cpio.scan_end_offset", cursor),
+            self._observation(artifact, "archive.cpio.bytes_read", bytes_read),
+            self._observation(artifact, "archive.cpio.scan_truncated", scan_truncated),
+            self._observation(artifact, "archive.cpio.entry_limit_reached", entry_limit_reached),
+            self._observation(artifact, "archive.cpio.structure_error", structure_error),
+            self._observation(artifact, "archive.container_kind", "cpio"),
         ]
 
     def _inspect_disk_memory(
@@ -10416,6 +10650,8 @@ def _format_from_header_bytes(header: bytes) -> str | None:
         return "pe"
     if header.startswith((b"Rar!\x1a\x07\x00", b"Rar!\x1a\x07\x01\x00")):
         return "rar"
+    if header.startswith((b"070701", b"070702")):
+        return "cpio"
     if header.startswith(b"BZh"):
         return "bzip2"
     if header.startswith(b"\xfd7zXZ\x00"):

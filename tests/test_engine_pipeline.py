@@ -20,6 +20,29 @@ from forensickit.triage import GenericTriageEngine
 from forensickit.workspace import CaseWorkspace
 
 
+def _cpio_crc_member(
+    name: str,
+    data: bytes = b"",
+    *,
+    mode: int = 0o100644,
+    inode: int = 1,
+) -> bytes:
+    raw_name = name.encode("utf-8") + b"\x00"
+    fields = (
+        inode, mode, 0, 0, 1, 1_700_000_000, len(data),
+        0, 0, 0, 0, len(raw_name), sum(data) & 0xFFFFFFFF,
+    )
+    result = bytearray(
+        b"070702" + b"".join(f"{value:08x}".encode("ascii") for value in fields)
+    )
+    assert len(result) == 110
+    result.extend(raw_name)
+    result.extend(b"\x00" * ((-len(result)) % 4))
+    result.extend(data)
+    result.extend(b"\x00" * ((-len(result)) % 4))
+    return bytes(result)
+
+
 def test_png_appended_zip_recurses_to_base64_flag(tmp_path: Path) -> None:
     archive = BytesIO()
     with ZipFile(archive, "w") as zip_file:
@@ -67,6 +90,67 @@ def test_gzip_recurses_with_artifact_lineage(tmp_path: Path) -> None:
 
     assert [artifact.logical_name for artifact in result.artifacts] == ["payload.txt.gz", "payload.txt"]
     assert any(candidate.value == "CTF{gzip_lineage}" for candidate in result.flags)
+
+
+def test_cpio_crc_regular_file_recurses_with_exact_range_and_checksum_lineage(tmp_path: Path) -> None:
+    payload = b"CTF{cpio_recursive_lineage}"
+    members = (
+        _cpio_crc_member("etc", mode=0o040755, inode=1),
+        _cpio_crc_member("etc/flag.txt", payload, inode=2),
+        _cpio_crc_member("etc/current", b"flag.txt", mode=0o120777, inode=3),
+        _cpio_crc_member("../escape.txt", b"CTF{must_not_escape}", inode=4),
+        _cpio_crc_member("TRAILER!!!", mode=0, inode=5),
+    )
+    evidence = tmp_path / "initramfs.cpio"
+    evidence.write_bytes(b"".join(members))
+
+    result = AnalysisEngine().analyze(
+        evidence, tmp_path / "cpio-cases", mode=AnalysisMode.AUTO,
+        execute=False,
+    )
+
+    assert [item.logical_name for item in result.artifacts] == [
+        "initramfs.cpio", "etc/flag.txt",
+    ]
+    child = result.artifacts[1]
+    assert child.parent_id == result.artifacts[0].id
+    assert child.size == len(payload)
+    assert any(
+        candidate.value == "CTF{cpio_recursive_lineage}"
+        and candidate.artifact_id == child.id
+        for candidate in result.flags
+    )
+    assert not any(
+        candidate.value == "CTF{must_not_escape}"
+        and candidate.artifact_id == child.id
+        for candidate in result.flags
+    )
+    assert not any(item.logical_name == "../escape.txt" for item in result.artifacts)
+    entries_observation = next(
+        item for item in result.observations
+        if item.artifact_id == result.artifacts[0].id
+        and item.key == "archive.cpio.entries"
+    )
+    recovery = next(
+        item for item in result.findings
+        if item.source == "builtin_cpio_extractor"
+    )
+    assert f"source_observation_id:{entries_observation.id}" in recovery.supporting_evidence[0]
+    assert "source_observation_key:archive.cpio.entries" in recovery.supporting_evidence[0]
+    assert f"data_length:{len(payload)}" in recovery.supporting_evidence[0]
+    assert f"stored_checksum:{sum(payload)}" in recovery.supporting_evidence[0]
+    assert f"calculated_checksum:{sum(payload)}" in recovery.supporting_evidence[0]
+    assert "checksum_valid:True" in recovery.supporting_evidence[0]
+    assert any(
+        "skipped CPIO member '../escape.txt': unsafe path" in error
+        for error in result.errors
+    )
+    report = next((tmp_path / "cpio-cases").glob("*/reports/report.json")).read_text(
+        encoding="utf-8"
+    )
+    assert "SVR4 cpio archive" in report
+    assert "builtin_cpio_extractor" in report
+    assert "CTF{cpio_recursive_lineage}" in report
 
 
 def test_ext_root_regular_file_recurses_to_flag_with_inode_lineage(tmp_path: Path) -> None:

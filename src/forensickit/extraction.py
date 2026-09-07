@@ -314,6 +314,149 @@ class ExtractionManager:
             )
         return result
 
+    def extract_cpio(self, artifact: Artifact) -> ExtractionResult:
+        """Copy bounded regular-file ranges from native newc/CRC observations."""
+        result = ExtractionResult()
+        entry_observation = next(
+            (
+                observation
+                for observation in self.workspace.database.observations(artifact.id)
+                if observation.key == "archive.cpio.entries"
+                and isinstance(observation.value, list)
+            ),
+            None,
+        )
+        if entry_observation is None:
+            return result
+        records = entry_observation.value
+        source = self.workspace.resolve_stored_path(artifact.path)
+        target_root = self.workspace.path("extracted", artifact.id, "builtin_cpio")
+        evidence: list[str] = []
+        try:
+            source_stream = source.open("rb")
+        except OSError as exc:
+            result.errors.append(f"CPIO source open failed for {artifact.logical_name}: {exc}")
+            return result
+        with source_stream:
+            for record_index, record in enumerate(records):
+                if not isinstance(record, dict) or record.get("file_type") != "regular":
+                    continue
+                name = record.get("name")
+                header_offset = record.get("header_offset")
+                name_offset = record.get("name_offset")
+                name_size = record.get("name_size_including_nul")
+                data_offset = record.get("data_offset")
+                data_length = record.get("data_length")
+                magic = record.get("magic")
+                stored_checksum = record.get("stored_checksum")
+                if not isinstance(name, str) or not name or self._unsafe_name(name):
+                    result.errors.append(f"skipped CPIO member {name!r}: unsafe path")
+                    continue
+                if (
+                    isinstance(header_offset, bool) or not isinstance(header_offset, int)
+                    or isinstance(name_offset, bool) or not isinstance(name_offset, int)
+                    or isinstance(name_size, bool) or not isinstance(name_size, int)
+                    or isinstance(data_offset, bool) or not isinstance(data_offset, int)
+                    or isinstance(data_length, bool) or not isinstance(data_length, int)
+                    or header_offset < 0 or name_offset != header_offset + 110
+                    or not 1 <= name_size <= 4_096
+                    or data_offset != (
+                        name_offset + name_size + (-(name_offset + name_size)) % 4
+                    )
+                    or data_length < 0 or data_offset + data_length > artifact.size
+                    or magic not in {"070701", "070702"}
+                    or isinstance(stored_checksum, bool) or not isinstance(stored_checksum, int)
+                ):
+                    result.errors.append(f"skipped CPIO member {name!r}: invalid observed byte range")
+                    continue
+                reason = self.can_register(artifact, data_length)
+                if reason:
+                    result.errors.append(f"skipped CPIO member {name!r}: {reason}")
+                    continue
+                try:
+                    source_stream.seek(header_offset)
+                    raw_header = source_stream.read(110)
+                    if (
+                        len(raw_header) != 110
+                        or raw_header[:6].decode("ascii", errors="replace") != magic
+                        or int(raw_header[14:22], 16) & 0o170000 != 0o100000
+                        or int(raw_header[54:62], 16) != data_length
+                        or int(raw_header[94:102], 16) != name_size
+                        or int(raw_header[102:110], 16) != stored_checksum
+                    ):
+                        raise RuntimeError("header no longer matches triage provenance")
+                    source_stream.seek(name_offset)
+                    raw_name = source_stream.read(name_size)
+                    if (
+                        len(raw_name) != name_size
+                        or not raw_name.endswith(b"\x00")
+                        or raw_name[:-1].hex() != record.get("name_raw_hex")
+                    ):
+                        raise RuntimeError("pathname no longer matches triage provenance")
+                except (OSError, RuntimeError, ValueError) as exc:
+                    result.errors.append(f"skipped CPIO member {name!r}: {exc}")
+                    continue
+                target_root.mkdir(parents=True, exist_ok=True)
+                output = target_root / f"{record_index:05d}_{safe_name(PurePosixPath(name).name)}"
+                calculated_checksum = 0
+                written = 0
+                try:
+                    source_stream.seek(data_offset)
+                    with output.open("xb") as writer:
+                        remaining = data_length
+                        while remaining:
+                            chunk = source_stream.read(min(1024 * 1024, remaining))
+                            if not chunk:
+                                raise RuntimeError("member data read ended before declared length")
+                            writer.write(chunk)
+                            written += len(chunk)
+                            remaining -= len(chunk)
+                            calculated_checksum = (
+                                calculated_checksum + sum(chunk)
+                            ) & 0xFFFFFFFF
+                    if written != data_length:
+                        raise RuntimeError("member data length mismatch")
+                except (OSError, RuntimeError) as exc:
+                    output.unlink(missing_ok=True)
+                    result.errors.append(f"failed CPIO member {name!r}: {exc}")
+                    continue
+                child = self.register_file(output, artifact, name)
+                if child is None:
+                    result.errors.append(
+                        f"skipped CPIO member {name!r}: duplicate or extraction limit"
+                    )
+                    continue
+                checksum_valid = (
+                    calculated_checksum == stored_checksum if magic == "070702" else None
+                )
+                result.artifacts.append(child)
+                result.extracted_bytes += child.size
+                evidence.append(
+                    f"child:{child.id};source_observation_id:{entry_observation.id};"
+                    f"source_observation_key:{entry_observation.key};"
+                    f"format:{record.get('format')};header_offset:{header_offset};"
+                    f"name_offset:{name_offset};data_offset:{data_offset};"
+                    f"data_length:{data_length};stored_checksum:{stored_checksum};"
+                    f"calculated_checksum:{calculated_checksum if magic == '070702' else None};"
+                    f"checksum_valid:{checksum_valid};entry_record:{record}"
+                )
+        if result.artifacts:
+            result.findings.append(Finding(
+                artifact_id=artifact.id,
+                title=f"Extracted {len(result.artifacts)} CPIO regular-file member(s)",
+                category="archive_extraction",
+                severity="info",
+                confidence=0.99,
+                explanation=(
+                    "Only regular files with relative non-traversing paths and exact image-bounded "
+                    "newc/CRC ranges were copied. Directories, links, and device/special entries "
+                    "remain metadata-only; CRC entries retain a byte-sum verdict computed while copying."
+                ),
+                source="builtin_cpio_extractor",
+                supporting_evidence=evidence[:128],
+            ))
+        return result
+
     def extract_single_stream(self, artifact: Artifact) -> ExtractionResult:
         source = self.workspace.resolve_stored_path(artifact.path)
         try:
@@ -2809,6 +2952,9 @@ class ExtractionManager:
         gzip_result = self.extract_gzip(artifact)
         if gzip_result.artifacts or gzip_result.errors:
             return gzip_result
+        cpio_result = self.extract_cpio(artifact)
+        if cpio_result.artifacts or cpio_result.errors:
+            return cpio_result
         tar_result = self.extract_tar(artifact)
         if tar_result.artifacts or tar_result.errors:
             return tar_result
@@ -2888,7 +3034,11 @@ class ExtractionManager:
     @staticmethod
     def _unsafe_name(name: str) -> bool:
         path = PurePosixPath(name.replace("\\", "/"))
-        return path.is_absolute() or ".." in path.parts
+        return (
+            path.is_absolute()
+            or re.match(r"^[A-Za-z]:/", str(path)) is not None
+            or ".." in path.parts
+        )
 
     def carve_appended_zip(self, artifact: Artifact, offset: int) -> ExtractionResult:
         """Carve a validated non-zero ZIP payload while retaining parent lineage."""

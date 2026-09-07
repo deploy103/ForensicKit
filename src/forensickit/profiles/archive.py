@@ -5,7 +5,7 @@ from .base import BaseProfile, ProfileContext, ProfileResult
 
 
 ARCHIVE_TYPES = {
-    "archive", "container", "zip", "7z", "rar", "tar", "gzip", "gz", "bzip2", "xz",
+    "archive", "container", "zip", "7z", "rar", "tar", "cpio", "gzip", "gz", "bzip2", "xz",
     "cab", "iso", "jar", "apk", "ooxml",
 }
 
@@ -22,7 +22,7 @@ class ArchiveProfile(BaseProfile):
         if context.format_is(*ARCHIVE_TYPES):
             reasons.append(f"observed archive format is {context.format}")
         mime = (context.artifact.mime or "").lower()
-        if any(marker in mime for marker in ("zip", "rar", "7z", "tar", "gzip", "compressed", "archive")):
+        if any(marker in mime for marker in ("zip", "rar", "7z", "tar", "cpio", "gzip", "compressed", "archive")):
             reasons.append(f"MIME indicates an archive: {context.artifact.mime}")
         return reasons
 
@@ -102,6 +102,73 @@ class ArchiveProfile(BaseProfile):
                     confidence=0.92,
                     explanation="Bounded native TAR header triage found a checksum mismatch or member range that cannot fit within the evidence.",
                     evidence=[str(item)[:1_000] for item in tar_invalid[:20]] + ([tar_error] if tar_error else []),
+                )
+            )
+        cpio_invalid = next(
+            (value for value in context.values("archive.cpio.invalid_checksums") if isinstance(value, list)),
+            [],
+        )
+        cpio_error = next(
+            (
+                value for value in context.values("archive.cpio.structure_error")
+                if isinstance(value, str) and value
+            ),
+            None,
+        )
+        cpio_consistent = next(
+            (
+                value for value in context.values("archive.cpio.format_consistent")
+                if isinstance(value, bool)
+            ),
+            True,
+        )
+        cpio_entries = next(
+            (value for value in context.values("archive.cpio.entries") if isinstance(value, list)),
+            [],
+        )
+        cpio_nonzero_newc_checksums = [
+            item for item in cpio_entries
+            if isinstance(item, dict)
+            and item.get("format") == "newc"
+            and item.get("checksum_field_zero") is False
+        ]
+        if cpio_invalid or cpio_error or cpio_consistent is False or cpio_nonzero_newc_checksums:
+            result.findings.append(
+                self.finding(
+                    context,
+                    title="CPIO member structure or integrity anomaly",
+                    category="archive_structure_anomaly",
+                    confidence=0.97,
+                    explanation=(
+                        "Bounded native newc/CRC parsing found a malformed range/header, mixed entry formats, "
+                        "a CRC byte-sum mismatch, or a nonzero checksum field in a non-CRC newc entry."
+                    ),
+                    evidence=(
+                        [str(item)[:2_000] for item in cpio_invalid[:16]]
+                        + [str(item)[:2_000] for item in cpio_nonzero_newc_checksums[:16]]
+                        + ([f"format_consistent={cpio_consistent}"] if cpio_consistent is False else [])
+                        + ([cpio_error] if cpio_error else [])
+                    ),
+                    severity="medium",
+                )
+            )
+        unsafe_cpio_entries = [
+            item for item in cpio_entries
+            if isinstance(item, dict) and item.get("path_safe") is False
+        ]
+        if unsafe_cpio_entries:
+            result.findings.append(
+                self.finding(
+                    context,
+                    title="CPIO contains unsafe member path(s)",
+                    category="archive_unsafe_member_path",
+                    confidence=0.99,
+                    explanation=(
+                        "One or more CPIO names are absolute or contain a parent-directory component. "
+                        "The built-in extractor will retain their metadata but never materialize them."
+                    ),
+                    evidence=[str(item)[:2_000] for item in unsafe_cpio_entries[:16]],
+                    severity="medium",
                 )
             )
         return result
