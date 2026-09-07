@@ -1,5 +1,18 @@
 # ForensicKit Work Log
 
+## 2026-09-07 13:09 KST
+
+### El Torito hard-disk-emulation MBR metadata
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/profiles/archive.py`, `tests/test_triage.py`, and `tests/test_engine_pipeline.py`.
+- Bootable hard-disk-emulation default and section entries now trigger one exact 512-byte read at their load RBA. The parser retains the MBR hash/raw bytes, signature, disk signature, all four raw partition records, boot/type/CHS/LBA/count fields, ISO-absolute byte ranges, overlap verdicts, active-partition count, and the minimum byte span needed to cover declared partitions.
+- MBR signatures, used/unused entry framing, positive non-MBR starts/counts, image/declared-volume bounds, non-overlap, and at most one bootable partition are validated. Even a valid table remains explicitly size-indeterminate because its last partition end is only a lower bound, so it never enters `el_torito_boot_images` and no speculative child is copied; malformed MBRs also enter the existing El Torito anomaly path.
+- Synthetic triage covers valid default and section hard-disk MBRs plus a corrupt signature, exact raw hash/entry offsets/ranges, and metadata-only profile severity. AUTO E2E confirms the valid MBR persists in JSON without a child or extractor finding. Focused triage/Engine regressions passed: 176 passed, 0 failed. The full direct synthetic suite passed: 337 passed, 0 failed. `python -m compileall -q src tests scripts` and `git diff --check` passed.
+
+### Next
+
+- Recognize RRIP `ZF` compression claims and validate the matching zisofs header/pointer table under explicit metadata/decompressed-size bounds before considering safe recursion.
+
 ## 2026-09-07 12:57 KST
 
 ### Rock Ridge PX hard-link identity

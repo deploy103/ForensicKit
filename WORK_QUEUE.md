@@ -1,10 +1,10 @@
 # ForensicKit Work Queue
 
-Last reviewed: 2026-09-07 12:57 KST
+Last reviewed: 2026-09-07 13:09 KST
 
 ## Post-v1.1 backlog
 
-- [ ] Validate El Torito hard-disk-emulation MBR metadata without inferring an image boundary.
+- [ ] Parse Rock Ridge `ZF`/zisofs metadata and validate compressed block tables without unbounded decompression.
 
 ## v1.1.0 release gate
 
@@ -17,6 +17,7 @@ Last reviewed: 2026-09-07 12:57 KST
 
 ## Completed this session
 
+- [x] Metadata-only El Torito hard-disk-emulation MBR and partition-range validation.
 - [x] Evidence-only Rock Ridge `PX` hard-link identity grouping with exact-extent alias deduplication.
 - [x] Bounded Joliet Type-L/Type-M path-table parsing, strict UCS-2BE comparison, and active-tree reconciliation.
 - [x] Bounded ISO multi-extent regular-file assembly with ordered per-record/range provenance and exact Joliet aliases.

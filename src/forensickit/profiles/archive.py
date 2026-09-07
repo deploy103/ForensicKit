@@ -367,6 +367,41 @@ class ArchiveProfile(BaseProfile):
             ),
             [],
         )
+        el_torito_hard_disks = next(
+            (
+                value for value in context.values(
+                    "archive.iso9660.el_torito_hard_disk_images"
+                )
+                if isinstance(value, list)
+            ),
+            [],
+        )
+        if el_torito_hard_disks:
+            result.findings.append(
+                self.finding(
+                    context,
+                    title="El Torito hard-disk-emulation MBR metadata retained",
+                    category="archive_boot_disk_metadata",
+                    confidence=0.98,
+                    explanation=(
+                        "A hard-disk-emulation catalog entry points to a bounded MBR sector. Its "
+                        "signature, partition records, absolute ISO ranges, overlaps, and minimum "
+                        "partition-covered length are inventoried, but MBR geometry does not declare "
+                        "the complete embedded-image boundary, so no child is created."
+                    ),
+                    evidence=[str(item)[:2_000] for item in el_torito_hard_disks[:16]],
+                    severity=(
+                        "info"
+                        if all(
+                            isinstance(item, dict)
+                            and isinstance(item.get("hard_disk_mbr"), dict)
+                            and item["hard_disk_mbr"].get("valid") is True
+                            for item in el_torito_hard_disks
+                        )
+                        else "medium"
+                    ),
+                )
+            )
         if el_torito_errors:
             result.findings.append(
                 self.finding(
@@ -376,8 +411,9 @@ class ArchiveProfile(BaseProfile):
                     confidence=0.98,
                     explanation=(
                         "A declared boot catalog failed its validation-entry checksum/key or default "
-                        "entry/range checks. The catalog remains raw evidence, and no unbounded or "
-                        "size-indeterminate boot image is materialized."
+                        "entry/range checks, or a hard-disk-emulation MBR was malformed. The catalog "
+                        "remains raw evidence, and no unbounded or size-indeterminate boot image is "
+                        "materialized."
                     ),
                     evidence=[str(item)[:2_000] for item in el_torito_errors[:16]],
                     severity="medium",
