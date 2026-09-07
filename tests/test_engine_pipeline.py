@@ -107,8 +107,8 @@ def _susp_entry(signature: bytes, data: bytes = b"") -> bytes:
     return signature + bytes((4 + len(data), 1)) + data
 
 
-def _rrip_px(mode: int, *, links: int = 1) -> bytes:
-    values = (mode, links, 1000, 1000, 1)
+def _rrip_px(mode: int, *, links: int = 1, serial: int = 1) -> bytes:
+    values = (mode, links, 1000, 1000, serial)
     data = b"".join(
         value.to_bytes(4, "little") + value.to_bytes(4, "big")
         for value in values
@@ -220,18 +220,19 @@ def _iso9660_with_multi_extent_file(
 def _iso9660_with_nested_file(
     name: bytes, payload: bytes, *, rock_ridge: bool = False,
     path_tables: bool = False, rock_ridge_continuation: bool = False,
-    rock_ridge_relocation: bool = False,
+    rock_ridge_relocation: bool = False, hard_links: bool = False,
+    hard_link_extent_mismatch: bool = False,
 ) -> bytes:
     block_size = 2_048
-    image = bytearray(24 * block_size)
+    image = bytearray(25 * block_size)
     pvd_offset = 16 * block_size
     image[pvd_offset] = 1
     image[pvd_offset + 1:pvd_offset + 6] = b"CD001"
     image[pvd_offset + 6] = 1
     image[pvd_offset + 8:pvd_offset + 40] = b"FORENSICKIT".ljust(32, b" ")
     image[pvd_offset + 40:pvd_offset + 72] = b"NESTED_ISO".ljust(32, b" ")
-    image[pvd_offset + 80:pvd_offset + 84] = (24).to_bytes(4, "little")
-    image[pvd_offset + 84:pvd_offset + 88] = (24).to_bytes(4, "big")
+    image[pvd_offset + 80:pvd_offset + 84] = (25).to_bytes(4, "little")
+    image[pvd_offset + 84:pvd_offset + 88] = (25).to_bytes(4, "big")
     image[pvd_offset + 120:pvd_offset + 122] = (1).to_bytes(2, "little")
     image[pvd_offset + 122:pvd_offset + 124] = (1).to_bytes(2, "big")
     image[pvd_offset + 124:pvd_offset + 126] = (1).to_bytes(2, "little")
@@ -334,11 +335,31 @@ def _iso9660_with_nested_file(
                 name, 23, len(payload),
                 system_use=(
                     skip_prefix
-                    + _rrip_px(0o100640)
+                    + _rrip_px(
+                        0o100640, links=2 if hard_links else 1,
+                        serial=42 if hard_links else 1,
+                    )
                     + _rrip_tf_short(bytes((124, 2, 3, 4, 5, 6, 4)))
                     + file_name_system_use
                     + _susp_entry(b"ST")
                 ),
+            )
+            + (
+                _iso_directory_record(
+                    b"ALIAS00.TXT;1",
+                    24 if hard_link_extent_mismatch else 23,
+                    (
+                        len(b"different-hard-link-payload")
+                        if hard_link_extent_mismatch else len(payload)
+                    ),
+                    system_use=(
+                        skip_prefix
+                        + _rrip_px(0o100640, links=2, serial=42)
+                        + _susp_entry(b"NM", b"\x00Alias Evidence.txt")
+                        + _susp_entry(b"ST")
+                    ),
+                )
+                if hard_links else b""
             )
             + _iso_directory_record(
                 b"LINK.;1", 23, 0,
@@ -365,6 +386,9 @@ def _iso9660_with_nested_file(
         )
     image[22 * block_size:22 * block_size + len(subdirectory)] = subdirectory
     image[23 * block_size:23 * block_size + len(payload)] = payload
+    if hard_links and hard_link_extent_mismatch:
+        mismatch_payload = b"different-hard-link-payload"
+        image[24 * block_size:24 * block_size + len(mismatch_payload)] = mismatch_payload
     return bytes(image)
 
 
@@ -1035,6 +1059,58 @@ def test_iso9660_rock_ridge_relocation_is_reported_without_inferred_children(
     ).read_text(encoding="utf-8")
     assert "rock_ridge_relocations" in report
     assert "rock_ridge_relocation_traversal_suppressed" in report
+
+
+def test_iso9660_rock_ridge_hard_link_alias_extracts_one_canonical_child(
+    tmp_path: Path,
+) -> None:
+    payload = b"CTF{rock_ridge_hard_link_alias}"
+    evidence = tmp_path / "rock-ridge-hard-links.iso"
+    evidence.write_bytes(_iso9660_with_nested_file(
+        b"FLAG000.TXT;1", payload, rock_ridge=True, hard_links=True,
+    ))
+
+    result = AnalysisEngine().analyze(
+        evidence, tmp_path / "hard-link-cases", mode=AnalysisMode.AUTO,
+        execute=False,
+    )
+
+    assert [item.logical_name for item in result.artifacts] == [
+        "rock-ridge-hard-links.iso", "Evidence Directory/Flag Evidence.txt",
+    ]
+    assert result.artifacts[1].size == len(payload)
+    assert any(
+        candidate.value == "CTF{rock_ridge_hard_link_alias}"
+        and candidate.artifact_id == result.artifacts[1].id
+        for candidate in result.flags
+    )
+    groups = next(
+        item.value for item in result.observations
+        if item.artifact_id == result.artifacts[0].id
+        and item.key == "archive.iso9660.rock_ridge_hard_link_groups"
+    )
+    assert len(groups) == 1
+    assert groups[0]["status"] == "verified_complete"
+    assert groups[0]["duplicate_extraction_suppressed_count"] == 1
+    errors = next(
+        item.value for item in result.observations
+        if item.artifact_id == result.artifacts[0].id
+        and item.key == "archive.iso9660.rock_ridge_hard_link_errors"
+    )
+    assert errors == []
+    assert not any("Alias Evidence.txt" in error for error in result.errors)
+    recovery = next(
+        item for item in result.findings
+        if item.source == "builtin_iso9660_extractor"
+    )
+    assert "rock_ridge_hard_link_group:" in recovery.supporting_evidence[0]
+    assert "'serial_number': 42" in recovery.supporting_evidence[0]
+    report = next(
+        (tmp_path / "hard-link-cases").glob("*/reports/report.json")
+    ).read_text(encoding="utf-8")
+    assert "rock_ridge_hard_link_groups" in report
+    assert "Alias Evidence.txt" in report
+    assert "archive_hard_link_metadata" in report
 
 
 def test_iso9660_joliet_extent_alias_recurses_once_with_ucs2_lineage(

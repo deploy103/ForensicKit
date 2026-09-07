@@ -51,6 +51,7 @@ Notable user-facing changes are documented here. This project follows Semantic V
 - Rock Ridge `CL`/`PL`/`RE` relocation roles and target blocks are validated and reconciled to known directory extents, but remain deliberately non-traversing metadata to avoid inferred paths and cycles.
 - Adjacent ISO 9660 multi-extent regular-file records can now form one bounded child after identifier/version, non-final alignment, range, overlap, terminator, and per-record provenance validation; primary/Joliet aliases require the same ordered extent sequence, while incomplete or over-limit chains remain wholly metadata-only.
 - Active Joliet descriptors now drive bounded Type-L/Type-M path-table parsing with strict UCS-2BE names, per-copy hashes, cross-endian semantic comparison, and exact active-tree reconciliation; divergent copies remain non-authoritative anomaly evidence.
+- Valid Rock Ridge `PX` serial/link-count claims now form evidence-only hard-link groups only when their exact ordered extent identities agree; one canonical payload is copied while alternate paths remain provenance, and contradictory groups are never reconciled or materialized as host links.
 
 ## [1.1.0] - 2026-09-04
 

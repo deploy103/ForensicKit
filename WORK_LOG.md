@@ -1,5 +1,18 @@
 # ForensicKit Work Log
 
+## 2026-09-07 12:57 KST
+
+### Rock Ridge PX hard-link identity
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/extraction.py`, `src/forensickit/profiles/archive.py`, `tests/test_triage.py`, and `tests/test_engine_pipeline.py`.
+- Valid RRIP `PX` metadata now retains its exact absolute source offset. Regular files claiming `link_count > 1` are grouped by serial number, then checked for one declared link count, no excess sampled members, and one exact logical extent sequence; single- and multi-extent identities use the same ordered-range representation. Partial same-extent groups remain explicitly partial rather than being claimed complete.
+- A verified same-extent group selects the earliest extraction-eligible directory record as its canonical evidence path and suppresses duplicate copying only; all aliases, raw record/PX offsets, declared versus observed counts, and status remain in observations and reports, and no host hard link is created. Serial collisions with different extents or counts remain unreconciled anomalies, so their independently valid files are not discarded.
+- Synthetic triage covers a complete two-name group and a same-serial/different-extent contradiction. AUTO E2E proves the shared payload yields one child and one flag while the alternate Rock Ridge path remains report evidence without a spurious skip error. Focused triage/Engine regressions passed: 174 passed, 0 failed. The full direct synthetic suite passed: 335 passed, 0 failed. `python -m compileall -q src tests scripts` and `git diff --check` passed.
+
+### Next
+
+- Parse and validate the MBR sector referenced by El Torito hard-disk-emulation entries as metadata only, preserving why the full virtual-disk byte boundary remains indeterminate.
+
 ## 2026-09-07 12:38 KST
 
 ### Joliet path-table validation

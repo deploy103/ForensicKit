@@ -575,6 +575,63 @@ class ArchiveProfile(BaseProfile):
                     severity="info",
                 )
             )
+        rock_ridge_hard_link_groups = next(
+            (
+                value for value in context.values(
+                    "archive.iso9660.rock_ridge_hard_link_groups"
+                )
+                if isinstance(value, list)
+            ),
+            [],
+        )
+        rock_ridge_hard_link_errors = next(
+            (
+                value for value in context.values(
+                    "archive.iso9660.rock_ridge_hard_link_errors"
+                )
+                if isinstance(value, list)
+            ),
+            [],
+        )
+        if rock_ridge_hard_link_groups:
+            result.findings.append(
+                self.finding(
+                    context,
+                    title="Rock Ridge hard-link identity metadata retained",
+                    category="archive_hard_link_metadata",
+                    confidence=0.98,
+                    explanation=(
+                        "Validated PX serial and link-count fields group regular-file directory "
+                        "records within this ISO. Exact shared extent sequences permit one canonical "
+                        "copy with alternate paths retained as evidence; no host hard link is created "
+                        "or followed."
+                    ),
+                    evidence=[
+                        str(item)[:2_000]
+                        for item in rock_ridge_hard_link_groups[:16]
+                    ],
+                    severity="info",
+                )
+            )
+        if rock_ridge_hard_link_errors:
+            result.findings.append(
+                self.finding(
+                    context,
+                    title="Rock Ridge hard-link metadata is incomplete or contradictory",
+                    category="iso9660_rock_ridge_hard_link_anomaly",
+                    confidence=0.97,
+                    explanation=(
+                        "A regular-file PX claim lacks a serial, has an invalid link count, exceeds its "
+                        "declared member count, disagrees across aliases, or maps one serial to different "
+                        "extent sequences. Such records are not reconciled as hard-link aliases."
+                    ),
+                    evidence=[
+                        str(item)[:2_000]
+                        for item in rock_ridge_hard_link_errors[:16]
+                    ],
+                    severity="medium",
+                )
+            )
         rock_ridge_relocations = next(
             (
                 value for value in context.values(

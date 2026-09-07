@@ -1889,6 +1889,10 @@ class GenericTriageEngine:
                         "primary_match_count": len(primary_matches),
                         "joliet_match_count": len(joliet_matches),
                     })
+        (
+            rock_ridge_hard_link_groups,
+            rock_ridge_hard_link_errors,
+        ) = self._iso9660_rock_ridge_hard_links(regular_files)
         rock_ridge_entries = [
             entry for entry in all_directory_entries
             if entry.get("rock_ridge_present") is True
@@ -1935,6 +1939,8 @@ class GenericTriageEngine:
             self._observation(artifact, "archive.iso9660.rock_ridge_entry_count", len(rock_ridge_entries)),
             self._observation(artifact, "archive.iso9660.rock_ridge_symlinks", rock_ridge_symlinks),
             self._observation(artifact, "archive.iso9660.rock_ridge_symlink_count", len(rock_ridge_symlinks)),
+            self._observation(artifact, "archive.iso9660.rock_ridge_hard_link_groups", rock_ridge_hard_link_groups),
+            self._observation(artifact, "archive.iso9660.rock_ridge_hard_link_errors", rock_ridge_hard_link_errors),
             self._observation(artifact, "archive.iso9660.joliet_detected", bool(joliet_descriptors)),
             self._observation(artifact, "archive.iso9660.joliet_descriptors", joliet_descriptors),
             self._observation(artifact, "archive.iso9660.joliet_active_descriptor", active_joliet_descriptor),
@@ -2324,6 +2330,200 @@ class GenericTriageEngine:
         ):
             return None
         return ((offset, length),)
+
+    def _iso9660_rock_ridge_hard_links(
+        self,
+        regular_files: list[dict[str, object]],
+    ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+        """Correlate validated PX serials without creating or following host links."""
+        buckets: dict[int, list[dict[str, object]]] = {}
+        claimed_serials: set[int] = set()
+        errors: list[dict[str, object]] = []
+        for record in regular_files:
+            posix = record.get("rock_ridge_posix")
+            if (
+                record.get("rock_ridge_present") is not True
+                or not isinstance(posix, dict)
+                or posix.get("file_type") != "regular"
+            ):
+                continue
+            rock_ridge_anomalies = record.get("rock_ridge_anomalies", [])
+            if (
+                isinstance(rock_ridge_anomalies, list)
+                and "duplicate_rock_ridge_posix" in rock_ridge_anomalies
+            ):
+                errors.append({
+                    "reason": "ambiguous_px_hard_link_identity",
+                    "record_offset": record.get("record_offset"),
+                    "archive_path": record.get("archive_path"),
+                })
+                continue
+            link_count = posix.get("link_count")
+            serial_number = posix.get("serial_number")
+            if (
+                not isinstance(link_count, int)
+                or isinstance(link_count, bool)
+                or link_count <= 0
+            ):
+                errors.append({
+                    "reason": "invalid_px_link_count",
+                    "record_offset": record.get("record_offset"),
+                    "archive_path": record.get("archive_path"),
+                    "link_count": link_count,
+                    "serial_number": serial_number,
+                    "px_source_absolute_offset": posix.get("source_absolute_offset"),
+                })
+                continue
+            if not isinstance(serial_number, int) or isinstance(serial_number, bool):
+                if link_count > 1:
+                    errors.append({
+                        "reason": "hard_link_claim_without_px_serial",
+                        "record_offset": record.get("record_offset"),
+                        "archive_path": record.get("archive_path"),
+                        "link_count": link_count,
+                        "px_source_absolute_offset": posix.get(
+                            "source_absolute_offset"
+                        ),
+                    })
+                continue
+            buckets.setdefault(serial_number, []).append(record)
+            if link_count > 1:
+                claimed_serials.add(serial_number)
+
+        groups: list[dict[str, object]] = []
+        for serial_number in sorted(claimed_serials):
+            records = sorted(
+                buckets[serial_number],
+                key=lambda item: int(item.get("record_offset", 0)),
+            )
+            link_counts = sorted({
+                int(posix["link_count"])
+                for record in records
+                if isinstance((posix := record.get("rock_ridge_posix")), dict)
+                and isinstance(posix.get("link_count"), int)
+                and not isinstance(posix.get("link_count"), bool)
+            })
+            member_details: list[dict[str, object]] = []
+            identities: list[tuple[tuple[int, int], ...] | None] = []
+            for record in records:
+                identity = self._iso9660_logical_extent_identity(record)
+                identities.append(identity)
+                posix = record.get("rock_ridge_posix", {})
+                member_details.append({
+                    "record_offset": record.get("record_offset"),
+                    "file_identifier": record.get("file_identifier"),
+                    "archive_path": record.get("archive_path"),
+                    "link_count": (
+                        posix.get("link_count") if isinstance(posix, dict) else None
+                    ),
+                    "serial_number": serial_number,
+                    "px_source_absolute_offset": (
+                        posix.get("source_absolute_offset")
+                        if isinstance(posix, dict) else None
+                    ),
+                    "logical_extent_segments": (
+                        [
+                            {"data_offset": offset, "data_length": length}
+                            for offset, length in identity
+                        ]
+                        if identity is not None else None
+                    ),
+                    "extraction_eligible_before_reconciliation": record.get(
+                        "extraction_eligible"
+                    ),
+                })
+
+            failed_checks: list[str] = []
+            if len(link_counts) != 1:
+                failed_checks.append("declared_link_count_mismatch")
+                declared_link_count: int | None = None
+            else:
+                declared_link_count = link_counts[0]
+                if len(records) > declared_link_count:
+                    failed_checks.append("observed_member_count_exceeds_declared")
+            if any(identity is None for identity in identities):
+                failed_checks.append("invalid_logical_extent_identity")
+            valid_identities = {
+                identity for identity in identities if identity is not None
+            }
+            same_extent = len(valid_identities) == 1 and len(valid_identities) == len({
+                identity for identity in identities
+            })
+            if len(records) > 1 and not same_extent:
+                failed_checks.append("logical_extent_mismatch")
+
+            failed_checks = list(dict.fromkeys(failed_checks))
+            verified = len(records) >= 2 and same_extent and not failed_checks
+            fully_observed = bool(
+                verified
+                and declared_link_count is not None
+                and len(records) == declared_link_count
+            )
+            eligible_records = [
+                record for record in records
+                if record.get("extraction_eligible") is True
+            ]
+            canonical = eligible_records[0] if verified and eligible_records else None
+            group: dict[str, object] = {
+                "serial_number": serial_number,
+                "declared_link_counts": link_counts,
+                "declared_link_count": declared_link_count,
+                "observed_member_count": len(records),
+                "fully_observed": fully_observed,
+                "same_logical_extent": same_extent,
+                "verified": verified,
+                "status": (
+                    "verified_complete" if fully_observed
+                    else "verified_partial" if verified
+                    else "partial_singleton" if len(records) == 1 and not failed_checks
+                    else "contradictory"
+                ),
+                "canonical_record_offset": (
+                    canonical.get("record_offset") if canonical is not None else None
+                ),
+                "canonical_archive_path": (
+                    canonical.get("archive_path") if canonical is not None else None
+                ),
+                "duplicate_extraction_suppressed_count": 0,
+                "failed_checks": failed_checks,
+                "members": member_details,
+            }
+            groups.append(group)
+            if failed_checks:
+                errors.append({
+                    "reason": "contradictory_px_hard_link_group",
+                    "serial_number": serial_number,
+                    "failed_checks": failed_checks,
+                    "declared_link_counts": link_counts,
+                    "observed_member_count": len(records),
+                    "members": member_details,
+                })
+
+            suppressed = 0
+            for record in records:
+                summary = {
+                    "serial_number": serial_number,
+                    "declared_link_count": declared_link_count,
+                    "observed_member_count": len(records),
+                    "fully_observed": fully_observed,
+                    "same_logical_extent": same_extent,
+                    "verified": verified,
+                    "status": group["status"],
+                    "canonical_record_offset": group["canonical_record_offset"],
+                    "canonical_archive_path": group["canonical_archive_path"],
+                }
+                record["rock_ridge_hard_link"] = summary
+                if canonical is not None and record is not canonical:
+                    if record.get("extraction_eligible") is True:
+                        record["extraction_eligible"] = False
+                        record[
+                            "extraction_reconciled_to_rock_ridge_hard_link"
+                        ] = True
+                        suppressed += 1
+            if canonical is not None:
+                group["duplicate_extraction_suppressed_count"] = suppressed
+                canonical["rock_ridge_hard_link_group"] = group
+        return groups, errors
 
     @staticmethod
     def _iso9660_el_torito_catalogs(
@@ -3905,13 +4105,13 @@ class GenericTriageEngine:
             "rock_ridge_present": rock_ridge_detected and bool(rrip_entries),
         })
 
-        px_entry = next(
-            (
-                entry for entry in rrip_entries
-                if entry.get("signature") == "PX" and entry.get("valid") is True
-            ),
-            None,
-        )
+        px_entries = [
+            entry for entry in rrip_entries
+            if entry.get("signature") == "PX" and entry.get("valid") is True
+        ]
+        px_entry = px_entries[0] if px_entries else None
+        if len(px_entries) > 1:
+            anomalies.append("duplicate_rock_ridge_posix")
         if px_entry is not None and isinstance(px_entry.get("mode"), int):
             mode = int(px_entry["mode"])
             mode_type = mode & 0o170000
@@ -3933,6 +4133,7 @@ class GenericTriageEngine:
                 "group_id": px_entry.get("group_id"),
                 "serial_number": px_entry.get("serial_number"),
                 "source_system_use_offset": px_entry.get("system_use_offset"),
+                "source_absolute_offset": px_entry.get("absolute_offset"),
             }
             iso_file_type = record.get("file_type")
             type_mismatch = (

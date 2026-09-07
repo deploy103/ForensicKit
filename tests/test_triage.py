@@ -202,8 +202,11 @@ def _susp_entry(signature: bytes, data: bytes = b"") -> bytes:
     return signature + bytes((length, 1)) + data
 
 
-def _rrip_px(mode: int, *, links: int = 1, uid: int = 1000, gid: int = 1000) -> bytes:
-    fields = (mode, links, uid, gid, 1)
+def _rrip_px(
+    mode: int, *, links: int = 1, uid: int = 1000, gid: int = 1000,
+    serial: int = 1,
+) -> bytes:
+    fields = (mode, links, uid, gid, serial)
     return _susp_entry(b"PX", b"".join(_iso_both32(value) for value in fields))
 
 
@@ -231,6 +234,8 @@ def _iso9660_with_rock_ridge(
     *, unsafe_file_name: bool = False, continued_name: bool = False,
     continuation_cycle: bool = False,
     relocation: bool = False,
+    hard_links: bool = False,
+    hard_link_extent_mismatch: bool = False,
 ) -> tuple[bytes, bytes]:
     block_size = 2_048
     image = bytearray(25 * block_size)
@@ -322,7 +327,10 @@ def _iso9660_with_rock_ridge(
     )
     file_system_use = (
         skip_prefix
-        + _rrip_px(0o100640)
+        + _rrip_px(
+            0o100640, links=2 if hard_links else 1,
+            serial=42 if hard_links else 1,
+        )
         + _rrip_tf_short(modify=bytes((124, 2, 3, 4, 5, 6, 4)))
         + file_name_entries
         + _susp_entry(b"ST")
@@ -334,6 +342,24 @@ def _iso9660_with_rock_ridge(
         + _susp_entry(b"NM", b"\x00latest")
         + _susp_entry(b"SL", b"\x00\x04\x00\x00\x06secret")
         + _susp_entry(b"ST")
+    )
+    hard_link_alias_payload = b"different-hard-link-payload"
+    hard_link_alias = (
+        _iso_directory_record(
+            b"ALIAS00.TXT;1",
+            24 if hard_link_extent_mismatch else 23,
+            (
+                len(hard_link_alias_payload)
+                if hard_link_extent_mismatch else len(payload)
+            ),
+            system_use=(
+                skip_prefix
+                + _rrip_px(0o100640, links=2, serial=42)
+                + _susp_entry(b"NM", b"\x00Alias Evidence.txt")
+                + _susp_entry(b"ST")
+            ),
+        )
+        if hard_links else b""
     )
     subdirectory = (
         _iso_directory_record(
@@ -347,12 +373,17 @@ def _iso9660_with_rock_ridge(
         + _iso_directory_record(
             b"FLAG000.TXT;1", 23, len(payload), system_use=file_system_use,
         )
+        + hard_link_alias
         + _iso_directory_record(
             b"LINK.;1", 24, 0, system_use=symlink_system_use,
         )
     )
     image[22 * block_size:22 * block_size + len(subdirectory)] = subdirectory
     image[23 * block_size:23 * block_size + len(payload)] = payload
+    if hard_links and hard_link_extent_mismatch:
+        image[
+            24 * block_size:24 * block_size + len(hard_link_alias_payload)
+        ] = hard_link_alias_payload
     if continued_name or continuation_cycle:
         continuation_offset = 24 * block_size + 256
         image[
@@ -2122,6 +2153,10 @@ def test_iso9660_rock_ridge_names_posix_metadata_and_symlinks_are_bounded(
         "group_id": 1000,
         "serial_number": 1,
         "source_system_use_offset": 2,
+        "source_absolute_offset": next(
+            item["absolute_offset"] for item in directory["susp_entries"]
+            if item["signature"] == "PX"
+        ),
     }
     assert nested["logical_name"] == "FLAG000.TXT"
     assert nested["rock_ridge_name"] == "Flag Evidence.txt"
@@ -2355,6 +2390,90 @@ def test_iso9660_rock_ridge_relocation_links_are_reconciled_without_traversal(
     assert relocation_finding.severity == "info"
     assert not any(
         item.category == "iso9660_susp_anomaly" for item in profile.findings
+    )
+
+
+def test_iso9660_rock_ridge_px_hard_links_require_exact_shared_extents(
+    tmp_path: Path,
+) -> None:
+    image, payload = _iso9660_with_rock_ridge(hard_links=True)
+    evidence = tmp_path / "rock-ridge-hard-links.iso"
+    evidence.write_bytes(image)
+    artifact = _artifact(evidence)
+    observations = GenericTriageEngine().analyze(artifact, evidence)
+    values = _values(observations)
+
+    groups = values["archive.iso9660.rock_ridge_hard_link_groups"]
+    assert len(groups) == 1
+    group = groups[0]
+    assert group["serial_number"] == 42
+    assert group["declared_link_counts"] == [2]
+    assert group["declared_link_count"] == 2
+    assert group["observed_member_count"] == 2
+    assert group["fully_observed"] is True
+    assert group["same_logical_extent"] is True
+    assert group["verified"] is True
+    assert group["status"] == "verified_complete"
+    assert group["duplicate_extraction_suppressed_count"] == 1
+    assert group["failed_checks"] == []
+    assert [item["archive_path"] for item in group["members"]] == [
+        "Evidence Directory/Flag Evidence.txt",
+        "Evidence Directory/Alias Evidence.txt",
+    ]
+    assert all(
+        item["logical_extent_segments"] == [{
+            "data_offset": 23 * 2_048, "data_length": len(payload),
+        }]
+        for item in group["members"]
+    )
+    primary, alias = [
+        item for item in values["archive.iso9660.regular_files"]
+        if item.get("rock_ridge_posix", {}).get("serial_number") == 42
+    ]
+    assert group["canonical_record_offset"] == primary["record_offset"]
+    assert primary["extraction_eligible"] is True
+    assert primary["rock_ridge_hard_link_group"] == group
+    assert alias["extraction_eligible"] is False
+    assert alias["extraction_reconciled_to_rock_ridge_hard_link"] is True
+    assert values["archive.iso9660.rock_ridge_hard_link_errors"] == []
+    profile = ProfileEngine().evaluate(artifact, observations)
+    assert any(
+        item.category == "archive_hard_link_metadata"
+        for item in profile.findings
+    )
+    assert not any(
+        item.category == "iso9660_rock_ridge_hard_link_anomaly"
+        for item in profile.findings
+    )
+
+    mismatch_image, _ = _iso9660_with_rock_ridge(
+        hard_links=True, hard_link_extent_mismatch=True,
+    )
+    mismatch_path = tmp_path / "rock-ridge-hard-link-mismatch.iso"
+    mismatch_path.write_bytes(mismatch_image)
+    mismatch_artifact = _artifact(mismatch_path)
+    mismatch_observations = GenericTriageEngine().analyze(
+        mismatch_artifact, mismatch_path,
+    )
+    mismatch_values = _values(mismatch_observations)
+    mismatch_group = mismatch_values[
+        "archive.iso9660.rock_ridge_hard_link_groups"
+    ][0]
+    assert mismatch_group["verified"] is False
+    assert mismatch_group["status"] == "contradictory"
+    assert mismatch_group["canonical_record_offset"] is None
+    assert "logical_extent_mismatch" in mismatch_group["failed_checks"]
+    mismatch_records = [
+        item for item in mismatch_values["archive.iso9660.regular_files"]
+        if item.get("rock_ridge_posix", {}).get("serial_number") == 42
+    ]
+    assert all(item["extraction_eligible"] is True for item in mismatch_records)
+    mismatch_profile = ProfileEngine().evaluate(
+        mismatch_artifact, mismatch_observations,
+    )
+    assert any(
+        item.category == "iso9660_rock_ridge_hard_link_anomaly"
+        for item in mismatch_profile.findings
     )
 
 

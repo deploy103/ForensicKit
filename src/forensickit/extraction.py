@@ -534,6 +534,10 @@ class ExtractionManager:
                     result.errors.append(f"skipped ISO member {name!r}: unsafe path")
                     continue
                 if record.get("extraction_eligible") is not True:
+                    if record.get(
+                        "extraction_reconciled_to_rock_ridge_hard_link"
+                    ) is True:
+                        continue
                     if record.get("rock_ridge_symlink") is True:
                         result.errors.append(
                             f"skipped ISO member {name!r}: Rock Ridge symbolic link is metadata-only"
@@ -763,6 +767,8 @@ class ExtractionManager:
                     f"archive_path:{name};"
                     f"containing_directory_identity:{record.get('containing_directory_identity')};"
                     f"directory_identity_lineage:{record.get('directory_identity_lineage')};"
+                    f"rock_ridge_hard_link_group:"
+                    f"{record.get('rock_ridge_hard_link_group')};"
                     f"archive_name_source:{record.get('archive_name_source')};"
                     f"joliet_alias:{record.get('joliet_alias')};"
                     f"joliet_containing_directory_identity:"
