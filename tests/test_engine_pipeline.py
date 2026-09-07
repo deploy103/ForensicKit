@@ -368,17 +368,20 @@ def _iso9660_with_nested_file(
     return bytes(image)
 
 
-def _iso9660_with_joliet_alias(payload: bytes) -> bytes:
+def _iso9660_with_joliet_alias(
+    payload: bytes, *, joliet_path_tables: bool = False,
+    divergent_joliet_path_table: bool = False,
+) -> bytes:
     block_size = 2_048
-    image = bytearray(25 * block_size)
+    image = bytearray(27 * block_size)
     pvd_offset = 16 * block_size
     image[pvd_offset] = 1
     image[pvd_offset + 1:pvd_offset + 6] = b"CD001"
     image[pvd_offset + 6] = 1
     image[pvd_offset + 8:pvd_offset + 40] = b"FORENSICKIT".ljust(32, b" ")
     image[pvd_offset + 40:pvd_offset + 72] = b"JOLIET_PRIMARY".ljust(32, b" ")
-    image[pvd_offset + 80:pvd_offset + 84] = (25).to_bytes(4, "little")
-    image[pvd_offset + 84:pvd_offset + 88] = (25).to_bytes(4, "big")
+    image[pvd_offset + 80:pvd_offset + 84] = (27).to_bytes(4, "little")
+    image[pvd_offset + 84:pvd_offset + 88] = (27).to_bytes(4, "big")
     image[pvd_offset + 120:pvd_offset + 122] = (1).to_bytes(2, "little")
     image[pvd_offset + 122:pvd_offset + 124] = (1).to_bytes(2, "big")
     image[pvd_offset + 124:pvd_offset + 126] = (1).to_bytes(2, "little")
@@ -396,8 +399,8 @@ def _iso9660_with_joliet_alias(payload: bytes) -> bytes:
     image[svd_offset + 6] = 1
     volume_identifier = "졸리엣".encode("utf-16-be")
     image[svd_offset + 40:svd_offset + 72] = volume_identifier.ljust(32, b"\x00")
-    image[svd_offset + 80:svd_offset + 84] = (25).to_bytes(4, "little")
-    image[svd_offset + 84:svd_offset + 88] = (25).to_bytes(4, "big")
+    image[svd_offset + 80:svd_offset + 84] = (27).to_bytes(4, "little")
+    image[svd_offset + 84:svd_offset + 88] = (27).to_bytes(4, "big")
     image[svd_offset + 88:svd_offset + 91] = b"%/E"
     image[svd_offset + 120:svd_offset + 122] = (1).to_bytes(2, "little")
     image[svd_offset + 122:svd_offset + 124] = (1).to_bytes(2, "big")
@@ -405,6 +408,30 @@ def _iso9660_with_joliet_alias(payload: bytes) -> bytes:
     image[svd_offset + 126:svd_offset + 128] = (1).to_bytes(2, "big")
     image[svd_offset + 128:svd_offset + 130] = block_size.to_bytes(2, "little")
     image[svd_offset + 130:svd_offset + 132] = block_size.to_bytes(2, "big")
+    if joliet_path_tables:
+        little_table = (
+            _iso_path_table_entry(b"\x00", 21, 1, byte_order="little")
+            + _iso_path_table_entry(
+                "증거".encode("utf-16-be"), 22, 1, byte_order="little",
+            )
+        )
+        big_name = "자료" if divergent_joliet_path_table else "증거"
+        big_table = (
+            _iso_path_table_entry(b"\x00", 21, 1, byte_order="big")
+            + _iso_path_table_entry(
+                big_name.encode("utf-16-be"), 22, 1, byte_order="big",
+            )
+        )
+        image[svd_offset + 132:svd_offset + 136] = len(little_table).to_bytes(
+            4, "little"
+        )
+        image[svd_offset + 136:svd_offset + 140] = len(big_table).to_bytes(
+            4, "big"
+        )
+        image[svd_offset + 140:svd_offset + 144] = (25).to_bytes(4, "little")
+        image[svd_offset + 148:svd_offset + 152] = (26).to_bytes(4, "big")
+        image[25 * block_size:25 * block_size + len(little_table)] = little_table
+        image[26 * block_size:26 * block_size + len(big_table)] = big_table
     joliet_root_record = _iso_directory_record(
         b"\x00", 21, block_size, flags=0x02,
     )
@@ -1061,6 +1088,58 @@ def test_iso9660_joliet_extent_alias_recurses_once_with_ucs2_lineage(
     assert "증거/깃발.txt" in report
     assert "joliet_extent_aliases" in report
     assert "CTF{joliet_recursive_lineage}" in report
+
+
+def test_iso9660_divergent_joliet_path_tables_remain_non_authoritative(
+    tmp_path: Path,
+) -> None:
+    payload = b"CTF{joliet_path_table_evidence_only}"
+    evidence = tmp_path / "joliet-path-table-divergent.iso"
+    evidence.write_bytes(_iso9660_with_joliet_alias(
+        payload,
+        joliet_path_tables=True,
+        divergent_joliet_path_table=True,
+    ))
+
+    result = AnalysisEngine().analyze(
+        evidence, tmp_path / "joliet-path-cases", mode=AnalysisMode.AUTO,
+        execute=False,
+    )
+
+    assert [item.logical_name for item in result.artifacts] == [
+        "joliet-path-table-divergent.iso", "증거/깃발.txt",
+    ]
+    comparison = next(
+        item.value for item in result.observations
+        if item.artifact_id == result.artifacts[0].id
+        and item.key == "archive.iso9660.joliet_path_table_comparison"
+    )
+    assert comparison["consistent"] is False
+    assert comparison["first_difference_index"] == 1
+    tables = next(
+        item.value for item in result.observations
+        if item.artifact_id == result.artifacts[0].id
+        and item.key == "archive.iso9660.joliet_path_tables"
+    )
+    assert [table["entries"][1]["identifier"] for table in tables] == [
+        "증거", "자료",
+    ]
+    finding = next(
+        item for item in result.findings
+        if item.category == "iso9660_joliet_path_table_anomaly"
+    )
+    assert finding.severity == "medium"
+    assert any(
+        candidate.value == "CTF{joliet_path_table_evidence_only}"
+        and candidate.artifact_id == result.artifacts[1].id
+        for candidate in result.flags
+    )
+    report = next(
+        (tmp_path / "joliet-path-cases").glob("*/reports/report.json")
+    ).read_text(encoding="utf-8")
+    assert "joliet_path_table_comparison" in report
+    assert "iso9660_joliet_path_table_anomaly" in report
+    assert "자료" in report
 
 
 def test_iso9660_el_torito_boot_image_recurses_with_catalog_lineage(

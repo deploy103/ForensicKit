@@ -362,10 +362,11 @@ def _iso9660_with_rock_ridge(
 
 
 def _iso9660_with_joliet_alias(
-    *, multi_extent: bool = False,
+    *, multi_extent: bool = False, joliet_path_tables: bool = False,
+    divergent_joliet_path_table: bool = False,
 ) -> tuple[bytes, bytes]:
     block_size = 2_048
-    image = bytearray(25 * block_size)
+    image = bytearray(27 * block_size)
     pvd_offset = 16 * block_size
     pvd = memoryview(image)[pvd_offset:pvd_offset + block_size]
     pvd[0] = 1
@@ -373,7 +374,7 @@ def _iso9660_with_joliet_alias(
     pvd[6] = 1
     pvd[8:40] = b"FORENSICKIT".ljust(32, b" ")
     pvd[40:72] = b"JOLIET_PRIMARY".ljust(32, b" ")
-    pvd[80:88] = _iso_both32(25)
+    pvd[80:88] = _iso_both32(27)
     pvd[120:124] = _iso_both16(1)
     pvd[124:128] = _iso_both16(1)
     pvd[128:132] = _iso_both16(block_size)
@@ -391,12 +392,33 @@ def _iso9660_with_joliet_alias(
     svd[8:40] = b"\x00" * 32
     volume_identifier = "졸리엣".encode("utf-16-be")
     svd[40:72] = volume_identifier.ljust(32, b"\x00")
-    svd[80:88] = _iso_both32(25)
+    svd[80:88] = _iso_both32(27)
     svd[88:91] = b"%/E"
     svd[120:124] = _iso_both16(1)
     svd[124:128] = _iso_both16(1)
     svd[128:132] = _iso_both16(block_size)
     svd[132:140] = _iso_both32(0)
+    if joliet_path_tables:
+        little_table = (
+            _iso_path_table_entry(b"\x00", 21, 1, byte_order="little")
+            + _iso_path_table_entry(
+                "증거".encode("utf-16-be"), 22, 1, byte_order="little",
+            )
+        )
+        big_name = "자료" if divergent_joliet_path_table else "증거"
+        big_table = (
+            _iso_path_table_entry(b"\x00", 21, 1, byte_order="big")
+            + _iso_path_table_entry(
+                big_name.encode("utf-16-be"), 22, 1, byte_order="big",
+            )
+        )
+        assert len(little_table) == len(big_table)
+        svd[132:136] = len(little_table).to_bytes(4, "little")
+        svd[136:140] = len(big_table).to_bytes(4, "big")
+        svd[140:144] = (25).to_bytes(4, "little")
+        svd[148:152] = (26).to_bytes(4, "big")
+        image[25 * block_size:25 * block_size + len(little_table)] = little_table
+        image[26 * block_size:26 * block_size + len(big_table)] = big_table
     joliet_root_record = _iso_directory_record(
         b"\x00", 21, block_size, flags=0x02,
     )
@@ -2404,6 +2426,101 @@ def test_iso9660_joliet_tree_reconciles_ucs2_path_to_primary_extent(
         item.category == "iso9660_joliet_anomaly"
         for item in profile.findings
     )
+
+
+def test_iso9660_joliet_path_table_copies_decode_and_reconcile_ucs2(
+    tmp_path: Path,
+) -> None:
+    block_size = 2_048
+    image, _ = _iso9660_with_joliet_alias(joliet_path_tables=True)
+    evidence = tmp_path / "joliet-path-tables.iso"
+    evidence.write_bytes(image)
+    artifact = _artifact(evidence)
+
+    observations = GenericTriageEngine().analyze(artifact, evidence)
+    values = _values(observations)
+    tables = values["archive.iso9660.joliet_path_tables"]
+    assert len(tables) == 2
+    assert [(item["byte_order"], item["copy_kind"]) for item in tables] == [
+        ("little", "mandatory"), ("big", "mandatory"),
+    ]
+    assert all(item["namespace"] == "joliet" for item in tables)
+    assert all(item["identifier_encoding"] == "joliet" for item in tables)
+    assert all(item["valid"] is True for item in tables)
+    assert all(len(item["raw_sha256"]) == 64 for item in tables)
+    for table in tables:
+        assert [item["identifier"] for item in table["entries"]] == [".", "증거"]
+        assert table["entries"][1]["identifier_raw_hex"] == (
+            "증거".encode("utf-16-be").hex()
+        )
+        assert table["entries"][1]["archive_path"] == "증거"
+        assert table["entries"][1]["data_offset"] == 22 * block_size
+    comparison = values["archive.iso9660.joliet_path_table_comparison"]
+    assert comparison["namespace"] == "joliet"
+    assert comparison["identifier_encoding"] == "joliet"
+    assert comparison["consistent"] is True
+    assert comparison["all_entries_reconciled"] is True
+    reconciliation = values[
+        "archive.iso9660.joliet_path_table_reconciliation"
+    ]
+    assert len(reconciliation) == 2
+    assert reconciliation[0]["directory_record_archive_path"] == "/"
+    assert reconciliation[1]["path_table_archive_path"] == "증거"
+    assert reconciliation[1]["directory_record_archive_path"] == "증거"
+    assert reconciliation[1]["reconciled"] is True
+    profile = ProfileEngine().evaluate(artifact, observations)
+    assert not any(
+        item.category == "iso9660_joliet_path_table_anomaly"
+        for item in profile.findings
+    )
+
+    divergent_image, _ = _iso9660_with_joliet_alias(
+        joliet_path_tables=True, divergent_joliet_path_table=True,
+    )
+    divergent_path = tmp_path / "joliet-path-table-divergent.iso"
+    divergent_path.write_bytes(divergent_image)
+    divergent_artifact = _artifact(divergent_path)
+    divergent_observations = GenericTriageEngine().analyze(
+        divergent_artifact, divergent_path,
+    )
+    divergent_values = _values(divergent_observations)
+    assert all(
+        item["valid"] is True
+        for item in divergent_values["archive.iso9660.joliet_path_tables"]
+    )
+    assert divergent_values[
+        "archive.iso9660.joliet_path_table_comparison"
+    ]["consistent"] is False
+    assert divergent_values[
+        "archive.iso9660.joliet_path_table_comparison"
+    ]["first_difference_index"] == 1
+    assert divergent_values[
+        "archive.iso9660.joliet_path_table_reconciliation"
+    ] == []
+    divergent_profile = ProfileEngine().evaluate(
+        divergent_artifact, divergent_observations,
+    )
+    assert any(
+        item.category == "iso9660_joliet_path_table_anomaly"
+        for item in divergent_profile.findings
+    )
+
+    invalid_image = bytearray(image)
+    second_identifier_offset = 26 * block_size + 10 + 8
+    invalid_image[
+        second_identifier_offset:second_identifier_offset + 4
+    ] = b"\xd8\x00\xac\x70"
+    invalid_path = tmp_path / "joliet-path-table-surrogate.iso"
+    invalid_path.write_bytes(invalid_image)
+    invalid_artifact = _artifact(invalid_path)
+    invalid_observations = GenericTriageEngine().analyze(
+        invalid_artifact, invalid_path,
+    )
+    invalid_values = _values(invalid_observations)
+    invalid_big = invalid_values["archive.iso9660.joliet_path_tables"][1]
+    assert invalid_big["entries"][1]["identifier_encoding_valid"] is False
+    assert invalid_big["valid"] is False
+    assert invalid_big["error"] == "path-table entry 2 failed validation"
 
 
 def test_iso9660_joliet_multi_extent_alias_requires_identical_ordered_ranges(

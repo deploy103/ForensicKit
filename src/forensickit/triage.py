@@ -1785,6 +1785,31 @@ class GenericTriageEngine:
             )
         joliet_entries = joliet_walk.get("entries", [])
         joliet_regular_files = joliet_walk.get("regular_files", [])
+        joliet_path_tables: list[dict[str, object]] = []
+        joliet_path_table_comparison: dict[str, object] = {
+            "available": False,
+            "consistent": None,
+            "namespace": "joliet",
+            "identifier_encoding": "joliet",
+            "reason": "active_joliet_descriptor_unavailable",
+        }
+        joliet_path_table_reconciliation: list[dict[str, object]] = []
+        if (
+            active_joliet_descriptor is not None
+            and isinstance(joliet_entries, list)
+        ):
+            (
+                joliet_path_tables,
+                joliet_path_table_comparison,
+                joliet_path_table_reconciliation,
+            ) = self._iso9660_path_tables(
+                path,
+                evidence_size=size,
+                pvd=active_joliet_descriptor,
+                directory_entries=joliet_entries,
+                namespace="joliet",
+                identifier_encoding="joliet",
+            )
         joliet_multi_extent_chains = joliet_walk.get("multi_extent_chains", [])
         joliet_multi_extent_errors = joliet_walk.get("multi_extent_errors", [])
         if isinstance(joliet_multi_extent_chains, list):
@@ -1921,6 +1946,9 @@ class GenericTriageEngine:
             self._observation(artifact, "archive.iso9660.joliet_directory_scan_bytes", joliet_walk.get("bytes_read", 0)),
             self._observation(artifact, "archive.iso9660.joliet_extent_aliases", joliet_aliases),
             self._observation(artifact, "archive.iso9660.joliet_reconciliation_errors", joliet_reconciliation_errors),
+            self._observation(artifact, "archive.iso9660.joliet_path_tables", joliet_path_tables),
+            self._observation(artifact, "archive.iso9660.joliet_path_table_comparison", joliet_path_table_comparison),
+            self._observation(artifact, "archive.iso9660.joliet_path_table_reconciliation", joliet_path_table_reconciliation),
             self._observation(artifact, "archive.iso9660.el_torito_detected", bool(el_torito_boot_records)),
             self._observation(artifact, "archive.iso9660.el_torito_boot_records", el_torito_boot_records),
             self._observation(artifact, "archive.iso9660.el_torito_catalogs", el_torito_catalogs),
@@ -2684,8 +2712,10 @@ class GenericTriageEngine:
         evidence_size: int,
         pvd: dict[str, object],
         directory_entries: list[dict[str, object]],
+        namespace: str = "primary",
+        identifier_encoding: str = "ascii",
     ) -> tuple[list[dict[str, object]], dict[str, object], list[dict[str, object]]]:
-        """Parse bounded primary path-table copies without selecting a divergent copy."""
+        """Parse one namespace's bounded path-table copies without selecting one."""
         tables: list[dict[str, object]] = []
         reconciliation: list[dict[str, object]] = []
         path_table_size = pvd.get("path_table_size")
@@ -2700,6 +2730,8 @@ class GenericTriageEngine:
             return tables, {
                 "available": False,
                 "consistent": None,
+                "namespace": namespace,
+                "identifier_encoding": identifier_encoding,
                 "reason": "path_table_size_is_zero_or_invalid",
             }, reconciliation
         byte_limit = min(self.limits.signature_scan_bytes, 8 * _MIB)
@@ -2714,6 +2746,8 @@ class GenericTriageEngine:
             if copy_kind == "optional" and table_block == 0:
                 continue
             table: dict[str, object] = {
+                "namespace": namespace,
+                "identifier_encoding": identifier_encoding,
                 "byte_order": byte_order,
                 "copy_kind": copy_kind,
                 "table_block": table_block,
@@ -2779,10 +2813,16 @@ class GenericTriageEngine:
                     extent_block = int.from_bytes(raw[cursor + 2:cursor + 6], "big")
                     parent_number = int.from_bytes(raw[cursor + 6:cursor + 8], "big")
                 identifier_raw = raw[cursor + 8:cursor + 8 + identifier_length]
-                identifier = (
-                    "." if identifier_raw == b"\x00"
-                    else identifier_raw.decode("ascii", errors="replace")
-                )
+                if identifier_raw == b"\x00":
+                    identifier = "."
+                    encoding_valid = True
+                elif identifier_encoding == "joliet":
+                    identifier, encoding_valid = self._iso9660_decode_ucs2(
+                        identifier_raw
+                    )
+                else:
+                    identifier = identifier_raw.decode("ascii", errors="replace")
+                    encoding_valid = "\ufffd" not in identifier
                 normalized = identifier.replace("\\", "/")
                 path_safe = bool(
                     identifier == "."
@@ -2802,8 +2842,8 @@ class GenericTriageEngine:
                 )
                 data_offset = (extent_block + extended_attribute_blocks) * block_size
                 extent_valid = 0 <= data_offset < min(evidence_size, declared_volume_bytes)
-                encoding_valid = "\ufffd" not in identifier
                 entry = {
+                    "namespace": namespace,
                     "directory_number": directory_number,
                     "offset": table_offset + cursor,
                     "relative_offset": cursor,
@@ -2812,6 +2852,7 @@ class GenericTriageEngine:
                     "identifier_length": identifier_length,
                     "identifier_raw_hex": identifier_raw.hex(),
                     "identifier": identifier,
+                    "identifier_encoding": identifier_encoding,
                     "identifier_encoding_valid": encoding_valid,
                     "path_safe": path_safe,
                     "extended_attribute_blocks": extended_attribute_blocks,
@@ -2867,6 +2908,8 @@ class GenericTriageEngine:
             if table.get("byte_order") == "big" and table.get("copy_kind") == "mandatory"
         ), None)
         comparison: dict[str, object] = {
+            "namespace": namespace,
+            "identifier_encoding": identifier_encoding,
             "available": mandatory_little is not None and mandatory_big is not None,
             "consistent": False,
             "little_table_offset": mandatory_little.get("table_offset") if mandatory_little else None,

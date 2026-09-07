@@ -1,5 +1,18 @@
 # ForensicKit Work Log
 
+## 2026-09-07 12:38 KST
+
+### Joliet path-table validation
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/profiles/archive.py`, `tests/test_triage.py`, and `tests/test_engine_pipeline.py`.
+- The bounded path-table parser now operates per namespace. Active Joliet supplementary descriptors feed their mandatory and present optional Type-L/Type-M copies through the same 8-MiB/4,096-entry, range, parent-order, padding, SHA-256, and non-authoritative comparison checks as the primary descriptor, while identifiers use strict surrogate-rejecting UCS-2BE decoding.
+- Consistent Joliet copies are reconciled by exact decoded identifier and extent block only against the independently validated active Joliet directory walk. Tables, comparison details, first differing entry, and per-directory reconciliation have dedicated observations; divergent or malformed copies produce a medium profile finding but never override the directory tree or prevent an otherwise validated child.
+- Synthetic triage covers matching cross-endian copies, Unicode path reconstruction, exact root/subdirectory reconciliation, semantic divergence, and a surrogate-bearing invalid identifier. An AUTO E2E confirms divergent table names persist in JSON/finding evidence while the validated Joliet tree still yields one child. Focused triage/Engine regressions passed: 172 passed, 0 failed. The full direct synthetic suite passed: 333 passed, 0 failed. `python -m compileall -q src tests scripts` and `git diff --check` passed.
+
+### Next
+
+- Group Rock Ridge regular-file aliases only from validated `PX` serial/link-count metadata, retaining contradictions and avoiding inferred filesystem links or duplicate child materialization.
+
 ## 2026-09-07 12:18 KST
 
 ### ISO 9660 multi-extent regular-file assembly

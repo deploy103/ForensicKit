@@ -1,10 +1,10 @@
 # ForensicKit Work Queue
 
-Last reviewed: 2026-09-07 12:18 KST
+Last reviewed: 2026-09-07 12:38 KST
 
 ## Post-v1.1 backlog
 
-- [ ] Validate Joliet little-/big-endian path-table copies and reconcile them to the active UCS-2 namespace.
+- [ ] Validate Rock Ridge `PX` hard-link identity groups without inferring unsafe links or duplicate children.
 
 ## v1.1.0 release gate
 
@@ -17,6 +17,7 @@ Last reviewed: 2026-09-07 12:18 KST
 
 ## Completed this session
 
+- [x] Bounded Joliet Type-L/Type-M path-table parsing, strict UCS-2BE comparison, and active-tree reconciliation.
 - [x] Bounded ISO multi-extent regular-file assembly with ordered per-record/range provenance and exact Joliet aliases.
 - [x] Rock Ridge `CL`/`PL`/`RE` relocation-role validation and non-traversing extent reconciliation.
 - [x] Rock Ridge `TF` short/long timestamp and `PN` both-endian device metadata parsing.
