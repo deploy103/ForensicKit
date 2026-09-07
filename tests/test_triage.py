@@ -83,6 +83,30 @@ def _cpio_newc_archive(*members: bytes, magic: bytes = b"070701") -> bytes:
     return b"".join((*members, trailer))
 
 
+def _cpio_odc_member(
+    name: str,
+    data: bytes = b"",
+    *,
+    mode: int = 0o100644,
+    inode: int = 1,
+    device: int = 0o12,
+    rdevice: int = 0,
+) -> bytes:
+    raw_name = name.encode("utf-8") + b"\x00"
+    header = (
+        b"070707"
+        + f"{device:06o}{inode:06o}{mode:06o}{1000:06o}{1000:06o}{1:06o}{rdevice:06o}"
+        f"{1_700_000_000:011o}{len(raw_name):06o}{len(data):011o}".encode("ascii")
+    )
+    assert len(header) == 76
+    result = bytearray(header)
+    result.extend(raw_name)
+    result.extend(b"\x00" * ((-len(result)) % 2))
+    result.extend(data)
+    result.extend(b"\x00" * ((-len(result)) % 2))
+    return bytes(result)
+
+
 def test_png_appended_zip_is_observed_and_classified(tmp_path: Path) -> None:
     zip_path = tmp_path / "payload.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
@@ -1161,6 +1185,38 @@ def test_cpio_crc_entries_preserve_ranges_checksums_types_and_unsafe_paths(tmp_p
         item.category == "archive_structure_anomaly"
         for item in nonzero_profile.findings
     )
+
+    odc_member = _cpio_odc_member(
+        "ab", b"xyz", mode=0o100604, inode=7, device=0o12, rdevice=0o34,
+    )
+    odc = tmp_path / "portable-ascii.cpio"
+    odc.write_bytes(odc_member + _cpio_odc_member(
+        "TRAILER!!!", mode=0, inode=8,
+    ))
+    odc_artifact = _artifact(odc)
+    odc_observations = GenericTriageEngine().analyze(odc_artifact, odc)
+    odc_values = _values(odc_observations)
+    assert IdentificationEngine().identify(odc_artifact, odc_observations).format == "cpio"
+    assert odc_values["archive.cpio.formats"] == ["odc"]
+    assert odc_values["archive.cpio.complete"] is True
+    odc_record = odc_values["archive.cpio.entries"][0]
+    assert odc_record["magic"] == "070707"
+    assert odc_record["header_length"] == 76
+    assert odc_record["numeric_encoding"] == "octal"
+    assert odc_record["alignment"] == 2
+    assert odc_record["name_offset"] == 76
+    assert odc_record["name_padding_length"] == 1
+    assert odc_record["data_offset"] == 80
+    assert odc_record["data_length"] == 3
+    assert odc_record["data_padding_length"] == 1
+    assert odc_record["next_header_offset"] == len(odc_member)
+    assert odc_record["inode"] == 7
+    assert odc_record["permissions"] == "0o0604"
+    assert odc_record["legacy_device"] == 0o12
+    assert odc_record["legacy_rdevice"] == 0o34
+    assert odc_record["device_major"] is None
+    assert odc_record["stored_checksum"] is None
+    assert odc_record["checksum_verification"] == "not_applicable"
 
 
 def test_ntfs_mft_zero_fixed_header_is_observed_at_boot_geometry_offset(tmp_path: Path) -> None:

@@ -140,7 +140,7 @@ class ArchiveProfile(BaseProfile):
                     category="archive_structure_anomaly",
                     confidence=0.97,
                     explanation=(
-                        "Bounded native newc/CRC parsing found a malformed range/header, mixed entry formats, "
+                        "Bounded native odc/newc/CRC parsing found a malformed range/header, mixed entry formats, "
                         "a CRC byte-sum mismatch, or a nonzero checksum field in a non-CRC newc entry."
                     ),
                     evidence=(

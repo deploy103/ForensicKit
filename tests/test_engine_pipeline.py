@@ -43,6 +43,27 @@ def _cpio_crc_member(
     return bytes(result)
 
 
+def _cpio_odc_member(
+    name: str,
+    data: bytes = b"",
+    *,
+    mode: int = 0o100644,
+    inode: int = 1,
+) -> bytes:
+    raw_name = name.encode("utf-8") + b"\x00"
+    fields = (
+        f"{0:06o}{inode:06o}{mode:06o}{0:06o}{0:06o}{1:06o}{0:06o}"
+        f"{1_700_000_000:011o}{len(raw_name):06o}{len(data):011o}"
+    )
+    result = bytearray(b"070707" + fields.encode("ascii"))
+    assert len(result) == 76
+    result.extend(raw_name)
+    result.extend(b"\x00" * ((-len(result)) % 2))
+    result.extend(data)
+    result.extend(b"\x00" * ((-len(result)) % 2))
+    return bytes(result)
+
+
 def test_png_appended_zip_recurses_to_base64_flag(tmp_path: Path) -> None:
     archive = BytesIO()
     with ZipFile(archive, "w") as zip_file:
@@ -148,9 +169,55 @@ def test_cpio_crc_regular_file_recurses_with_exact_range_and_checksum_lineage(tm
     report = next((tmp_path / "cpio-cases").glob("*/reports/report.json")).read_text(
         encoding="utf-8"
     )
-    assert "SVR4 cpio archive" in report
+    assert "ASCII cpio archive" in report
     assert "builtin_cpio_extractor" in report
     assert "CTF{cpio_recursive_lineage}" in report
+
+
+def test_cpio_odc_regular_file_recurses_with_octal_header_provenance(tmp_path: Path) -> None:
+    payload = b"CTF{cpio_odc_recursive}"
+    member = _cpio_odc_member("flag", payload, inode=7)
+    trailer = _cpio_odc_member("TRAILER!!!", mode=0, inode=8)
+    evidence = tmp_path / "portable-ascii.cpio"
+    evidence.write_bytes(member + trailer)
+
+    result = AnalysisEngine().analyze(
+        evidence, tmp_path / "cpio-odc-cases", mode=AnalysisMode.AUTO,
+        execute=False,
+    )
+
+    assert [item.logical_name for item in result.artifacts] == [
+        "portable-ascii.cpio", "flag",
+    ]
+    child = result.artifacts[1]
+    assert child.parent_id == result.artifacts[0].id
+    assert child.size == len(payload)
+    assert any(
+        candidate.value == "CTF{cpio_odc_recursive}"
+        and candidate.artifact_id == child.id
+        for candidate in result.flags
+    )
+    entry = next(
+        item.value[0] for item in result.observations
+        if item.artifact_id == result.artifacts[0].id
+        and item.key == "archive.cpio.entries"
+    )
+    assert entry["format"] == "odc"
+    assert entry["header_length"] == 76
+    assert entry["numeric_encoding"] == "octal"
+    assert entry["alignment"] == 2
+    assert entry["data_offset"] == len(member) - len(payload) - ((-len(payload)) % 2)
+    recovery = next(
+        item for item in result.findings
+        if item.source == "builtin_cpio_extractor"
+    )
+    assert "format:odc" in recovery.supporting_evidence[0]
+    assert "header_offset:0" in recovery.supporting_evidence[0]
+    assert f"data_offset:{entry['data_offset']}" in recovery.supporting_evidence[0]
+    assert f"data_length:{len(payload)}" in recovery.supporting_evidence[0]
+    assert "stored_checksum:None" in recovery.supporting_evidence[0]
+    assert "calculated_checksum:None" in recovery.supporting_evidence[0]
+    assert "checksum_valid:None" in recovery.supporting_evidence[0]
 
 
 def test_ext_root_regular_file_recurses_to_flag_with_inode_lineage(tmp_path: Path) -> None:

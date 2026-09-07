@@ -1,5 +1,18 @@
 # ForensicKit Work Log
 
+## 2026-09-07 10:06 KST
+
+### Portable ASCII CPIO odc support
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/identification.py`, `src/forensickit/profiles/archive.py`, `src/forensickit/extraction.py`, `tests/test_triage.py`, and `tests/test_engine_pipeline.py`.
+- Extended the native CPIO walker to magic `070707` portable ASCII `odc` entries. Each entry is decoded only after all fixed fields pass strict octal validation and retains its distinct 76-byte header, two-byte name/data alignment, legacy device/rdevice values, inode/mode/ownership/link/mtime metadata, exact pathname/data offsets, and explicit checksum-not-applicable state. Mixed odc/newc/CRC entry formats remain visible and trigger the existing structural anomaly path.
+- The built-in extractor now independently revalidates odc octal mode/name-size/file-size fields and the exact two-byte-aligned observed data range before copying a regular file. The existing unsafe-path, special-file, recursion, count, and byte gates apply unchanged, while extraction findings distinguish odc format and retain null checksum provenance instead of fabricating CRC semantics.
+- Odd-length pathname/data fixtures prove odc padding and range math; an AUTO Engine E2E proves CPIO root → odc regular-file child → child-attributed FlagCandidate with octal-header evidence in the report. Focused CPIO regressions passed; the full direct synthetic suite passed: 309 passed, 0 failed. `python -m compileall -q src tests` and `git diff --check` passed.
+
+### Next
+
+- Add bounded ISO 9660 primary-volume/root-directory parsing and safe regular-file child extraction with extent, logical-block, directory-record, and volume-descriptor provenance.
+
 ## 2026-09-07 10:01 KST
 
 ### Native CPIO newc/CRC parsing and recursive extraction

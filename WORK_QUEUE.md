@@ -1,10 +1,11 @@
 # ForensicKit Work Queue
 
-Last reviewed: 2026-09-07 10:01 KST
+Last reviewed: 2026-09-07 10:06 KST
 
 ## Post-v1.1 backlog
 
-- [ ] Extend native CPIO coverage to portable ASCII `odc` while preserving format-specific alignment and numeric provenance.
+- [ ] Add bounded ISO 9660 primary-volume/root-directory parsing and safe regular-file child extraction.
+- [ ] Add bounded ISO 9660 active subdirectory traversal with shared-extent/cycle protection and directory lineage.
 
 ## v1.1.0 release gate
 
@@ -17,6 +18,7 @@ Last reviewed: 2026-09-07 10:01 KST
 
 ## Completed this session
 
+- [x] Portable ASCII CPIO `odc` strict-octal parsing and two-byte-aligned recursive regular-file extraction.
 - [x] Native bounded CPIO `newc`/CRC parsing, checksum/path anomaly findings, and safe recursive regular-file extraction.
 - [x] Cross-table primary/logical/GPT partition extent overlap/duplicate detection, semantic-container exclusion, and ambiguity-gated recursive materialization.
 - [x] Bounded ext4 depth-two extent-tree traversal, intermediate-index provenance, range validation, cycle protection, and recursive Engine E2E.
