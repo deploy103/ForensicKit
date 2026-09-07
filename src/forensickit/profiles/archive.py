@@ -6,7 +6,7 @@ from .base import BaseProfile, ProfileContext, ProfileResult
 
 ARCHIVE_TYPES = {
     "archive", "container", "zip", "7z", "rar", "tar", "cpio", "gzip", "gz", "bzip2", "xz",
-    "cab", "iso", "jar", "apk", "ooxml",
+    "cab", "iso", "iso9660", "jar", "apk", "ooxml",
 }
 
 
@@ -169,6 +169,111 @@ class ArchiveProfile(BaseProfile):
                     ),
                     evidence=[str(item)[:2_000] for item in unsafe_cpio_entries[:16]],
                     severity="medium",
+                )
+            )
+        iso_signature = context.truthy("archive.iso9660.signature")
+        iso_pvd = next(
+            (
+                value for value in context.values("archive.iso9660.primary_volume_descriptor")
+                if isinstance(value, dict)
+            ),
+            {},
+        )
+        iso_descriptor_error = next(
+            (
+                value for value in context.values("archive.iso9660.descriptor_error")
+                if isinstance(value, str) and value
+            ),
+            None,
+        )
+        iso_root_error = next(
+            (
+                value for value in context.values("archive.iso9660.root_directory_error")
+                if isinstance(value, str) and value
+            ),
+            None,
+        )
+        iso_terminator = next(
+            (
+                value for value in context.values("archive.iso9660.descriptor_terminator_found")
+                if isinstance(value, bool)
+            ),
+            False,
+        )
+        if iso_signature and (
+            iso_pvd.get("valid") is not True
+            or iso_descriptor_error
+            or iso_root_error
+            or not iso_terminator
+        ):
+            result.findings.append(
+                self.finding(
+                    context,
+                    title="ISO 9660 volume or root-directory structure anomaly",
+                    category="archive_structure_anomaly",
+                    confidence=0.98,
+                    explanation=(
+                        "The fixed-location descriptor sequence, primary-volume both-endian fields, "
+                        "declared volume bounds, root directory record, or a bounded root entry did not validate."
+                    ),
+                    evidence=(
+                        [f"primary_volume_descriptor={iso_pvd}"]
+                        + ([f"descriptor_error={iso_descriptor_error}"] if iso_descriptor_error else [])
+                        + ([f"root_directory_error={iso_root_error}"] if iso_root_error else [])
+                        + (["descriptor_terminator_found=False"] if not iso_terminator else [])
+                    ),
+                    severity="medium",
+                )
+            )
+        iso_entries = next(
+            (
+                value for value in context.values("archive.iso9660.root_directory_entries")
+                if isinstance(value, list)
+            ),
+            [],
+        )
+        unsafe_iso_entries = [
+            item for item in iso_entries
+            if isinstance(item, dict) and item.get("path_safe") is False
+        ]
+        if unsafe_iso_entries:
+            result.findings.append(
+                self.finding(
+                    context,
+                    title="ISO 9660 contains unsafe root member name(s)",
+                    category="archive_unsafe_member_path",
+                    confidence=0.99,
+                    explanation=(
+                        "A root directory identifier is absolute, drive-rooted, contains a path separator, "
+                        "or contains a parent component. It remains metadata-only."
+                    ),
+                    evidence=[str(item)[:2_000] for item in unsafe_iso_entries[:16]],
+                    severity="medium",
+                )
+            )
+        unsupported_iso_entries = [
+            item for item in iso_entries
+            if isinstance(item, dict)
+            and item.get("file_type") == "regular"
+            and (
+                item.get("multi_extent") is True
+                or item.get("file_unit_size") not in {0, None}
+                or item.get("interleave_gap_size") not in {0, None}
+            )
+        ]
+        if unsupported_iso_entries:
+            result.findings.append(
+                self.finding(
+                    context,
+                    title="ISO 9660 root file uses an unsupported multi-extent/interleaved layout",
+                    category="archive_unsupported_layout",
+                    confidence=0.99,
+                    explanation=(
+                        "The entry remains fully inventoried, but the native extractor requires one "
+                        "non-interleaved extent and will not infer missing extent joins."
+                    ),
+                    evidence=[str(item)[:2_000] for item in unsupported_iso_entries[:16]],
+                    severity="info",
                 )
             )
         return result

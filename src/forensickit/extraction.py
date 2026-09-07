@@ -489,6 +489,174 @@ class ExtractionManager:
             ))
         return result
 
+    def extract_iso9660(self, artifact: Artifact) -> ExtractionResult:
+        """Copy validated single-extent regular files from the ISO primary root."""
+        result = ExtractionResult()
+        observations = self.workspace.database.observations(artifact.id)
+        entry_observation = next(
+            (
+                observation
+                for observation in observations
+                if observation.key == "archive.iso9660.root_directory_entries"
+                and isinstance(observation.value, list)
+            ),
+            None,
+        )
+        if entry_observation is None:
+            return result
+        pvd_observation = next(
+            (
+                observation
+                for observation in observations
+                if observation.key == "archive.iso9660.primary_volume_descriptor"
+                and isinstance(observation.value, dict)
+            ),
+            None,
+        )
+        if pvd_observation is None or pvd_observation.value.get("valid") is not True:
+            result.errors.append("skipped ISO extraction: primary volume descriptor did not validate")
+            return result
+        pvd_block_size = pvd_observation.value.get("logical_block_size")
+        source = self.workspace.resolve_stored_path(artifact.path)
+        target_root = self.workspace.path("extracted", artifact.id, "builtin_iso9660")
+        evidence: list[str] = []
+        try:
+            source_stream = source.open("rb")
+        except OSError as exc:
+            result.errors.append(f"ISO source open failed for {artifact.logical_name}: {exc}")
+            return result
+        with source_stream:
+            for record_index, record in enumerate(entry_observation.value):
+                if not isinstance(record, dict) or record.get("file_type") != "regular":
+                    continue
+                name = record.get("logical_name")
+                if not isinstance(name, str) or not name or self._unsafe_name(name):
+                    result.errors.append(f"skipped ISO root member {name!r}: unsafe path")
+                    continue
+                if record.get("extraction_eligible") is not True:
+                    if (
+                        record.get("multi_extent") is True
+                        or record.get("file_unit_size") not in {0, None}
+                        or record.get("interleave_gap_size") not in {0, None}
+                    ):
+                        result.errors.append(
+                            f"skipped ISO root member {name!r}: unsupported multi-extent/interleaved layout"
+                        )
+                    else:
+                        result.errors.append(
+                            f"skipped ISO root member {name!r}: directory record did not validate"
+                        )
+                    continue
+                record_offset = record.get("record_offset")
+                record_length = record.get("record_length")
+                block_size = record.get("logical_block_size")
+                extent_block = record.get("extent_block")
+                extended_attribute_blocks = record.get("extended_attribute_blocks")
+                data_offset = record.get("data_offset")
+                data_length = record.get("data_length")
+                identifier_raw_hex = record.get("identifier_raw_hex")
+                if (
+                    isinstance(record_offset, bool) or not isinstance(record_offset, int)
+                    or isinstance(record_length, bool) or not isinstance(record_length, int)
+                    or isinstance(block_size, bool) or not isinstance(block_size, int)
+                    or isinstance(extent_block, bool) or not isinstance(extent_block, int)
+                    or isinstance(extended_attribute_blocks, bool)
+                    or not isinstance(extended_attribute_blocks, int)
+                    or isinstance(data_offset, bool) or not isinstance(data_offset, int)
+                    or isinstance(data_length, bool) or not isinstance(data_length, int)
+                    or not isinstance(identifier_raw_hex, str)
+                    or record_offset < 0 or not 34 <= record_length <= 255
+                    or block_size < 512 or block_size > 32_768
+                    or block_size != pvd_block_size
+                    or data_offset != (extent_block + extended_attribute_blocks) * block_size
+                    or data_length < 0 or data_offset + data_length > artifact.size
+                ):
+                    result.errors.append(f"skipped ISO root member {name!r}: invalid observed byte range")
+                    continue
+                reason = self.can_register(artifact, data_length)
+                if reason:
+                    result.errors.append(f"skipped ISO root member {name!r}: {reason}")
+                    continue
+                try:
+                    source_stream.seek(record_offset)
+                    raw_record = source_stream.read(record_length)
+                    identifier_length = raw_record[32] if len(raw_record) >= 33 else 0
+                    raw_identifier = raw_record[33:33 + identifier_length]
+                    if (
+                        len(raw_record) != record_length
+                        or raw_record[0] != record_length
+                        or raw_record[1] != extended_attribute_blocks
+                        or 33 + identifier_length > record_length
+                        or raw_identifier.hex() != identifier_raw_hex
+                        or int.from_bytes(raw_record[2:6], "little") != extent_block
+                        or int.from_bytes(raw_record[6:10], "big") != extent_block
+                        or int.from_bytes(raw_record[10:14], "little") != data_length
+                        or int.from_bytes(raw_record[14:18], "big") != data_length
+                        or raw_record[25] & 0x82
+                        or raw_record[26] != 0
+                        or raw_record[27] != 0
+                    ):
+                        raise RuntimeError("directory record no longer matches triage provenance")
+                except (OSError, RuntimeError) as exc:
+                    result.errors.append(f"skipped ISO root member {name!r}: {exc}")
+                    continue
+                target_root.mkdir(parents=True, exist_ok=True)
+                output = target_root / f"{record_index:05d}_{safe_name(name)}"
+                written = 0
+                try:
+                    source_stream.seek(data_offset)
+                    with output.open("xb") as writer:
+                        remaining = data_length
+                        while remaining:
+                            chunk = source_stream.read(min(1024 * 1024, remaining))
+                            if not chunk:
+                                raise RuntimeError("file extent read ended before declared length")
+                            writer.write(chunk)
+                            written += len(chunk)
+                            remaining -= len(chunk)
+                    if written != data_length:
+                        raise RuntimeError("file extent length mismatch")
+                except (OSError, RuntimeError) as exc:
+                    output.unlink(missing_ok=True)
+                    result.errors.append(f"failed ISO root member {name!r}: {exc}")
+                    continue
+                child = self.register_file(output, artifact, name)
+                if child is None:
+                    result.errors.append(
+                        f"skipped ISO root member {name!r}: duplicate or extraction limit"
+                    )
+                    continue
+                result.artifacts.append(child)
+                result.extracted_bytes += child.size
+                evidence.append(
+                    f"child:{child.id};source_observation_id:{entry_observation.id};"
+                    f"source_observation_key:{entry_observation.key};"
+                    f"pvd_observation_id:{pvd_observation.id};"
+                    f"pvd_observation_key:{pvd_observation.key};"
+                    f"pvd_descriptor_offset:{pvd_observation.value.get('descriptor_offset')};"
+                    f"record_offset:{record_offset};record_length:{record_length};"
+                    f"logical_block_size:{block_size};extent_block:{extent_block};"
+                    f"extended_attribute_blocks:{extended_attribute_blocks};"
+                    f"data_offset:{data_offset};data_length:{data_length};"
+                    f"directory_record:{record}"
+                )
+        if result.artifacts:
+            result.findings.append(Finding(
+                artifact_id=artifact.id,
+                title=f"Extracted {len(result.artifacts)} ISO 9660 root file(s)",
+                category="archive_extraction",
+                severity="info",
+                confidence=0.99,
+                explanation=(
+                    "Only primary-volume root regular files with matching both-endian extent/length "
+                    "fields, one non-interleaved extent, safe identifiers, and complete image-bounded "
+                    "ranges were copied. Directory and unsupported layouts remain metadata-only."
+                ),
+                source="builtin_iso9660_extractor",
+                supporting_evidence=evidence[:128],
+            ))
+        return result
+
     def extract_single_stream(self, artifact: Artifact) -> ExtractionResult:
         source = self.workspace.resolve_stored_path(artifact.path)
         try:
@@ -2987,6 +3155,9 @@ class ExtractionManager:
         cpio_result = self.extract_cpio(artifact)
         if cpio_result.artifacts or cpio_result.errors:
             return cpio_result
+        iso_result = self.extract_iso9660(artifact)
+        if iso_result.artifacts or iso_result.errors:
+            return iso_result
         tar_result = self.extract_tar(artifact)
         if tar_result.artifacts or tar_result.errors:
             return tar_result
