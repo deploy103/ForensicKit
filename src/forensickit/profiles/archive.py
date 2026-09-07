@@ -297,6 +297,67 @@ class ArchiveProfile(BaseProfile):
                     severity="medium",
                 )
             )
+        rock_ridge_zisofs = next(
+            (
+                value for value in context.values(
+                    "archive.iso9660.rock_ridge_zisofs"
+                )
+                if isinstance(value, list)
+            ),
+            [],
+        )
+        rock_ridge_zisofs_errors = next(
+            (
+                value for value in context.values(
+                    "archive.iso9660.rock_ridge_zisofs_errors"
+                )
+                if isinstance(value, list)
+            ),
+            [],
+        )
+        valid_rock_ridge_zisofs = [
+            item for item in rock_ridge_zisofs
+            if isinstance(item, dict) and item.get("valid") is True
+        ]
+        if valid_rock_ridge_zisofs:
+            result.findings.append(
+                self.finding(
+                    context,
+                    title="Rock Ridge zisofs compression metadata validated",
+                    category="archive_compression_metadata",
+                    confidence=0.99,
+                    explanation=(
+                        "An RRIP ZF declaration matches a bounded zisofs header and monotonic "
+                        "block-pointer table. Exact metadata offsets and hashes are retained, "
+                        "including zero-fill blocks, but compressed data is not decompressed or "
+                        "materialized."
+                    ),
+                    evidence=[
+                        str(item)[:2_000]
+                        for item in valid_rock_ridge_zisofs[:16]
+                    ],
+                    severity="info",
+                )
+            )
+        if rock_ridge_zisofs_errors:
+            result.findings.append(
+                self.finding(
+                    context,
+                    title="Rock Ridge zisofs metadata is inconsistent or malformed",
+                    category="iso9660_zisofs_anomaly",
+                    confidence=0.98,
+                    explanation=(
+                        "An RRIP ZF claim, zisofs header, stored range, or bounded block-pointer "
+                        "table failed validation. The compressed stream remains evidence-only and "
+                        "is never speculatively decompressed."
+                    ),
+                    evidence=[
+                        str(item)[:2_000]
+                        for item in rock_ridge_zisofs_errors[:16]
+                    ],
+                    severity="medium",
+                )
+            )
         joliet_descriptors = next(
             (
                 value for value in context.values("archive.iso9660.joliet_descriptors")

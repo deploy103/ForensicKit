@@ -1916,6 +1916,23 @@ class GenericTriageEngine:
                         "primary_match_count": len(primary_matches),
                         "joliet_match_count": len(joliet_matches),
                     })
+        rock_ridge_zisofs: list[dict[str, object]] = []
+        rock_ridge_zisofs_errors: list[dict[str, object]] = []
+        if (
+            pvd is not None
+            and pvd.get("valid") is True
+            and isinstance(pvd.get("declared_volume_bytes"), int)
+            and not isinstance(pvd.get("declared_volume_bytes"), bool)
+        ):
+            (
+                rock_ridge_zisofs,
+                rock_ridge_zisofs_errors,
+            ) = self._iso9660_zisofs_metadata(
+                path,
+                regular_files,
+                evidence_size=size,
+                declared_volume_bytes=int(pvd["declared_volume_bytes"]),
+            )
         (
             rock_ridge_hard_link_groups,
             rock_ridge_hard_link_errors,
@@ -1966,6 +1983,8 @@ class GenericTriageEngine:
             self._observation(artifact, "archive.iso9660.rock_ridge_entry_count", len(rock_ridge_entries)),
             self._observation(artifact, "archive.iso9660.rock_ridge_symlinks", rock_ridge_symlinks),
             self._observation(artifact, "archive.iso9660.rock_ridge_symlink_count", len(rock_ridge_symlinks)),
+            self._observation(artifact, "archive.iso9660.rock_ridge_zisofs", rock_ridge_zisofs),
+            self._observation(artifact, "archive.iso9660.rock_ridge_zisofs_errors", rock_ridge_zisofs_errors),
             self._observation(artifact, "archive.iso9660.rock_ridge_hard_link_groups", rock_ridge_hard_link_groups),
             self._observation(artifact, "archive.iso9660.rock_ridge_hard_link_errors", rock_ridge_hard_link_errors),
             self._observation(artifact, "archive.iso9660.joliet_detected", bool(joliet_descriptors)),
@@ -2163,6 +2182,7 @@ class GenericTriageEngine:
                     or segment.get("susp_error")
                     or segment.get("susp_continuation_unparsed") is True
                     or segment.get("rock_ridge_relocation_traversal_suppressed") is True
+                    or segment.get("rock_ridge_zisofs") is True
                 ):
                     failed_checks.append(f"segment_{segment_index}_metadata_unsafe")
                 data_offset = segment.get("data_offset")
@@ -2552,6 +2572,267 @@ class GenericTriageEngine:
                 group["duplicate_extraction_suppressed_count"] = suppressed
                 canonical["rock_ridge_hard_link_group"] = group
         return groups, errors
+
+    def _iso9660_zisofs_metadata(
+        self,
+        path: Path,
+        regular_files: list[dict[str, object]],
+        *,
+        evidence_size: int,
+        declared_volume_bytes: int,
+    ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+        """Validate bounded zisofs headers and pointer tables without decompressing."""
+        records: list[dict[str, object]] = []
+        errors: list[dict[str, object]] = []
+        pointer_limit = 65_536
+        metadata_byte_limit = min(self.limits.signature_scan_bytes, _MIB)
+        magic = bytes.fromhex("37e45396c9dbd607")
+        for file_record in regular_files:
+            if file_record.get("rock_ridge_zisofs") is not True:
+                continue
+            claim = file_record.get("rock_ridge_zisofs_claim")
+            data_offset = file_record.get("data_offset")
+            stored_length = file_record.get("data_length")
+            failed_checks: list[str] = []
+            record: dict[str, object] = {
+                "record_offset": file_record.get("record_offset"),
+                "archive_path": file_record.get("archive_path"),
+                "data_offset": data_offset,
+                "stored_length": stored_length,
+                "stored_end_offset": (
+                    data_offset + stored_length
+                    if isinstance(data_offset, int)
+                    and not isinstance(data_offset, bool)
+                    and isinstance(stored_length, int)
+                    and not isinstance(stored_length, bool)
+                    else None
+                ),
+                "claim": claim,
+                "pointer_limit": pointer_limit,
+                "metadata_byte_limit": metadata_byte_limit,
+                "decompression_performed": False,
+                "extraction_eligible": False,
+                "failed_checks": failed_checks,
+                "valid": False,
+            }
+            records.append(record)
+            file_record["rock_ridge_zisofs_validation"] = record
+            if not isinstance(claim, dict):
+                failed_checks.append("unique_valid_zf_claim")
+            if file_record.get("multi_extent") is True:
+                failed_checks.append("single_extent_compressed_stream")
+            if (
+                not isinstance(data_offset, int) or isinstance(data_offset, bool)
+                or not isinstance(stored_length, int)
+                or isinstance(stored_length, bool)
+                or stored_length < 16
+                or data_offset < 0
+                or data_offset + stored_length > evidence_size
+                or data_offset + stored_length > declared_volume_bytes
+            ):
+                failed_checks.append("stored_stream_range")
+            if failed_checks:
+                errors.append({
+                    "reason": "invalid_zisofs_metadata",
+                    "record_offset": file_record.get("record_offset"),
+                    "archive_path": file_record.get("archive_path"),
+                    "failed_checks": list(failed_checks),
+                })
+                continue
+            assert isinstance(claim, dict)
+            assert isinstance(data_offset, int)
+            assert isinstance(stored_length, int)
+            try:
+                with path.open("rb") as stream:
+                    stream.seek(data_offset)
+                    header = stream.read(16)
+            except OSError as exc:
+                record["read_error"] = str(exc)[:2_000]
+                failed_checks.append("header_read")
+                errors.append({
+                    "reason": "invalid_zisofs_metadata",
+                    "record_offset": file_record.get("record_offset"),
+                    "archive_path": file_record.get("archive_path"),
+                    "failed_checks": list(failed_checks),
+                })
+                continue
+            if len(header) != 16:
+                failed_checks.append("header_truncated")
+                errors.append({
+                    "reason": "invalid_zisofs_metadata",
+                    "record_offset": file_record.get("record_offset"),
+                    "archive_path": file_record.get("archive_path"),
+                    "failed_checks": list(failed_checks),
+                })
+                continue
+
+            uncompressed_size = int.from_bytes(header[8:12], "little")
+            header_size_words = header[12]
+            header_size_bytes = header_size_words * 4
+            block_shift = header[13]
+            block_size = 1 << block_shift if block_shift <= 31 else None
+            record.update({
+                "header_offset": data_offset,
+                "header_length": 16,
+                "header_end_offset": data_offset + 16,
+                "header_raw_hex": header.hex(),
+                "magic_raw_hex": header[:8].hex(),
+                "magic_valid": header[:8] == magic,
+                "uncompressed_size": uncompressed_size,
+                "header_size_words": header_size_words,
+                "header_size_bytes": header_size_bytes,
+                "block_shift": block_shift,
+                "block_size": block_size,
+                "reserved_raw_hex": header[14:16].hex(),
+            })
+            if header[:8] != magic:
+                failed_checks.append("zisofs_magic")
+            if uncompressed_size != claim.get("uncompressed_size"):
+                failed_checks.append("zf_uncompressed_size_mismatch")
+            if header_size_words != claim.get("header_size_words"):
+                failed_checks.append("zf_header_size_mismatch")
+            if block_shift != claim.get("block_shift"):
+                failed_checks.append("zf_block_shift_mismatch")
+            if header[14:16] != b"\x00\x00":
+                failed_checks.append("header_reserved_bytes")
+            if not 4 <= header_size_words <= 255:
+                failed_checks.append("header_size")
+            if not 9 <= block_shift <= 17 or not isinstance(block_size, int):
+                failed_checks.append("block_shift")
+            if uncompressed_size > self.limits.max_single_artifact_size:
+                failed_checks.append("uncompressed_size_limit")
+
+            block_count = (
+                (uncompressed_size + block_size - 1) // block_size
+                if isinstance(block_size, int) else pointer_limit + 1
+            )
+            pointer_count = block_count + 1
+            pointer_table_offset = data_offset + header_size_bytes
+            pointer_table_length = pointer_count * 4
+            pointer_table_end_relative = header_size_bytes + pointer_table_length
+            record.update({
+                "block_count": block_count,
+                "pointer_count": pointer_count,
+                "pointer_table_offset": pointer_table_offset,
+                "pointer_table_length": pointer_table_length,
+                "pointer_table_end_offset": data_offset + pointer_table_end_relative,
+                "pointer_table_end_relative": pointer_table_end_relative,
+                "metadata_offset": data_offset,
+                "metadata_length": pointer_table_end_relative,
+                "metadata_end_offset": data_offset + pointer_table_end_relative,
+            })
+            if pointer_count > pointer_limit:
+                failed_checks.append("pointer_count_limit")
+            if pointer_table_end_relative > metadata_byte_limit:
+                failed_checks.append("zisofs_metadata_byte_limit")
+            if (
+                header_size_bytes < 16
+                or pointer_table_end_relative > stored_length
+            ):
+                failed_checks.append("pointer_table_within_stored_stream")
+            if failed_checks:
+                record["failed_checks"] = list(dict.fromkeys(failed_checks))
+                errors.append({
+                    "reason": "invalid_zisofs_metadata",
+                    "record_offset": file_record.get("record_offset"),
+                    "archive_path": file_record.get("archive_path"),
+                    "failed_checks": record["failed_checks"],
+                })
+                continue
+            try:
+                with path.open("rb") as stream:
+                    stream.seek(data_offset + 16)
+                    metadata_tail = stream.read(
+                        pointer_table_end_relative - 16
+                    )
+            except OSError as exc:
+                record["read_error"] = str(exc)[:2_000]
+                failed_checks.append("pointer_table_read")
+                metadata_tail = b""
+            header_extension_length = header_size_bytes - 16
+            header_extension = metadata_tail[:header_extension_length]
+            pointer_raw = metadata_tail[header_extension_length:]
+            record.update({
+                "header_extension_raw_hex": header_extension.hex(),
+                "metadata_raw_sha256": hashlib.sha256(
+                    header + metadata_tail
+                ).hexdigest(),
+            })
+            if len(metadata_tail) != pointer_table_end_relative - 16:
+                failed_checks.append("zisofs_metadata_truncated")
+            if len(pointer_raw) != pointer_table_length:
+                failed_checks.append("pointer_table_truncated")
+            pointers = [
+                int.from_bytes(pointer_raw[index:index + 4], "little")
+                for index in range(0, len(pointer_raw), 4)
+                if index + 4 <= len(pointer_raw)
+            ]
+            record.update({
+                "pointer_table_preview_hex": pointer_raw[:256].hex(),
+                "pointer_table_raw_sha256": hashlib.sha256(pointer_raw).hexdigest(),
+                "pointers": pointers,
+                "compressed_blocks": [],
+            })
+            if len(pointers) != pointer_count:
+                failed_checks.append("pointer_count")
+            if pointers and pointers[0] < pointer_table_end_relative:
+                failed_checks.append("first_pointer_before_table_end")
+            if any(left > right for left, right in zip(pointers, pointers[1:])):
+                failed_checks.append("pointer_order")
+            if any(pointer > stored_length for pointer in pointers):
+                failed_checks.append("pointer_within_stored_stream")
+            if pointers and pointers[-1] != stored_length:
+                failed_checks.append("final_pointer_matches_stored_length")
+
+            compressed_blocks: list[dict[str, object]] = []
+            if len(pointers) == pointer_count and isinstance(block_size, int):
+                for block_index, (start, end) in enumerate(
+                    zip(pointers, pointers[1:])
+                ):
+                    expected_length = min(
+                        block_size,
+                        max(0, uncompressed_size - block_index * block_size),
+                    )
+                    compressed_length = end - start
+                    compressed_bound = (
+                        expected_length
+                        + (expected_length >> 12)
+                        + (expected_length >> 14)
+                        + (expected_length >> 25)
+                        + 13
+                    )
+                    length_valid = 0 <= compressed_length <= compressed_bound
+                    if not length_valid:
+                        failed_checks.append(
+                            f"compressed_block_{block_index}_length"
+                        )
+                    compressed_blocks.append({
+                        "index": block_index,
+                        "pointer_entry_offset": pointer_table_offset + block_index * 4,
+                        "start_relative_offset": start,
+                        "end_relative_offset": end,
+                        "data_offset": data_offset + start,
+                        "data_end_offset": data_offset + end,
+                        "compressed_length": compressed_length,
+                        "expected_uncompressed_length": expected_length,
+                        "zero_fill": start == end,
+                        "compressed_length_within_bound": length_valid,
+                    })
+            failed_checks = list(dict.fromkeys(failed_checks))
+            record.update({
+                "compressed_blocks": compressed_blocks,
+                "failed_checks": failed_checks,
+                "valid": not failed_checks,
+            })
+            file_record["rock_ridge_zisofs_validation"] = record
+            if failed_checks:
+                errors.append({
+                    "reason": "invalid_zisofs_metadata",
+                    "record_offset": file_record.get("record_offset"),
+                    "archive_path": file_record.get("archive_path"),
+                    "failed_checks": failed_checks,
+                })
+        return records, errors
 
     @staticmethod
     def _iso9660_el_torito_hard_disk_mbr(
@@ -3969,6 +4250,37 @@ class GenericTriageEngine:
                         entry[f"{field_name}_both_endian_match"] = little == big
                         if little != big:
                             fail(entry, f"RRIP PN {field_name} both-endian mismatch")
+            elif signature == "ZF":
+                if entry_length != 16:
+                    fail(entry, "invalid RRIP ZF entry length")
+                else:
+                    algorithm_raw = raw[4:6]
+                    header_size_words = raw[6]
+                    block_shift = raw[7]
+                    uncompressed_size = int.from_bytes(raw[8:12], "little")
+                    uncompressed_size_big = int.from_bytes(raw[12:16], "big")
+                    entry.update({
+                        "algorithm_raw_hex": algorithm_raw.hex(),
+                        "algorithm": algorithm_raw.decode("ascii", errors="replace"),
+                        "algorithm_supported": algorithm_raw == b"pz",
+                        "header_size_words": header_size_words,
+                        "header_size_bytes": header_size_words * 4,
+                        "block_shift": block_shift,
+                        "block_size": 1 << block_shift if block_shift <= 31 else None,
+                        "uncompressed_size": uncompressed_size,
+                        "uncompressed_size_big_endian": uncompressed_size_big,
+                        "uncompressed_size_both_endian_match": (
+                            uncompressed_size == uncompressed_size_big
+                        ),
+                    })
+                    if algorithm_raw != b"pz":
+                        fail(entry, "unsupported RRIP ZF compression algorithm")
+                    if not 4 <= header_size_words <= 255:
+                        fail(entry, "invalid RRIP ZF header size")
+                    if not 9 <= block_shift <= 17:
+                        fail(entry, "unsupported RRIP ZF block shift")
+                    if uncompressed_size != uncompressed_size_big:
+                        fail(entry, "RRIP ZF uncompressed size both-endian mismatch")
             elif signature == "TF":
                 if entry_length < 5:
                     fail(entry, "truncated RRIP TF entry")
@@ -4295,7 +4607,9 @@ class GenericTriageEngine:
                 entry["absolute_offset"] = (
                     record_offset + system_use_offset_in_record + system_use_offset
                 )
-        rrip_signatures = {"RR", "PX", "NM", "SL", "TF", "CL", "PL", "RE", "PN"}
+        rrip_signatures = {
+            "RR", "PX", "NM", "SL", "TF", "CL", "PL", "RE", "PN", "ZF",
+        }
         rrip_entries = [
             entry for entry in semantic_entries if entry.get("signature") in rrip_signatures
         ]
@@ -4359,6 +4673,32 @@ class GenericTriageEngine:
                 anomalies.append("rock_ridge_iso_file_type_mismatch")
             if file_type not in {"regular", "directory"}:
                 record["rock_ridge_non_regular"] = True
+
+        zf_entries = [
+            entry for entry in rrip_entries if entry.get("signature") == "ZF"
+        ]
+        if zf_entries:
+            record["rock_ridge_zisofs"] = True
+            record["rock_ridge_zisofs_entries"] = zf_entries
+            valid_zf_entries = [
+                entry for entry in zf_entries if entry.get("valid") is True
+            ]
+            if len(zf_entries) > 1:
+                anomalies.append("duplicate_rock_ridge_zisofs")
+            if len(valid_zf_entries) == 1 and len(zf_entries) == 1:
+                zf_entry = valid_zf_entries[0]
+                record["rock_ridge_zisofs_claim"] = {
+                    "algorithm": zf_entry.get("algorithm"),
+                    "algorithm_raw_hex": zf_entry.get("algorithm_raw_hex"),
+                    "header_size_words": zf_entry.get("header_size_words"),
+                    "header_size_bytes": zf_entry.get("header_size_bytes"),
+                    "block_shift": zf_entry.get("block_shift"),
+                    "block_size": zf_entry.get("block_size"),
+                    "uncompressed_size": zf_entry.get("uncompressed_size"),
+                    "source_absolute_offset": zf_entry.get("absolute_offset"),
+                }
+            else:
+                anomalies.append("invalid_rock_ridge_zisofs_claim")
 
         tf_entries = [
             entry for entry in rrip_entries if entry.get("signature") == "TF"
@@ -4565,6 +4905,7 @@ class GenericTriageEngine:
             or (susp_error is not None and rock_ridge_detected)
             or continuation_unparsed
             or record.get("rock_ridge_relocation_traversal_suppressed") is True
+            or record.get("rock_ridge_zisofs") is True
         ):
             record["extraction_eligible"] = False
         record["rock_ridge_anomalies"] = anomalies

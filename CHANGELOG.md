@@ -53,6 +53,7 @@ Notable user-facing changes are documented here. This project follows Semantic V
 - Active Joliet descriptors now drive bounded Type-L/Type-M path-table parsing with strict UCS-2BE names, per-copy hashes, cross-endian semantic comparison, and exact active-tree reconciliation; divergent copies remain non-authoritative anomaly evidence.
 - Valid Rock Ridge `PX` serial/link-count claims now form evidence-only hard-link groups only when their exact ordered extent identities agree; one canonical payload is copied while alternate paths remain provenance, and contradictory groups are never reconciled or materialized as host links.
 - El Torito hard-disk-emulation default and section entries now receive exact 512-byte MBR signature/partition/range/overlap validation with raw/hash provenance and a minimum covered length; full image size remains deliberately indeterminate and no speculative child is created.
+- Rock Ridge `ZF` claims now drive metadata-only zisofs header and block-pointer validation under decompressed-size, 65,536-pointer, and 1-MiB metadata bounds; exact offsets, hashes, compressed ranges, and zero-fill blocks are retained without decompression or speculative child creation.
 
 ## [1.1.0] - 2026-09-04
 
