@@ -489,6 +489,7 @@ def _iso9660_with_joliet_alias(
 
 def _iso9660_with_el_torito(
     payload: bytes, *, section_payload: bytes | None = None,
+    hard_disk: bool = False,
 ) -> bytes:
     block_size = 2_048
     image = bytearray(24 * block_size)
@@ -536,6 +537,7 @@ def _iso9660_with_el_torito(
     validation[28:30] = checksum.to_bytes(2, "little")
     initial = bytearray(32)
     initial[0] = 0x88
+    initial[1] = 4 if hard_disk else 0
     initial[6:8] = (1).to_bytes(2, "little")
     initial[8:12] = (22).to_bytes(4, "little")
     image[21 * block_size:21 * block_size + 64] = validation + initial
@@ -555,8 +557,21 @@ def _iso9660_with_el_torito(
         )
         assert len(section_payload) <= 512
         image[23 * block_size:23 * block_size + 512] = section_payload.ljust(512, b"\x00")
-    assert len(payload) <= 512
-    image[22 * block_size:22 * block_size + 512] = payload.ljust(512, b"\x00")
+    if hard_disk:
+        mbr = bytearray(512)
+        mbr[440:444] = b"FKIT"
+        partition = memoryview(mbr)[446:462]
+        partition[0] = 0x80
+        partition[1:4] = b"\xfe\xff\xff"
+        partition[4] = 0x0C
+        partition[5:8] = b"\xfe\xff\xff"
+        partition[8:12] = (1).to_bytes(4, "little")
+        partition[12:16] = (2).to_bytes(4, "little")
+        mbr[510:512] = b"\x55\xaa"
+        image[22 * block_size:22 * block_size + 512] = mbr
+    else:
+        assert len(payload) <= 512
+        image[22 * block_size:22 * block_size + 512] = payload.ljust(512, b"\x00")
     return bytes(image)
 
 
@@ -1264,6 +1279,55 @@ def test_iso9660_el_torito_boot_image_recurses_with_catalog_lineage(
     assert "builtin_el_torito_extractor" in report
     assert "el_torito_boot_images" in report
     assert "CTF{el_torito_recursive_lineage}" in report
+
+
+def test_iso9660_el_torito_hard_disk_mbr_remains_metadata_only(
+    tmp_path: Path,
+) -> None:
+    evidence = tmp_path / "hard-disk-emulation.iso"
+    evidence.write_bytes(_iso9660_with_el_torito(b"", hard_disk=True))
+
+    result = AnalysisEngine().analyze(
+        evidence, tmp_path / "hard-disk-el-torito-cases",
+        mode=AnalysisMode.AUTO, execute=False,
+    )
+
+    assert [item.logical_name for item in result.artifacts] == [
+        "hard-disk-emulation.iso",
+    ]
+    hard_disks = next(
+        item.value for item in result.observations
+        if item.artifact_id == result.artifacts[0].id
+        and item.key == "archive.iso9660.el_torito_hard_disk_images"
+    )
+    assert len(hard_disks) == 1
+    record = hard_disks[0]
+    assert record["entry_role"] == "initial"
+    assert record["image_offset"] == 22 * 2_048
+    assert record["full_image_size_determinable"] is False
+    assert record["extraction_eligible"] is False
+    assert record["hard_disk_mbr"]["valid"] is True
+    assert record["hard_disk_mbr"]["minimum_image_bytes"] == 1_536
+    assert next(
+        item.value for item in result.observations
+        if item.artifact_id == result.artifacts[0].id
+        and item.key == "archive.iso9660.el_torito_boot_images"
+    ) == []
+    finding = next(
+        item for item in result.findings
+        if item.category == "archive_boot_disk_metadata"
+    )
+    assert finding.severity == "info"
+    assert not any(
+        item.source == "builtin_el_torito_extractor"
+        for item in result.findings
+    )
+    report = next(
+        (tmp_path / "hard-disk-el-torito-cases").glob("*/reports/report.json")
+    ).read_text(encoding="utf-8")
+    assert "el_torito_hard_disk_images" in report
+    assert "mbr_partition_table_does_not_declare_container_length" in report
+    assert "archive_boot_disk_metadata" in report
 
 
 def test_iso9660_el_torito_section_boot_load_recurses_with_header_lineage(

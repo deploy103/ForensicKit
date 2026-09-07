@@ -505,6 +505,8 @@ def _iso9660_with_joliet_alias(
 
 def _iso9660_with_el_torito(
     *, corrupt_checksum: bool = False, with_section: bool = False,
+    hard_disk: bool = False, corrupt_hard_disk_mbr: bool = False,
+    hard_disk_section: bool = False,
 ) -> tuple[bytes, bytes]:
     block_size = 2_048
     image = bytearray(24 * block_size)
@@ -555,7 +557,7 @@ def _iso9660_with_el_torito(
         validation[28] ^= 1
     initial = bytearray(32)
     initial[0] = 0x88
-    initial[1] = 0
+    initial[1] = 4 if hard_disk else 0
     initial[6:8] = (1).to_bytes(2, "little")
     initial[8:12] = (22).to_bytes(4, "little")
     image[21 * block_size:21 * block_size + 64] = validation + initial
@@ -567,6 +569,7 @@ def _iso9660_with_el_torito(
         section_header[4:32] = b"FORENSICKIT EFI".ljust(28, b" ")
         section_entry = bytearray(32)
         section_entry[0] = 0x88
+        section_entry[1] = 4 if hard_disk_section else 0
         section_entry[6:8] = (1).to_bytes(2, "little")
         section_entry[8:12] = (23).to_bytes(4, "little")
         extension_entry = bytearray(32)
@@ -576,9 +579,33 @@ def _iso9660_with_el_torito(
         image[catalog_section_offset:catalog_section_offset + 96] = (
             section_header + section_entry + extension_entry
         )
-        section_payload = b"CTF{el_torito_efi_section}".ljust(512, b"\x00")
+        if hard_disk_section:
+            section_payload_data = bytearray(512)
+            section_partition = memoryview(section_payload_data)[446:462]
+            section_partition[4] = 0x83
+            section_partition[8:12] = (1).to_bytes(4, "little")
+            section_partition[12:16] = (1).to_bytes(4, "little")
+            section_payload_data[510:512] = b"\x55\xaa"
+            section_payload = bytes(section_payload_data)
+        else:
+            section_payload = b"CTF{el_torito_efi_section}".ljust(512, b"\x00")
         image[23 * block_size:23 * block_size + len(section_payload)] = section_payload
-    payload = b"CTF{el_torito_boot_image}".ljust(512, b"\x00")
+    if hard_disk:
+        payload_data = bytearray(512)
+        payload_data[440:444] = b"FKIT"
+        partition = memoryview(payload_data)[446:462]
+        partition[0] = 0x80
+        partition[1:4] = b"\xfe\xff\xff"
+        partition[4] = 0x0C
+        partition[5:8] = b"\xfe\xff\xff"
+        partition[8:12] = (1).to_bytes(4, "little")
+        partition[12:16] = (2).to_bytes(4, "little")
+        payload_data[510:512] = (
+            b"\x00\x00" if corrupt_hard_disk_mbr else b"\x55\xaa"
+        )
+        payload = bytes(payload_data)
+    else:
+        payload = b"CTF{el_torito_boot_image}".ljust(512, b"\x00")
     image[22 * block_size:22 * block_size + len(payload)] = payload
     return bytes(image), payload
 
@@ -2732,6 +2759,110 @@ def test_iso9660_el_torito_catalog_validates_declared_boot_image_range(
         "invalid_catalog_or_boot_range"
     )
     corrupt_profile = ProfileEngine().evaluate(corrupt_artifact, corrupt_observations)
+    assert any(
+        item.category == "iso9660_el_torito_anomaly"
+        for item in corrupt_profile.findings
+    )
+
+
+def test_iso9660_el_torito_hard_disk_mbr_is_validated_without_size_inference(
+    tmp_path: Path,
+) -> None:
+    block_size = 2_048
+    image, mbr_raw = _iso9660_with_el_torito(hard_disk=True)
+    evidence = tmp_path / "hard-disk-emulation.iso"
+    evidence.write_bytes(image)
+    artifact = _artifact(evidence)
+
+    observations = GenericTriageEngine().analyze(artifact, evidence)
+    values = _values(observations)
+    catalog = values["archive.iso9660.el_torito_catalogs"][0]
+    initial = catalog["initial_entry"]
+    assert initial["media"] == "hard_disk"
+    assert initial["data_length"] is None
+    assert initial["data_length_source"] == "not_determinable"
+    assert initial["extraction_eligible"] is False
+    assert initial["hard_disk_mbr_valid"] is True
+    mbr = initial["hard_disk_mbr"]
+    assert mbr["image_offset"] == 22 * block_size
+    assert mbr["bytes_read"] == 512
+    assert mbr["raw_sha256"] == hashlib.sha256(mbr_raw).hexdigest()
+    assert mbr["disk_signature_raw_hex"] == b"FKIT".hex()
+    assert mbr["signature_raw_hex"] == "55aa"
+    assert mbr["signature_valid"] is True
+    assert mbr["used_partition_count"] == 1
+    assert mbr["bootable_partition_count"] == 1
+    assert mbr["minimum_image_bytes"] == 3 * 512
+    assert mbr["minimum_image_end_offset"] == 22 * block_size + 3 * 512
+    assert mbr["image_size_determinable"] is False
+    assert mbr["image_size_reason"] == (
+        "mbr_partition_table_does_not_declare_container_length"
+    )
+    partition = mbr["partitions"][0]
+    assert partition["entry_offset"] == 22 * block_size + 446
+    assert partition["partition_type_raw"] == "0x0c"
+    assert partition["start_lba"] == 1
+    assert partition["sector_count"] == 2
+    assert partition["byte_offset"] == 22 * block_size + 512
+    assert partition["byte_length"] == 1_024
+    assert partition["range_within_evidence_and_volume"] is True
+    assert partition["valid"] is True
+    assert all(item["valid"] is True for item in mbr["partitions"])
+    hard_disks = values["archive.iso9660.el_torito_hard_disk_images"]
+    assert len(hard_disks) == 1
+    assert hard_disks[0]["entry_role"] == "initial"
+    assert hard_disks[0]["full_image_size_determinable"] is False
+    assert hard_disks[0]["extraction_eligible"] is False
+    assert values["archive.iso9660.el_torito_boot_images"] == []
+    assert values["archive.iso9660.el_torito_errors"] == []
+    profile = ProfileEngine().evaluate(artifact, observations)
+    hard_disk_finding = next(
+        item for item in profile.findings
+        if item.category == "archive_boot_disk_metadata"
+    )
+    assert hard_disk_finding.severity == "info"
+
+    section_image, _ = _iso9660_with_el_torito(
+        with_section=True, hard_disk_section=True,
+    )
+    section_path = tmp_path / "section-hard-disk-emulation.iso"
+    section_path.write_bytes(section_image)
+    section_artifact = _artifact(section_path)
+    section_values = _values(GenericTriageEngine().analyze(
+        section_artifact, section_path,
+    ))
+    section_hard_disks = section_values[
+        "archive.iso9660.el_torito_hard_disk_images"
+    ]
+    assert len(section_hard_disks) == 1
+    assert section_hard_disks[0]["entry_role"] == "section"
+    assert section_hard_disks[0]["section_index"] == 0
+    assert section_hard_disks[0]["section_entry_index"] == 0
+    assert section_hard_disks[0]["image_offset"] == 23 * block_size
+    assert section_hard_disks[0]["hard_disk_mbr"]["valid"] is True
+    assert len(section_values["archive.iso9660.el_torito_boot_images"]) == 1
+
+    corrupt_image, _ = _iso9660_with_el_torito(
+        hard_disk=True, corrupt_hard_disk_mbr=True,
+    )
+    corrupt_path = tmp_path / "hard-disk-emulation-bad-mbr.iso"
+    corrupt_path.write_bytes(corrupt_image)
+    corrupt_artifact = _artifact(corrupt_path)
+    corrupt_observations = GenericTriageEngine().analyze(
+        corrupt_artifact, corrupt_path,
+    )
+    corrupt_values = _values(corrupt_observations)
+    corrupt_mbr = corrupt_values[
+        "archive.iso9660.el_torito_hard_disk_images"
+    ][0]["hard_disk_mbr"]
+    assert corrupt_mbr["valid"] is False
+    assert "mbr_signature" in corrupt_mbr["failed_checks"]
+    assert corrupt_values["archive.iso9660.el_torito_errors"][0]["reason"] == (
+        "invalid_hard_disk_emulation_mbr"
+    )
+    corrupt_profile = ProfileEngine().evaluate(
+        corrupt_artifact, corrupt_observations,
+    )
     assert any(
         item.category == "iso9660_el_torito_anomaly"
         for item in corrupt_profile.findings

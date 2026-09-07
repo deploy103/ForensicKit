@@ -1245,6 +1245,7 @@ class GenericTriageEngine:
         el_torito_catalogs: list[dict[str, object]] = []
         el_torito_errors: list[dict[str, object]] = []
         el_torito_boot_images: list[dict[str, object]] = []
+        el_torito_hard_disk_images: list[dict[str, object]] = []
         if pvd is not None and pvd.get("valid") is True:
             (
                 el_torito_catalogs,
@@ -1256,6 +1257,32 @@ class GenericTriageEngine:
                 pvd=pvd,
                 boot_records=el_torito_boot_records,
             )
+            for catalog in el_torito_catalogs:
+                if not isinstance(catalog, dict):
+                    continue
+                candidate_entries = [
+                    ("initial", catalog.get("initial_entry")),
+                    *[
+                        ("section", entry)
+                        for entry in catalog.get("section_entries", [])
+                        if isinstance(entry, dict)
+                    ],
+                ]
+                for entry_role, entry in candidate_entries:
+                    if not isinstance(entry, dict) or entry.get("media_type") != 4:
+                        continue
+                    el_torito_hard_disk_images.append({
+                        "entry_role": entry_role,
+                        "catalog_offset": catalog.get("catalog_offset"),
+                        "entry_offset": entry.get("offset"),
+                        "section_index": entry.get("section_index"),
+                        "section_entry_index": entry.get("section_entry_index"),
+                        "load_block": entry.get("load_block"),
+                        "image_offset": entry.get("data_offset"),
+                        "full_image_size_determinable": False,
+                        "extraction_eligible": False,
+                        "hard_disk_mbr": entry.get("hard_disk_mbr"),
+                    })
 
         root_entries: list[dict[str, object]] = []
         root_error: str | None = None
@@ -1960,6 +1987,7 @@ class GenericTriageEngine:
             self._observation(artifact, "archive.iso9660.el_torito_catalogs", el_torito_catalogs),
             self._observation(artifact, "archive.iso9660.el_torito_errors", el_torito_errors),
             self._observation(artifact, "archive.iso9660.el_torito_boot_images", el_torito_boot_images),
+            self._observation(artifact, "archive.iso9660.el_torito_hard_disk_images", el_torito_hard_disk_images),
             self._observation(artifact, "archive.iso9660.path_tables", path_tables),
             self._observation(artifact, "archive.iso9660.path_table_comparison", path_table_comparison),
             self._observation(artifact, "archive.iso9660.path_table_reconciliation", path_table_reconciliation),
@@ -2526,6 +2554,156 @@ class GenericTriageEngine:
         return groups, errors
 
     @staticmethod
+    def _iso9660_el_torito_hard_disk_mbr(
+        path: Path,
+        *,
+        image_offset: int,
+        evidence_size: int,
+        declared_volume_bytes: int,
+    ) -> dict[str, object]:
+        """Validate a hard-disk-emulation MBR without inferring container size."""
+        result: dict[str, object] = {
+            "image_offset": image_offset,
+            "sector_size": 512,
+            "bytes_read": 0,
+            "image_size_determinable": False,
+            "image_size_reason": "mbr_partition_table_does_not_declare_container_length",
+            "minimum_image_bytes": None,
+            "partitions": [],
+            "failed_checks": [],
+            "valid": False,
+        }
+        if (
+            image_offset < 0
+            or image_offset + 512 > evidence_size
+            or image_offset + 512 > declared_volume_bytes
+        ):
+            result["failed_checks"] = ["mbr_sector_within_evidence_and_volume"]
+            return result
+        try:
+            with path.open("rb") as stream:
+                stream.seek(image_offset)
+                raw = stream.read(512)
+        except OSError as exc:
+            result["read_error"] = str(exc)[:2_000]
+            result["failed_checks"] = ["mbr_read"]
+            return result
+        result.update({
+            "bytes_read": len(raw),
+            "raw_sha256": hashlib.sha256(raw).hexdigest(),
+            "raw_hex": raw.hex(),
+        })
+        if len(raw) != 512:
+            result["failed_checks"] = ["mbr_truncated_read"]
+            return result
+
+        signature_valid = raw[510:512] == b"\x55\xaa"
+        result.update({
+            "bootstrap_raw_hex": raw[:440].hex(),
+            "disk_signature_raw_hex": raw[440:444].hex(),
+            "reserved_raw_hex": raw[444:446].hex(),
+            "partition_table_offset": image_offset + 446,
+            "partition_table_raw_hex": raw[446:510].hex(),
+            "signature_raw_hex": raw[510:512].hex(),
+            "signature_valid": signature_valid,
+        })
+        failed_checks: list[str] = []
+        if not signature_valid:
+            failed_checks.append("mbr_signature")
+        partitions: list[dict[str, object]] = []
+        used_ranges: list[tuple[int, int]] = []
+        bootable_count = 0
+        minimum_image_bytes = 512
+        for partition_index in range(4):
+            relative_offset = 446 + partition_index * 16
+            entry_raw = raw[relative_offset:relative_offset + 16]
+            boot_indicator = entry_raw[0]
+            partition_type = entry_raw[4]
+            start_lba = int.from_bytes(entry_raw[8:12], "little")
+            sector_count = int.from_bytes(entry_raw[12:16], "little")
+            unused = not any(entry_raw)
+            used = partition_type != 0 or sector_count != 0 or start_lba != 0
+            byte_offset = image_offset + start_lba * 512
+            byte_length = sector_count * 512
+            byte_end = byte_offset + byte_length
+            range_valid = bool(
+                used
+                and start_lba > 0
+                and sector_count > 0
+                and byte_offset >= image_offset + 512
+                and byte_end <= evidence_size
+                and byte_end <= declared_volume_bytes
+            )
+            entry_valid = bool(
+                boot_indicator in {0x00, 0x80}
+                and (
+                    unused
+                    or (
+                        partition_type != 0
+                        and range_valid
+                    )
+                )
+            )
+            partition = {
+                "index": partition_index,
+                "entry_offset": image_offset + relative_offset,
+                "entry_relative_offset": relative_offset,
+                "raw_hex": entry_raw.hex(),
+                "boot_indicator_raw": f"0x{boot_indicator:02x}",
+                "bootable": boot_indicator == 0x80,
+                "boot_indicator_valid": boot_indicator in {0x00, 0x80},
+                "start_chs_raw_hex": entry_raw[1:4].hex(),
+                "partition_type": partition_type,
+                "partition_type_raw": f"0x{partition_type:02x}",
+                "end_chs_raw_hex": entry_raw[5:8].hex(),
+                "start_lba": start_lba,
+                "sector_count": sector_count,
+                "byte_offset": byte_offset,
+                "byte_length": byte_length,
+                "byte_end_offset": byte_end,
+                "range_within_evidence_and_volume": range_valid,
+                "unused": unused,
+                "used": used,
+                "overlaps_prior_partition": False,
+                "valid": entry_valid,
+            }
+            if boot_indicator == 0x80:
+                bootable_count += 1
+            if used:
+                if any(
+                    byte_offset < prior_end and prior_start < byte_end
+                    for prior_start, prior_end in used_ranges
+                ):
+                    partition["overlaps_prior_partition"] = True
+                    partition["valid"] = False
+                    failed_checks.append(f"partition_{partition_index}_overlap")
+                used_ranges.append((byte_offset, byte_end))
+                minimum_image_bytes = max(
+                    minimum_image_bytes, (start_lba + sector_count) * 512,
+                )
+            if partition["valid"] is not True:
+                failed_checks.append(f"partition_{partition_index}_layout")
+            partitions.append(partition)
+        used_partition_count = sum(
+            partition["used"] is True for partition in partitions
+        )
+        if used_partition_count == 0:
+            failed_checks.append("no_used_partitions")
+        if bootable_count > 1:
+            failed_checks.append("multiple_bootable_partitions")
+        failed_checks = list(dict.fromkeys(failed_checks))
+        result.update({
+            "partitions": partitions,
+            "used_partition_count": used_partition_count,
+            "bootable_partition_count": bootable_count,
+            "minimum_image_bytes": minimum_image_bytes,
+            "minimum_image_end_offset": image_offset + minimum_image_bytes,
+            "failed_checks": failed_checks,
+            "valid": not failed_checks,
+        })
+        return result
+
+    @staticmethod
     def _iso9660_el_torito_catalogs(
         path: Path,
         *,
@@ -2664,6 +2842,22 @@ class GenericTriageEngine:
                 and initial_entry["reserved_byte"] == 0
                 and load_block > 0
             )
+            if media_type == 4 and load_block > 0:
+                hard_disk_mbr = GenericTriageEngine._iso9660_el_torito_hard_disk_mbr(
+                    path,
+                    image_offset=data_offset,
+                    evidence_size=evidence_size,
+                    declared_volume_bytes=declared_volume_bytes,
+                )
+                initial_entry["hard_disk_mbr"] = hard_disk_mbr
+                initial_entry["hard_disk_mbr_valid"] = hard_disk_mbr.get("valid")
+                if hard_disk_mbr.get("valid") is not True:
+                    errors.append({
+                        "reason": "invalid_hard_disk_emulation_mbr",
+                        "catalog_offset": catalog_offset,
+                        "entry_offset": catalog_offset + 32,
+                        "hard_disk_mbr": hard_disk_mbr,
+                    })
             initial_entry["extraction_eligible"] = bool(
                 validation_entry["valid"]
                 and initial_entry["valid"]
@@ -2837,6 +3031,26 @@ class GenericTriageEngine:
                         and section_entry["reserved_byte"] == 0
                         and section_load_block > 0
                     )
+                    if section_media_type == 4 and section_load_block > 0:
+                        hard_disk_mbr = (
+                            GenericTriageEngine._iso9660_el_torito_hard_disk_mbr(
+                                path,
+                                image_offset=section_data_offset,
+                                evidence_size=evidence_size,
+                                declared_volume_bytes=declared_volume_bytes,
+                            )
+                        )
+                        section_entry["hard_disk_mbr"] = hard_disk_mbr
+                        section_entry["hard_disk_mbr_valid"] = hard_disk_mbr.get(
+                            "valid"
+                        )
+                        if hard_disk_mbr.get("valid") is not True:
+                            errors.append({
+                                "reason": "invalid_hard_disk_emulation_mbr",
+                                "catalog_offset": catalog_offset,
+                                "entry_offset": entry_offset,
+                                "hard_disk_mbr": hard_disk_mbr,
+                            })
                     section_entry["extraction_eligible"] = bool(
                         validation_entry["valid"]
                         and header["valid"]
