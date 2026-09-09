@@ -133,12 +133,48 @@ def test_reports_include_linked_hypothesis_verification_and_evidence(tmp_path: P
         assert report["verifications"][0]["status"] == "unverified"
         assert report["verifications"][0]["method"] == "not_performed"
         assert report["verifications"][0]["evidence"] == ["offset=4096", "<record>"]
-        assert "## Investigation chain" in markdown
-        assert "`not_performed`" in markdown
+        assert "## 조사 및 검증 과정" in markdown
+        assert "`수행 안 함`" in markdown
         assert "offset=4096" in markdown
-        assert "<h2>Investigation chain</h2>" in html
-        assert "not_performed" in html
+        assert "## Artifact 계보" in markdown
+        assert "`report-artifact.bin` (data)" in markdown
+        assert "기록된 artifact 계보가 없습니다." not in markdown
+        assert '<html lang="ko">' in html
+        assert "<h2>조사 및 검증 과정</h2>" in html
+        assert "수행 안 함" in html
         assert "&lt;record&gt;" in html
+
+
+def test_human_reports_localize_known_findings_without_changing_json(tmp_path: Path) -> None:
+    with CaseWorkspace.create(tmp_path / "cases", "korean-report") as workspace:
+        artifact = _artifact(workspace.case.id, "korean-artifact")
+        workspace.database.add_artifact(artifact)
+        finding = Finding(
+            id="korean-finding",
+            artifact_id=artifact.id,
+            title="Executable has high sampled entropy",
+            category="executable_packing_lead",
+            severity="low",
+            confidence=0.70,
+            explanation=(
+                "High entropy can result from packing, encryption, or compressed resources; "
+                "correlate it with section layout and strings."
+            ),
+            source="profile:executable",
+            supporting_evidence=["raw <evidence>"],
+        )
+        workspace.database.add_findings([finding])
+
+        json_path, markdown_path = ReportGenerator().generate(workspace)
+        report = json.loads(json_path.read_text(encoding="utf-8"))
+        markdown = markdown_path.read_text(encoding="utf-8")
+        html = workspace.path("reports", "report.html").read_text(encoding="utf-8")
+
+        assert report["findings"][0]["title"] == "Executable has high sampled entropy"
+        assert "실행 파일에서 높은 표본 entropy가 확인되었습니다" in markdown
+        assert "높은 entropy는 packing, 암호화 또는 압축된 resource 때문에" in markdown
+        assert "실행 파일에서 높은 표본 entropy가 확인되었습니다" in html
+        assert "raw &lt;evidence&gt;" in html
 
 
 def test_explicit_verification_requires_a_real_method_and_evidence(tmp_path: Path) -> None:
