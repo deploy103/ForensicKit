@@ -536,6 +536,10 @@ class ReportGenerator:
         ]
         available_plans = [plan for plan in plans if plan.get("available")]
         missing_plans = [plan for plan in plans if not plan.get("available")]
+        unverified = [
+            item for item in report.get("verifications", [])
+            if item.get("status") == "unverified"
+        ]
         lines.extend(["", "## Recommended next steps", ""])
         if report["flag_candidates"]:
             lines.append("- Validate prominent flag candidates against their recorded artifact, source location, and transform chain.")
@@ -547,7 +551,12 @@ class ReportGenerator:
             lines.append(f"- If time permits, stage missing optional tools offline and rerun the relevant plans: `{tool_names}`.")
         if report["errors"]:
             lines.append("- Review the recorded non-fatal analysis errors before relying on incomplete extraction or parser output.")
-        if not report["flag_candidates"] and not available_plans and not missing_plans and not report["errors"]:
+        if unverified:
+            lines.append(
+                f"- Independently verify the {len(unverified)} unverified finding hypothesis/hypotheses; "
+                "recorded supporting strings alone are not a completed verification."
+            )
+        if not report["flag_candidates"] and not available_plans and not missing_plans and not report["errors"] and not unverified:
             lines.append("- No follow-up is currently evidence-backed; inspect raw observations and preserved output before broadening scope.")
         lines.extend(["", "## Findings", ""])
         if report["findings"]:
@@ -599,13 +608,13 @@ class ReportGenerator:
                     "",
                     f"Verification conclusion: {verification.get('conclusion')}",
                     "",
-                    "Recorded evidence:",
+                    "Evidence attached to this verification record:",
                 ])
                 evidence = verification.get("evidence") or []
                 if evidence:
                     lines.extend(f"- {item}" for item in evidence)
                 else:
-                    lines.append("- No supporting evidence recorded; this remains explicitly unverified.")
+                    lines.append("- No verification evidence recorded; this remains explicitly unverified.")
                 lines.append("")
         else:
             lines.extend(["No hypothesis or verification records available.", ""])
@@ -761,7 +770,7 @@ class ReportGenerator:
             evidence = verification.get("evidence") or []
             evidence_items = "".join(
                 f"<li><code>{esc(item)}</code></li>" for item in evidence
-            ) or "<li>No supporting evidence recorded; analyst verification is required.</li>"
+            ) or "<li>No verification evidence recorded; analyst verification is required.</li>"
             chain_rows.append(
                 "<tr>"
                 f"<td><code>{esc(finding_id)}</code><br>{esc(finding.get('title'))}</td>"

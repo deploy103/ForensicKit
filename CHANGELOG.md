@@ -89,8 +89,13 @@ Notable user-facing changes are documented here. This project follows Semantic V
 ### Changed
 
 - Textual is now a standard runtime dependency so the required no-subcommand keyboard interface is present after an ordinary installation.
-- Offline release bundles require clean Git provenance by default, record the exact commit/dirty state, exclude stale build products, validate archives, and contain exactly one source-version-matched ForensicKit wheel.
-- Offline installation is staged and self-tested before activation; upgrades force-reinstall the checksummed wheel and preserve the prior prefix when staging fails.
+- Offline release bundles require clean Git provenance by default, record the exact commit/dirty state and reproducible wheel epoch, exclude stale build products, validate archives, lock one immutable wheel per resolved Python distribution, and include standalone verified installer helpers.
+- The release gate now binds a bundle to the exact gated Git commit/source archive and canonical project-wheel checksum instead of accepting an older clean bundle.
+- Offline installation is staged and self-tested before activation; upgrades force-reinstall the checksummed wheel, refuse unrelated or protected prefixes, authenticate recognized prior ForensicKit layouts with a path-bound marker, and restore the prior prefix after activation failures.
+- Findings now begin with an honest `unverified` verification placeholder even when supporting evidence strings are present; `supported` requires an explicit method, conclusion, source, and verification evidence.
+- Planner history deduplicates an exact tool/mode/parameter execution rather than suppressing legitimate follow-up modes, and rule confidence/parser/extractor actions now have bounded, persisted execution semantics.
+- External-tool outputs are accepted only after bounded count, aggregate-byte, per-file, link/special-file, partial-run, and case-scope audits; live growth past the aggregate limit terminates the tool.
+- README is now a detailed Korean competition operator guide covering architecture, stack, evidence coverage, tool/bootstrap installation, offline media, CLI/TUI, reports, safety limits, troubleshooting, and real-environment gates.
 - Doctor and operational health commands provide machine-readable JSON output, while routine CLI evidence/workspace errors return concise non-traceback failures.
 
 ## [1.1.0] - 2026-09-04

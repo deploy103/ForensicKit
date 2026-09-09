@@ -30,14 +30,28 @@ provenance; it is not silently declared the answer.
 - Keyboard-first active TUI with artifact tree, classifications, observations,
   findings, flags, timeline, tool runs, cancellation, and safe extraction save.
 - Auditable offline bundle v2 with exact source provenance, component hashes,
-  staged/rollback-safe installation, and an installed-runtime self-test.
+  deterministic project-wheel timestamps, a resolved wheelhouse lock,
+  standalone installer helpers, staged/rollback-safe installation, and an
+  installed-runtime self-test.
+- Release validation binds the bundle source archive and canonical wheel hash
+  to the exact gated commit; upgrades refuse protected or unrelated prefixes.
+- Exact tool-mode/parameter execution history preserves legitimate follow-up
+  plans, while rule actions and aggregate generated output now have enforced,
+  auditable bounds.
+- Verification records no longer equate descriptive supporting strings with
+  independent verification; findings remain unverified until a concrete
+  verification action and evidence are explicitly recorded.
+- README is a detailed Korean competition guide covering the implementation
+  stack, tool preparation, offline installation, CLI/TUI workflows, reports,
+  safety limits, troubleshooting, and the remaining real-environment gates.
 
 ## Final validation
 
 Run `scripts/release_gate.sh --bundle BUNDLE` on the clean release commit. It
-performs local compile and shell checks, the complete pytest suite, the core
-self-test, Doctor bundle validation, and installer verification without network
-access. A real full-system memory image still requires the matching staged
+performs local compile and shell checks, the complete pytest and direct suites,
+the core self-test, exact commit/source/wheel/lock validation, Doctor bundle
+validation, and installer verification without network access. A real
+full-system memory image still requires the matching staged
 Volatility symbols, and the final USB bundle should be exercised on the exact
 Ubuntu/Kali competition image before the event.
 

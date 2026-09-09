@@ -128,6 +128,134 @@ def test_parameterized_tool_plan_keeps_partition_offset_as_distinct_argv_value(t
     assert {tuple(item.command_argv[-3:-1]) for item in plans} == {("-o", "2048"), ("-o", "4096")}
 
 
+def test_planner_history_deduplicates_exact_plan_but_keeps_same_tool_follow_up_mode(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "payload.zip"
+    source.write_bytes(b"PK\x03\x04payload")
+    executable = tmp_path / "7z"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(0o755)
+    registry = ToolRegistry([
+        ToolDefinition(
+            "sevenzip", (str(executable),),
+            command_templates={
+                "default": ("{executable}", "l", "--", "{evidence}"),
+                "extract": ("{executable}", "x", "-o{output_dir}", "--", "{evidence}"),
+            },
+        )
+    ])
+    with CaseWorkspace.create(tmp_path / "cases", "plan-history") as workspace:
+        target = EvidenceManager(workspace).ingest(source)
+        completed = ToolRun(
+            artifact_id=target.id,
+            tool="sevenzip",
+            command_argv=[str(executable), "l", "--", str(source)],
+            timeout=5,
+            status=ToolRunStatus.COMPLETED,
+            exit_code=0,
+        )
+        workspace.database.add_tool_run(completed)
+        workspace.database.add_observations([Observation(
+            artifact_id=target.id,
+            key="planner.tool_execution",
+            value={
+                "run_id": completed.id,
+                "tool": "sevenzip",
+                "command_mode": "default",
+                "parameters": {},
+                "status": "completed",
+                "exit_code": 0,
+            },
+            source="tool_planner",
+        )])
+        recommendations = [
+            ToolRecommendation(
+                "sevenzip", frozenset({AnalysisMode.AUTO}), "repeat listing", 80,
+            ),
+            ToolRecommendation(
+                "sevenzip", frozenset({AnalysisMode.AUTO}), "extract verified payload", 95,
+                command_mode="extract",
+            ),
+            ToolRecommendation(
+                "sevenzip", frozenset({AnalysisMode.AUTO}), "same extraction from another rule", 90,
+                command_mode="extract",
+            ),
+        ]
+        plans = ToolPlanner(workspace, registry).plan(
+            target, recommendations, AnalysisMode.AUTO,
+        )
+
+    assert len(plans) == 1
+    assert plans[0].command_mode == "extract"
+    assert plans[0].command_argv[1] == "x"
+    assert plans[0].reasons == [
+        "extract verified payload", "same extraction from another rule",
+    ]
+
+
+def test_planner_does_not_trust_unaudited_tool_name_history_for_deduplication(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "payload.bin"
+    source.write_bytes(b"payload")
+    executable = tmp_path / "probe"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(0o755)
+    registry = ToolRegistry([ToolDefinition(
+        "probe", (str(executable),),
+        command_templates={"default": ("{executable}", "{evidence}")},
+    )])
+    with CaseWorkspace.create(tmp_path / "cases", "legacy-history") as workspace:
+        target = EvidenceManager(workspace).ingest(source)
+        workspace.database.add_tool_run(ToolRun(
+            artifact_id=target.id,
+            tool="probe",
+            command_argv=[str(executable), str(source)],
+            timeout=5,
+            status=ToolRunStatus.COMPLETED,
+            exit_code=0,
+        ))
+        plans = ToolPlanner(workspace, registry).plan(
+            target,
+            [ToolRecommendation(
+                "probe", frozenset({AnalysisMode.AUTO}), "new auditable plan", 80,
+            )],
+            AnalysisMode.AUTO,
+        )
+
+    assert len(plans) == 1
+    assert plans[0].command_mode == "default"
+
+
+def test_planner_explicitly_rejects_unknown_requested_command_mode(tmp_path: Path) -> None:
+    source = tmp_path / "payload.bin"
+    source.write_bytes(b"payload")
+    executable = tmp_path / "probe"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(0o755)
+    registry = ToolRegistry([ToolDefinition(
+        "probe", (str(executable),),
+        command_templates={"default": ("{executable}", "{evidence}")},
+    )])
+    with CaseWorkspace.create(tmp_path / "cases", "invalid-mode") as workspace:
+        target = EvidenceManager(workspace).ingest(source)
+        plans = ToolPlanner(workspace, registry).plan(
+            target,
+            [ToolRecommendation(
+                "probe", frozenset({AnalysisMode.AUTO}), "unsupported action", 80,
+                command_mode="extract",
+            )],
+            AnalysisMode.AUTO,
+        )
+
+    assert len(plans) == 1
+    assert plans[0].available is False
+    assert plans[0].command_mode == "extract"
+    assert plans[0].command_argv == []
+    assert "requested command mode 'extract' is not defined" in " ".join(plans[0].reasons)
+
+
 def test_planner_accepts_identified_elf_magic_for_readelf(tmp_path: Path) -> None:
     source = tmp_path / "sample.elf"
     source.write_bytes(b"\x7fELF" + b"\x00" * 128)

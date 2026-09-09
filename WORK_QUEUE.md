@@ -1,6 +1,6 @@
 # ForensicKit Work Queue
 
-Last reviewed: 2026-09-09 11:15 KST
+Last reviewed: 2026-09-09 12:17 KST
 
 ## Post-v1.1 backlog
 
@@ -18,6 +18,11 @@ Last reviewed: 2026-09-09 11:15 KST
 
 ## Completed this session
 
+- [x] Rewrite README as a detailed Korean competition operator guide covering architecture/stack, evidence coverage, tool installation, offline bundle workflows, CLI/TUI, reports, limits, troubleshooting, and real-environment gates.
+- [x] Bind release bundles to the exact gated Git commit, source tar stream, canonical project-wheel checksum, reproducible wheel epoch, and one-candidate-per-distribution wheelhouse lock; ship standalone checked installer helpers.
+- [x] Refuse protected, symbolic-link, and unrelated nonempty offline-install prefixes; authenticate compatible previous installs, bind install markers to the canonical prefix, and roll back activation/final-validation failures.
+- [x] Keep automatically generated investigation verifications `unverified` until an explicit method/source/conclusion/evidence record supports them, including safe migration of earlier auto-supported placeholders.
+- [x] Deduplicate only exact tool/mode/parameter histories, persist execution identities, enforce rule confidence/action semantics, and cap external-tool outputs by file count, aggregate bytes, per-file size, type, scope, and completion status.
 - [x] Bounded UDF Allocation Extent Descriptor continuation chains for directory and file short/long/extended AD arrays, with exact Type-1 range/tag/checksum/CRC/location/previous-pointer/hash provenance, cycle/overlap/count defenses, metadata-only malformed chains, and full-chain immutable extraction revalidation.
 - [x] ECMA-167 extended-AD length correction and safe Type-1 extraction only when recorded/information lengths prove untransformed data or exact sparse zeros; compressed-length divergence remains metadata-only.
 - [x] Immutable UDF extraction for complete short/long recorded and unrecorded sparse ranges plus embedded-in-ICB regular files, with bounded logical-zero writes and exact ICB provenance.

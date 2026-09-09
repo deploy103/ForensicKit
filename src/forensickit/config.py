@@ -16,6 +16,8 @@ class AnalysisLimits:
     memory_jobs: int = 1
     tool_max_memory_bytes: int = 6 * 1024 * 1024 * 1024
     tool_max_output_file_bytes: int = 2 * 1024 * 1024 * 1024
+    tool_max_generated_files: int = 1_000
+    tool_max_generated_bytes: int = 2 * 1024 * 1024 * 1024
     planner_cpu_units: int = 2
     planner_max_ram_bytes: int = 6 * 1024 * 1024 * 1024
     max_strings: int = 2_000
@@ -41,6 +43,8 @@ class AnalysisLimits:
             "memory_jobs",
             "tool_max_memory_bytes",
             "tool_max_output_file_bytes",
+            "tool_max_generated_files",
+            "tool_max_generated_bytes",
             "planner_cpu_units",
             "planner_max_ram_bytes",
             "max_strings",

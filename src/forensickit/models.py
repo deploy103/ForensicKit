@@ -33,7 +33,7 @@ class ToolRunStatus(str, Enum):
 
 
 class VerificationStatus(str, Enum):
-    """Whether recorded evidence currently verifies a hypothesis."""
+    """Whether an explicit recorded verification supports a hypothesis."""
 
     SUPPORTED = "supported"
     UNVERIFIED = "unverified"

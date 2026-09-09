@@ -21,6 +21,7 @@ from .models import (
     ToolRunStatus,
     Verification,
     VerificationStatus,
+    utc_now,
 )
 
 
@@ -147,6 +148,22 @@ class CaseDatabase:
             "SELECT * FROM findings ORDER BY created_at, id"
         ).fetchall():
             self._ensure_investigation_chain(row)
+        # v1.2.0 release candidates treated the mere presence of a finding's
+        # supporting-evidence strings as if an independent verification had
+        # occurred.  That overstates the investigation state.  This method
+        # name was used only by that automatic backfill, so it is safe to
+        # migrate those placeholders back to an honest unverified state.
+        self.connection.execute(
+            """UPDATE verifications
+               SET method='not_performed', status='unverified',
+                   conclusion=CASE
+                     WHEN evidence_json='[]' THEN
+                       'No supporting evidence or independent verification was recorded; analyst verification is required.'
+                     ELSE
+                       'Supporting evidence is recorded, but no independent verification action has been performed.'
+                   END
+               WHERE method='recorded_supporting_evidence_review'"""
+        )
 
     def close(self) -> None:
         self.connection.close()
@@ -313,6 +330,58 @@ class CaseDatabase:
             for row in rows
         ]
 
+    def record_verification(
+        self,
+        finding_id: str,
+        *,
+        method: str,
+        status: VerificationStatus,
+        conclusion: str,
+        source: str,
+        evidence: Iterable[str] = (),
+    ) -> Verification:
+        """Replace an automatic placeholder with an explicit verification.
+
+        A hypothesis may be marked supported only when the caller records the
+        concrete verification method, source, conclusion, and at least one
+        evidence reference.  This prevents a finding's descriptive support
+        strings from silently masquerading as a completed verification step.
+        """
+        method = method.strip()
+        conclusion = conclusion.strip()
+        source = source.strip()
+        if not method or method == "not_performed":
+            raise ValueError("verification method must describe an action that was performed")
+        if not conclusion:
+            raise ValueError("verification conclusion must not be empty")
+        if not source:
+            raise ValueError("verification source must not be empty")
+        if not isinstance(status, VerificationStatus):
+            try:
+                status = VerificationStatus(status)
+            except ValueError as exc:
+                raise ValueError(f"unsupported verification status: {status!r}") from exc
+        recorded_evidence = [str(item).strip() for item in evidence if str(item).strip()]
+        if status is VerificationStatus.SUPPORTED and not recorded_evidence:
+            raise ValueError("a supported verification requires recorded evidence")
+
+        with self._lock, self.connection:
+            existing = self.connection.execute(
+                "SELECT id FROM verifications WHERE finding_id=?", (finding_id,),
+            ).fetchone()
+            if existing is None:
+                raise LookupError(f"finding has no verification chain: {finding_id}")
+            self.connection.execute(
+                """UPDATE verifications
+                   SET method=?, status=?, conclusion=?, source=?, evidence_json=?, created_at=?
+                   WHERE finding_id=?""",
+                (
+                    method, status.value, conclusion, source,
+                    json.dumps(recorded_evidence), utc_now(), finding_id,
+                ),
+            )
+            return self.verifications(finding_id=finding_id)[0]
+
     def _ensure_investigation_chain(self, finding: sqlite3.Row) -> None:
         """Create the one-to-one hypothesis and verification for a finding.
 
@@ -350,15 +419,11 @@ class CaseDatabase:
             raise sqlite3.IntegrityError(
                 f"unable to persist hypothesis for finding {finding_id}"
             )
-        supported = bool(evidence)
-        status = (
-            VerificationStatus.SUPPORTED.value
-            if supported else VerificationStatus.UNVERIFIED.value
-        )
+        status = VerificationStatus.UNVERIFIED.value
         conclusion = (
-            "The finding is supported by its recorded evidence."
-            if supported else
-            "No supporting evidence was recorded; analyst verification is required."
+            "Supporting evidence is recorded, but no independent verification action has been performed."
+            if evidence else
+            "No supporting evidence or independent verification was recorded; analyst verification is required."
         )
         self.connection.execute(
             """INSERT OR IGNORE INTO verifications
@@ -367,7 +432,7 @@ class CaseDatabase:
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 f"verification-{finding_id}", artifact_id, finding_id,
-                str(hypothesis["id"]), "recorded_supporting_evidence_review",
+                str(hypothesis["id"]), "not_performed",
                 status, conclusion, str(finding["source"]), evidence_json,
                 str(finding["created_at"]),
             ),

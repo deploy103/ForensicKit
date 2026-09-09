@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import tarfile
@@ -198,22 +200,107 @@ def test_doctor_warns_for_valid_dirty_development_bundle(tmp_path: Path) -> None
     assert "dirty development worktree" in check.detail
 
 
-def _installer_bundle(root: Path, *, unsafe_source: bool = False) -> None:
+def _installer_bundle(
+    root: Path, *, unsafe_source: bool = False, fail_final_self_test: bool = False,
+) -> None:
     (root / "manifests").mkdir(parents=True)
     (root / "wheels").mkdir()
     (root / "debs").mkdir()
     (root / "tools").mkdir()
     wheel = root / "wheels" / "forensickit-9.9.9-py3-none-any.whl"
-    wheel.write_bytes(b"installer selection fixture")
+    dist_info = "forensickit-9.9.9.dist-info"
+    final_self_test_guard = (
+        "        if '.installing.' not in sys.executable:\n"
+        "            raise SystemExit(23)\n"
+        if fail_final_self_test else ""
+    )
+    wheel_members = {
+        "forensickit/__init__.py": '__version__ = "9.9.9"\n',
+        "forensickit/cli.py": (
+            "def main():\n"
+            "    import sys\n"
+            "    if sys.argv[1:] == ['--version']:\n"
+            "        print('ForensicKit 9.9.9')\n"
+            "    elif sys.argv[1:] == ['self-test']:\n"
+            f"{final_self_test_guard}"
+            "        print('Self-test passed')\n"
+            "    else:\n"
+            "        raise SystemExit(2)\n"
+        ),
+        f"{dist_info}/METADATA": (
+            "Metadata-Version: 2.1\nName: forensickit\nVersion: 9.9.9\n"
+            "Provides-Extra: tui\nProvides-Extra: test\n"
+        ),
+        f"{dist_info}/WHEEL": (
+            "Wheel-Version: 1.0\nGenerator: ForensicKit tests\n"
+            "Root-Is-Purelib: true\nTag: py3-none-any\n"
+        ),
+        f"{dist_info}/entry_points.txt": "[console_scripts]\nforensickit = forensickit.cli:main\n",
+    }
+    wheel_members[f"{dist_info}/RECORD"] = (
+        "".join(f"{name},,\n" for name in wheel_members) + f"{dist_info}/RECORD,,\n"
+    )
+    with zipfile.ZipFile(wheel, "w") as archive:
+        for name, data in wheel_members.items():
+            archive.writestr(name, data)
     with tarfile.open(root / "forensickit-source.tar.gz", "w:gz") as archive:
-        payload = tmp_file = root.parent / "README.fixture"
-        payload.write_bytes(b"offline source")
-        archive.add(tmp_file, arcname="../escape" if unsafe_source else "README.md")
+        source_members = {
+            "pyproject.toml": b'[project]\nname = "forensickit"\nversion = "9.9.9"\n',
+            "src/forensickit/__init__.py": b'__version__ = "9.9.9"\n',
+            "README.md": b"offline source\n",
+        }
+        if unsafe_source:
+            source_members = {"../escape": b"unsafe\n"}
+        for name, data in source_members.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            info.mode = 0o644
+            archive.addfile(info, io.BytesIO(data))
     (root / "manifests" / "build-manifest.env").write_text(
         "BUNDLE_FORMAT=forensickit-offline-v1\n"
         "DISTRO_ID=unknown\nDISTRO_VERSION=unknown\nARCHITECTURE=unknown\n",
         encoding="utf-8",
     )
+    _checksums(root)
+
+
+def _promote_installer_bundle_to_v2(root: Path) -> None:
+    wheel = root / "wheels" / "forensickit-9.9.9-py3-none-any.whl"
+    (root / "manifests" / "build-manifest.env").write_text(
+        "BUNDLE_FORMAT=forensickit-offline-v2\n"
+        "DISTRO_ID=unknown\nDISTRO_VERSION=unknown\nARCHITECTURE=unknown\n"
+        f"SOURCE_COMMIT={'a' * 40}\nSOURCE_DIRTY=0\nSOURCE_DATE_EPOCH=315532800\n",
+        encoding="utf-8",
+    )
+    (root / "manifests" / "component-manifest.json").write_text(
+        json.dumps({
+            "schema_version": 1,
+            "bundle_format": "forensickit-offline-v2",
+            "components": [{
+                "kind": "python_wheel",
+                "name": "forensickit",
+                "version": "9.9.9",
+                "license": "NOASSERTION",
+                "bundle_path": "wheels/forensickit-9.9.9-py3-none-any.whl",
+                "sha256": hashlib.sha256(wheel.read_bytes()).hexdigest(),
+                "supported_os": ["any"],
+                "architectures": ["any"],
+            }],
+        }),
+        encoding="utf-8",
+    )
+    verifier = root / "verify-wheelhouse.py"
+    verifier.write_bytes((ROOT / "scripts" / "wheelhouse_lock.py").read_bytes())
+    verifier.chmod(0o755)
+    completed = subprocess.run(
+        [
+            str(verifier), "--wheel-dir", str(root / "wheels"),
+            "--lock", str(root / "manifests" / "python-wheel-lock.json"),
+            "--write",
+        ],
+        text=True, capture_output=True, check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
     _checksums(root)
 
 
@@ -228,6 +315,46 @@ def test_offline_installer_verify_only_accepts_one_safe_project_wheel(tmp_path: 
 
     assert completed.returncode == 0, completed.stderr
     assert "bundle verified" in completed.stdout
+
+
+def test_offline_installer_v2_verifies_wheelhouse_dependency_lock(tmp_path: Path) -> None:
+    bundle = tmp_path / "bundle"
+    _installer_bundle(bundle)
+    _promote_installer_bundle_to_v2(bundle)
+
+    accepted = subprocess.run(
+        [str(ROOT / "scripts" / "install_offline.sh"), str(bundle), "--verify-only"],
+        text=True, capture_output=True, check=False,
+    )
+    assert accepted.returncode == 0, accepted.stderr
+
+    lock = bundle / "manifests" / "python-wheel-lock.json"
+    payload = json.loads(lock.read_text(encoding="utf-8"))
+    payload["wheels"][0]["version"] = "0.0.0"
+    lock.write_text(json.dumps(payload), encoding="utf-8")
+    _checksums(bundle)
+    rejected = subprocess.run(
+        [str(ROOT / "scripts" / "install_offline.sh"), str(bundle), "--verify-only"],
+        text=True, capture_output=True, check=False,
+    )
+    assert rejected.returncode == 1
+    assert "does not match its dependency lock" in rejected.stderr
+
+
+def test_offline_installer_v2_requires_regular_lock_and_verifier(tmp_path: Path) -> None:
+    bundle = tmp_path / "bundle"
+    _installer_bundle(bundle)
+    _promote_installer_bundle_to_v2(bundle)
+    (bundle / "manifests" / "python-wheel-lock.json").unlink()
+    _checksums(bundle)
+
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "install_offline.sh"), str(bundle), "--verify-only"],
+        text=True, capture_output=True, check=False,
+    )
+
+    assert completed.returncode == 1
+    assert "lacks a regular wheelhouse lock" in completed.stderr
 
 
 def test_offline_installer_rejects_ambiguous_project_wheels(tmp_path: Path) -> None:
@@ -274,7 +401,190 @@ def test_offline_installer_rejects_root_and_bundle_containing_prefixes(tmp_path:
         assert message in completed.stderr
 
 
-def test_failed_staged_upgrade_preserves_existing_prefix(tmp_path: Path) -> None:
+def test_offline_installer_rejects_protected_system_prefixes(tmp_path: Path) -> None:
+    bundle = tmp_path / "bundle"
+    _installer_bundle(bundle)
+
+    for prefix in ("/etc", "/home", "/opt", "/tmp", "/usr", "/usr/local", "/var"):
+        completed = subprocess.run(
+            [
+                str(ROOT / "scripts" / "install_offline.sh"), str(bundle),
+                "--prefix", prefix, "--verify-only",
+            ],
+            text=True, capture_output=True, check=False,
+        )
+
+        assert completed.returncode == 1
+        assert "protected system path" in completed.stderr
+
+
+def test_offline_installer_rejects_symlink_prefix_without_touching_target(tmp_path: Path) -> None:
+    bundle = tmp_path / "bundle"
+    target = tmp_path / "target"
+    prefix = tmp_path / "install-link"
+    _installer_bundle(bundle)
+    target.mkdir()
+    sentinel = target / "keep.txt"
+    sentinel.write_text("unrelated", encoding="utf-8")
+    prefix.symlink_to(target, target_is_directory=True)
+
+    completed = subprocess.run(
+        [
+            str(ROOT / "scripts" / "install_offline.sh"), str(bundle),
+            "--prefix", f"{prefix}//", "--no-apt", "--upgrade",
+        ],
+        text=True, capture_output=True, check=False,
+    )
+
+    assert completed.returncode == 1
+    assert "symbolic link" in completed.stderr
+    assert prefix.is_symlink()
+    assert sentinel.read_text(encoding="utf-8") == "unrelated"
+
+
+def test_offline_installer_rejects_forged_marker_without_installed_distribution(tmp_path: Path) -> None:
+    bundle = tmp_path / "bundle"
+    prefix = tmp_path / "unrelated"
+    _installer_bundle(bundle)
+    prefix.mkdir()
+    sentinel = prefix / "keep.txt"
+    sentinel.write_text("unrelated", encoding="utf-8")
+    prefix_hash = hashlib.sha256(str(prefix.resolve()).encode()).hexdigest()
+    (prefix / ".forensickit-install").write_text(
+        "FORENSICKIT_INSTALL_MARKER_V1\n"
+        f"prefix_sha256={prefix_hash}\n"
+        f"wheel_sha256={'0' * 64}\n"
+        "bundle_format=forensickit-offline-v2\n"
+        f"source_commit={'0' * 40}\n"
+        "source_dirty=0\n",
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [
+            str(ROOT / "scripts" / "install_offline.sh"), str(bundle),
+            "--prefix", str(prefix), "--no-apt", "--upgrade",
+        ],
+        text=True, capture_output=True, check=False,
+    )
+
+    assert completed.returncode == 1
+    assert "not a recognized ForensicKit installation" in completed.stderr
+    assert sentinel.read_text(encoding="utf-8") == "unrelated"
+
+
+def _legacy_install(prefix: Path, *, nested_source: bool) -> None:
+    site_packages = prefix / "venv" / "lib" / "python3.12" / "site-packages"
+    package = site_packages / "forensickit"
+    dist_info = site_packages / "forensickit-9.9.9.dist-info"
+    launcher = prefix / "venv" / "bin" / "forensickit"
+    package.mkdir(parents=True)
+    dist_info.mkdir()
+    launcher.parent.mkdir(parents=True, exist_ok=True)
+    (prefix / "venv" / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+    package.joinpath("__init__.py").write_text('__version__ = "9.9.9"\n', encoding="utf-8")
+    dist_info.joinpath("METADATA").write_text(
+        "Metadata-Version: 2.1\nName: forensickit\nVersion: 9.9.9\n",
+        encoding="utf-8",
+    )
+    launcher.write_text(
+        "#!/usr/bin/python3\nfrom forensickit.cli import main\nmain()\n",
+        encoding="utf-8",
+    )
+    project = prefix / "source" if nested_source else prefix
+    project.joinpath("src", "forensickit").mkdir(parents=True, exist_ok=True)
+    project.joinpath("src", "forensickit", "__init__.py").write_text(
+        '__version__ = "9.9.9"\n', encoding="utf-8",
+    )
+    project.joinpath("pyproject.toml").write_text(
+        '[project]\nname = "forensickit"\nversion = "9.9.9"\n',
+        encoding="utf-8",
+    )
+
+
+def test_offline_installer_fresh_install_writes_upgrade_marker(tmp_path: Path) -> None:
+    bundle = tmp_path / "bundle"
+    prefix = tmp_path / "new-install"
+    _installer_bundle(bundle)
+    clean_env = os.environ.copy()
+    clean_env.pop("PYTHONPATH", None)
+
+    completed = subprocess.run(
+        [
+            str(ROOT / "scripts" / "install_offline.sh"), str(bundle),
+            "--prefix", str(prefix), "--no-apt",
+        ],
+        text=True, capture_output=True, check=False, timeout=120, env=clean_env,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert (prefix / ".forensickit-install").is_file()
+    assert (prefix / "venv" / "bin" / "forensickit").is_file()
+
+
+def test_offline_installer_upgrades_legacy_install_and_writes_bound_marker(
+    tmp_path: Path,
+) -> None:
+    clean_env = os.environ.copy()
+    clean_env.pop("PYTHONPATH", None)
+    for layout_name, nested_source in (("v1.1-layout", False), ("v1.2-layout", True)):
+        scenario = tmp_path / layout_name
+        bundle = scenario / "bundle"
+        prefix = scenario / "installed"
+        _installer_bundle(bundle)
+        _legacy_install(prefix, nested_source=nested_source)
+
+        completed = subprocess.run(
+            [
+                str(ROOT / "scripts" / "install_offline.sh"), str(bundle),
+                "--prefix", str(prefix), "--no-apt", "--upgrade",
+            ],
+            text=True, capture_output=True, check=False, timeout=120, env=clean_env,
+        )
+
+        assert completed.returncode == 0, completed.stderr
+        marker = prefix / ".forensickit-install"
+        marker_text = marker.read_text(encoding="utf-8")
+        assert marker_text.startswith("FORENSICKIT_INSTALL_MARKER_V1\n")
+        assert f"prefix_sha256={hashlib.sha256(str(prefix.resolve()).encode()).hexdigest()}\n" in marker_text
+        assert "bundle_format=forensickit-offline-v1\n" in marker_text
+        assert "source_commit=unknown\n" in marker_text
+        assert "source_dirty=unknown\n" in marker_text
+        assert not list(scenario.glob("installed.installing.*"))
+        assert not list(scenario.glob("installed.backup.*"))
+
+        # The newly written marker path, not just the legacy fallback,
+        # authorizes a subsequent verified upgrade.
+        second = subprocess.run(
+            [
+                str(ROOT / "scripts" / "install_offline.sh"), str(bundle),
+                "--prefix", str(prefix), "--no-apt", "--upgrade",
+            ],
+            text=True, capture_output=True, check=False, timeout=120, env=clean_env,
+        )
+        assert second.returncode == 0, second.stderr
+
+        # A marker copied or edited for another prefix is not accepted, even
+        # when the surrounding virtual environment is otherwise complete.
+        marker.write_text(
+            marker.read_text(encoding="utf-8").replace(
+                f"prefix_sha256={hashlib.sha256(str(prefix.resolve()).encode()).hexdigest()}",
+                f"prefix_sha256={'f' * 64}",
+            ),
+            encoding="utf-8",
+        )
+        rejected = subprocess.run(
+            [
+                str(ROOT / "scripts" / "install_offline.sh"), str(bundle),
+                "--prefix", str(prefix), "--no-apt", "--upgrade",
+            ],
+            text=True, capture_output=True, check=False, timeout=60, env=clean_env,
+        )
+        assert rejected.returncode == 1
+        assert "belongs to a different prefix" in rejected.stderr
+
+
+def test_upgrade_rejects_unrelated_existing_prefix_without_touching_it(tmp_path: Path) -> None:
     bundle = tmp_path / "bundle"
     prefix = tmp_path / "installed"
     _installer_bundle(bundle)
@@ -296,6 +606,32 @@ def test_failed_staged_upgrade_preserves_existing_prefix(tmp_path: Path) -> None
     assert not list(tmp_path.glob("installed.backup.*"))
 
 
+def test_failed_final_validation_restores_recognized_existing_install(tmp_path: Path) -> None:
+    bundle = tmp_path / "bundle"
+    prefix = tmp_path / "installed"
+    _installer_bundle(bundle, fail_final_self_test=True)
+    _legacy_install(prefix, nested_source=True)
+    sentinel = prefix / "known-good.txt"
+    sentinel.write_text("previous installation", encoding="utf-8")
+    clean_env = os.environ.copy()
+    clean_env.pop("PYTHONPATH", None)
+
+    completed = subprocess.run(
+        [
+            str(ROOT / "scripts" / "install_offline.sh"), str(bundle),
+            "--prefix", str(prefix), "--no-apt", "--upgrade",
+        ],
+        text=True, capture_output=True, check=False, timeout=120, env=clean_env,
+    )
+
+    assert completed.returncode != 0
+    assert "final-path validation failed" in completed.stderr
+    assert sentinel.read_text(encoding="utf-8") == "previous installation"
+    assert not (prefix / ".forensickit-install").exists()
+    assert not list(tmp_path.glob("installed.installing.*"))
+    assert not list(tmp_path.glob("installed.backup.*"))
+
+
 def test_bundle_builder_requires_clean_provenance_by_default() -> None:
     script = (ROOT / "scripts" / "build_offline_bundle.sh").read_text(encoding="utf-8")
 
@@ -303,5 +639,9 @@ def test_bundle_builder_requires_clean_provenance_by_default() -> None:
     assert "git -C \"$PROJECT_ROOT\" archive" in script
     assert "SOURCE_COMMIT=$SOURCE_COMMIT" in script
     assert "SOURCE_DIRTY=$SOURCE_DIRTY" in script
+    assert "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH" in script
+    assert "python-wheel-lock.json" in script
+    assert '"$OUTPUT/install_offline.sh"' in script
+    assert '"$OUTPUT/verify-wheelhouse.py"' in script
     assert "--exclude='build'" in script
     assert "--exclude='dist'" in script

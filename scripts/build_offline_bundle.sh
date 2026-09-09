@@ -51,6 +51,7 @@ fi
 
 SOURCE_COMMIT="unknown"
 SOURCE_DIRTY="unknown"
+REPRODUCIBLE_EPOCH="315532800"
 if command -v git >/dev/null 2>&1 && git -C "$PROJECT_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   SOURCE_COMMIT="$(git -C "$PROJECT_ROOT" rev-parse HEAD)"
   if [[ -n "$(git -C "$PROJECT_ROOT" status --porcelain --untracked-files=normal)" ]]; then
@@ -62,10 +63,31 @@ if command -v git >/dev/null 2>&1 && git -C "$PROJECT_ROOT" rev-parse --is-insid
   else
     SOURCE_DIRTY="0"
   fi
+  # Derive the wheel timestamp from the latest committed wheel input, not from
+  # HEAD. A follow-up commit that only records the release checksum must not
+  # perturb dist-info ZIP timestamps and create a checksum cycle.
+  REPRODUCIBLE_EPOCH="$(
+    git -C "$PROJECT_ROOT" log -1 --format=%ct "$SOURCE_COMMIT" -- \
+      pyproject.toml README.md src setup.py setup.cfg MANIFEST.in \
+      ':(glob)LICENSE*' ':(glob)COPYING*'
+  )"
+  if [[ -z "$REPRODUCIBLE_EPOCH" ]]; then
+    REPRODUCIBLE_EPOCH="$(git -C "$PROJECT_ROOT" show -s --format=%ct "$SOURCE_COMMIT")"
+  fi
 elif (( ! ALLOW_DIRTY )); then
   echo "refusing to build a release bundle without Git source provenance; use --allow-dirty for a development-only bundle" >&2
   exit 1
 fi
+if [[ ! "$REPRODUCIBLE_EPOCH" =~ ^[0-9]+$ ]]; then
+  echo "could not derive a valid SOURCE_DATE_EPOCH: $REPRODUCIBLE_EPOCH" >&2
+  exit 1
+fi
+# ZIP timestamps cannot represent dates before 1980. This also provides a
+# stable fallback for explicitly allowed non-Git development source trees.
+if (( REPRODUCIBLE_EPOCH < 315532800 )); then
+  REPRODUCIBLE_EPOCH=315532800
+fi
+export SOURCE_DATE_EPOCH="$REPRODUCIBLE_EPOCH"
 OUTPUT="$(realpath -m "$OUTPUT")"
 if [[ -e "$OUTPUT" ]]; then
   echo "refusing to overwrite existing bundle: $OUTPUT" >&2
@@ -85,6 +107,12 @@ fi
 
 mkdir -p "$OUTPUT"/{debs,wheels,manifests,tools}
 mkdir -p "$OUTPUT/debs/partial"
+# Keep the bundle directly installable after it is copied to offline media;
+# requiring a second checkout merely to locate the installer defeats that
+# operational property.  Both helpers are covered by the bundle checksum
+# manifest generated below.
+install -m 0755 "$PROJECT_ROOT/scripts/install_offline.sh" "$OUTPUT/install_offline.sh"
+install -m 0755 "$PROJECT_ROOT/scripts/wheelhouse_lock.py" "$OUTPUT/verify-wheelhouse.py"
 
 APT_PACKAGES=(
   python3 python3-venv python3-pip file
@@ -96,6 +124,10 @@ APT_PACKAGES+=("${EXTRA_PACKAGES[@]}")
 printf '%s\n' "${APT_PACKAGES[@]}" | awk 'NF && !seen[$0]++' | sort > "$OUTPUT/manifests/apt-packages.txt"
 
 python3 -m pip wheel --wheel-dir "$OUTPUT/wheels" --prefer-binary "$PROJECT_ROOT[tui,test]"
+python3 "$PROJECT_ROOT/scripts/wheelhouse_lock.py" \
+  --wheel-dir "$OUTPUT/wheels" \
+  --lock "$OUTPUT/manifests/python-wheel-lock.json" \
+  --write
 
 if (( INCLUDE_APT )); then
   if ! command -v apt-get >/dev/null 2>&1; then
@@ -173,6 +205,7 @@ BUILT_AT_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 PYTHON=$(python3 --version 2>&1)
 SOURCE_COMMIT=$SOURCE_COMMIT
 SOURCE_DIRTY=$SOURCE_DIRTY
+SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH
 EOF
 
 COMPONENT_COMMAND=(
@@ -191,4 +224,4 @@ fi
 )
 echo "Offline bundle created: $OUTPUT"
 echo "Copy it to a matching offline machine, then run:"
-echo "  scripts/install_offline.sh $OUTPUT"
+echo "  $OUTPUT/install_offline.sh $OUTPUT"

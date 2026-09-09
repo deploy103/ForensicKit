@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import signal
+import stat
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -23,10 +24,27 @@ class ToolExecutionResult:
     stdout_preview: str = ""
     stderr_preview: str = ""
     generated_directory: str | None = None
+    generated_output_audit: dict[str, object] = field(default_factory=dict)
 
     @property
     def status(self) -> ToolRunStatus:
         return self.run.status
+
+
+@dataclass(slots=True)
+class _GeneratedOutputAudit:
+    files: list[str] = field(default_factory=list)
+    regular_file_count: int = 0
+    regular_file_bytes: int = 0
+    directory_count: int = 0
+    entries_scanned: int = 0
+    scan_complete: bool = True
+    rejected_entries: list[dict[str, object]] = field(default_factory=list)
+    failed_checks: list[str] = field(default_factory=list)
+
+    @property
+    def accepted(self) -> bool:
+        return not self.failed_checks
 
 
 class ToolRunner:
@@ -42,12 +60,13 @@ class ToolRunner:
         parser_bytes: int = 2 * 1024 * 1024,
         termination_grace: float = 0.5,
         max_generated_files: int = 1_000,
+        max_generated_bytes: int = 2 * 1024 * 1024 * 1024,
         max_timeout: float | None = None,
         cancel_event: Event | None = None,
         max_memory_bytes: int | None = None,
         max_output_file_bytes: int | None = None,
     ) -> None:
-        if preview_bytes <= 0 or parser_bytes <= 0 or max_generated_files <= 0 or (max_timeout is not None and max_timeout <= 0) or (max_memory_bytes is not None and max_memory_bytes <= 0) or (max_output_file_bytes is not None and max_output_file_bytes <= 0):
+        if preview_bytes <= 0 or parser_bytes <= 0 or max_generated_files <= 0 or max_generated_bytes <= 0 or (max_timeout is not None and max_timeout <= 0) or (max_memory_bytes is not None and max_memory_bytes <= 0) or (max_output_file_bytes is not None and max_output_file_bytes <= 0):
             raise ValueError("output bounds must be positive")
         self.workspace = workspace
         self.registry = registry or ToolRegistry.default()
@@ -56,6 +75,7 @@ class ToolRunner:
         self.parser_bytes = parser_bytes
         self.termination_grace = max(0.05, termination_grace)
         self.max_generated_files = max_generated_files
+        self.max_generated_bytes = max_generated_bytes
         self.max_timeout = max_timeout
         self.cancel_event = cancel_event
         self.max_memory_bytes = max_memory_bytes
@@ -99,11 +119,36 @@ class ToolRunner:
         stdout_file = self.workspace.path("outputs", f"{run.id}.stdout.log")
         stderr_file = self.workspace.path("logs", f"{run.id}.stderr.log")
         generated_dir = self._generated_directory(run.id, output_directory)
-        generated_dir.mkdir(parents=True, exist_ok=False)
         stdout_file.touch(exist_ok=False)
         stderr_file.touch(exist_ok=False)
         run.stdout_path = self.workspace.relative(stdout_file)
         run.stderr_path = self.workspace.relative(stderr_file)
+        try:
+            generated_dir.mkdir(parents=True, exist_ok=False)
+        except OSError as exc:
+            preparation_audit = _GeneratedOutputAudit(scan_complete=False)
+            preparation_audit.failed_checks.append(
+                "preexisting_output"
+                if os.path.lexists(generated_dir)
+                else "output_directory_preparation"
+            )
+            preparation_audit.rejected_entries.append({
+                "path": str(generated_dir)[:1_024],
+                "reason": str(exc)[:2_000],
+            })
+            run.status = ToolRunStatus.FAILED
+            run.error = (
+                "generated output directory preparation failed; a tool run "
+                f"must start with a new empty directory: {exc}"
+            )
+            run.ended_at = utc_now()
+            self.workspace.database.add_tool_run(run)
+            return self._finish_without_parser(
+                run,
+                generated_dir,
+                available=definition is not None,
+                generated_output_audit=preparation_audit,
+            )
 
         if definition is None:
             run.status = ToolRunStatus.SKIPPED
@@ -138,6 +183,27 @@ class ToolRunner:
             self.workspace.database.add_tool_run(run)
             return self._finish_without_parser(run, generated_dir, available=True)
 
+        prelaunch_audit = self._generated_output_audit(generated_dir)
+        if prelaunch_audit.entries_scanned or not prelaunch_audit.accepted:
+            prelaunch_audit.scan_complete = False
+            prelaunch_audit.failed_checks.insert(0, "preexisting_output")
+            prelaunch_audit.failed_checks = list(dict.fromkeys(
+                prelaunch_audit.failed_checks
+            ))
+            run.status = ToolRunStatus.FAILED
+            run.error = (
+                "generated output directory was not empty immediately before "
+                "tool launch"
+            )
+            run.ended_at = utc_now()
+            self.workspace.database.add_tool_run(run)
+            return self._finish_without_parser(
+                run,
+                generated_dir,
+                available=True,
+                generated_output_audit=prelaunch_audit,
+            )
+
         self.workspace.database.add_tool_run(run)
         if self.cancel_event is not None and self.cancel_event.is_set():
             run.status = ToolRunStatus.CANCELED
@@ -150,6 +216,7 @@ class ToolRunner:
         self.workspace.database.update_tool_run(run)
 
         process: subprocess.Popen[bytes] | None = None
+        live_output_audit: _GeneratedOutputAudit | None = None
         try:
             with stdout_file.open("wb") as stdout_handle, stderr_file.open("wb") as stderr_handle:
                 popen_options: dict[str, object] = {}
@@ -186,6 +253,18 @@ class ToolRunner:
                     try:
                         run.exit_code = process.wait(timeout=min(0.25, remaining))
                     except subprocess.TimeoutExpired:
+                        current_audit = self._generated_output_audit(
+                            generated_dir
+                        )
+                        if not current_audit.accepted:
+                            live_output_audit = current_audit
+                            self._terminate_process_group(process)
+                            run.exit_code = process.returncode
+                            run.status = ToolRunStatus.FAILED
+                            run.error = self._generated_output_error(
+                                current_audit
+                            )
+                            break
                         continue
                     run.status = (
                         ToolRunStatus.COMPLETED if run.exit_code == 0 else ToolRunStatus.FAILED
@@ -208,7 +287,31 @@ class ToolRunner:
         finally:
             run.ended_at = utc_now()
 
-        run.generated_files, generated_truncated = self._generated_files(generated_dir)
+        output_audit = live_output_audit or self._generated_output_audit(
+            generated_dir
+        )
+        if (
+            run.status is not ToolRunStatus.COMPLETED
+            and output_audit.entries_scanned
+        ):
+            output_audit.failed_checks.append("partial_output_from_incomplete_run")
+            output_audit.failed_checks = list(dict.fromkeys(
+                output_audit.failed_checks
+            ))
+        if output_audit.accepted and run.status is ToolRunStatus.COMPLETED:
+            run.generated_files = output_audit.files
+        else:
+            run.generated_files = []
+            if run.status is ToolRunStatus.COMPLETED:
+                run.status = ToolRunStatus.FAILED
+            if output_audit.failed_checks:
+                output_error = self._generated_output_error(output_audit)
+                if run.error:
+                    if output_error not in run.error:
+                        run.error = f"{run.error}; {output_error}"
+                else:
+                    run.error = output_error
+        generated_truncated = not output_audit.accepted
         self.workspace.database.update_tool_run(run)
 
         stdout_for_parser = self._read_bounded(stdout_file, self.parser_bytes)
@@ -424,12 +527,25 @@ class ToolRunner:
                     confidence=1.0,
                 ),
             ))
+        parsed.observations.append(
+            Observation(
+                artifact_id=artifact.id,
+                key=f"tool.{definition.name}.generated_output_audit",
+                value=self._generated_output_audit_value(output_audit),
+                source=f"tool_runner:{run.id}",
+                confidence=1.0,
+            )
+        )
         if generated_truncated:
             parsed.observations.append(
                 Observation(
                     artifact_id=artifact.id,
                     key=f"tool.{definition.name}.generated_files_truncated",
-                    value={"limit": self.max_generated_files},
+                    value={
+                        "file_limit": self.max_generated_files,
+                        "byte_limit": self.max_generated_bytes,
+                        "failed_checks": output_audit.failed_checks,
+                    },
                     source=f"tool_runner:{run.id}",
                     confidence=1.0,
                 )
@@ -443,6 +559,9 @@ class ToolRunner:
             stdout_preview=self._read_bounded(stdout_file, self.preview_bytes),
             stderr_preview=self._read_bounded(stderr_file, self.preview_bytes),
             generated_directory=self.workspace.relative(generated_dir),
+            generated_output_audit=self._generated_output_audit_value(
+                output_audit
+            ),
         )
 
     def _finish_without_parser(
@@ -451,19 +570,33 @@ class ToolRunner:
         generated_dir: Path,
         *,
         available: bool,
+        generated_output_audit: _GeneratedOutputAudit | None = None,
     ) -> ToolExecutionResult:
-        observation = Observation(
+        observations = [Observation(
             artifact_id=run.artifact_id,
             key=f"tool.{run.tool}.available",
             value=available,
             source=f"tool_runner:{run.id}",
             confidence=1.0,
-        )
-        self.workspace.database.add_observations([observation])
+        )]
+        audit_value: dict[str, object] = {}
+        if generated_output_audit is not None:
+            audit_value = self._generated_output_audit_value(
+                generated_output_audit
+            )
+            observations.append(Observation(
+                artifact_id=run.artifact_id,
+                key=f"tool.{run.tool}.generated_output_audit",
+                value=audit_value,
+                source=f"tool_runner:{run.id}",
+                confidence=1.0,
+            ))
+        self.workspace.database.add_observations(observations)
         return ToolExecutionResult(
             run=run,
-            observations=[observation],
+            observations=observations,
             generated_directory=self.workspace.relative(generated_dir),
+            generated_output_audit=audit_value,
         )
 
     def _generated_directory(self, run_id: str, requested: Path | None) -> Path:
@@ -479,20 +612,172 @@ class ToolRunner:
             raise ValueError("generated output directory must be inside the case workspace")
         return candidate
 
-    def _generated_files(self, directory: Path) -> tuple[list[str], bool]:
-        files: list[str] = []
-        truncated = False
-        for path in sorted(directory.rglob("*")):
-            if path.is_symlink() or not path.is_file():
-                continue
+    def _generated_output_audit(self, directory: Path) -> _GeneratedOutputAudit:
+        """Inventory output metadata without following links or reading file data."""
+        audit = _GeneratedOutputAudit()
+        try:
+            root_metadata = directory.lstat()
+        except OSError as exc:
+            audit.scan_complete = False
+            audit.failed_checks.append("output_directory_stat")
+            audit.rejected_entries.append({
+                "path": str(directory)[:1_024],
+                "reason": str(exc)[:2_000],
+            })
+            return audit
+        if stat.S_ISLNK(root_metadata.st_mode) or not stat.S_ISDIR(
+            root_metadata.st_mode
+        ):
+            audit.scan_complete = False
+            audit.failed_checks.append("invalid_output_directory_type")
+            audit.rejected_entries.append({
+                "path": str(directory)[:1_024],
+                "mode": root_metadata.st_mode,
+                "reason": "tool output root is not a real directory",
+            })
+            return audit
+        pending = [directory]
+        accepted_paths: list[Path] = []
+        entry_limit = max(
+            self.max_generated_files + 256,
+            self.max_generated_files * 4,
+        )
+        while pending:
+            current = pending.pop()
             try:
-                files.append(self.workspace.relative(path))
-            except ValueError:
-                continue
-            if len(files) >= self.max_generated_files:
-                truncated = True
+                entries = os.scandir(current)
+            except OSError as exc:
+                audit.scan_complete = False
+                audit.failed_checks.append("output_directory_scan")
+                audit.rejected_entries.append({
+                    "path": str(current)[:1_024],
+                    "reason": str(exc)[:2_000],
+                })
                 break
-        return files, truncated
+            with entries:
+                for entry in entries:
+                    audit.entries_scanned += 1
+                    relative_name = str(
+                        Path(entry.path).relative_to(directory)
+                    )[:1_024]
+                    if audit.entries_scanned > entry_limit:
+                        audit.scan_complete = False
+                        audit.failed_checks.append("output_entry_limit")
+                        audit.rejected_entries.append({
+                            "path": relative_name,
+                            "reason": "output inventory entry limit exceeded",
+                        })
+                        pending.clear()
+                        break
+                    try:
+                        metadata = entry.stat(follow_symlinks=False)
+                    except OSError as exc:
+                        audit.scan_complete = False
+                        audit.failed_checks.append("output_entry_stat")
+                        audit.rejected_entries.append({
+                            "path": relative_name,
+                            "reason": str(exc)[:2_000],
+                        })
+                        pending.clear()
+                        break
+                    mode = metadata.st_mode
+                    if stat.S_ISLNK(mode):
+                        audit.scan_complete = False
+                        audit.failed_checks.append("symbolic_link_output")
+                        audit.rejected_entries.append({
+                            "path": relative_name,
+                            "reason": "symbolic link output is not accepted",
+                        })
+                        pending.clear()
+                        break
+                    if stat.S_ISDIR(mode):
+                        audit.directory_count += 1
+                        pending.append(Path(entry.path))
+                        continue
+                    if not stat.S_ISREG(mode):
+                        audit.scan_complete = False
+                        audit.failed_checks.append("special_file_output")
+                        audit.rejected_entries.append({
+                            "path": relative_name,
+                            "mode": mode,
+                            "reason": "non-regular tool output is not accepted",
+                        })
+                        pending.clear()
+                        break
+                    audit.regular_file_count += 1
+                    audit.regular_file_bytes += metadata.st_size
+                    if audit.regular_file_count > self.max_generated_files:
+                        audit.scan_complete = False
+                        audit.failed_checks.append("generated_file_count_limit")
+                        audit.rejected_entries.append({
+                            "path": relative_name,
+                            "size": metadata.st_size,
+                            "reason": "generated file count limit exceeded",
+                        })
+                        pending.clear()
+                        break
+                    if (
+                        self.max_output_file_bytes is not None
+                        and metadata.st_size > self.max_output_file_bytes
+                    ):
+                        audit.scan_complete = False
+                        audit.failed_checks.append("generated_file_size_limit")
+                        audit.rejected_entries.append({
+                            "path": relative_name,
+                            "size": metadata.st_size,
+                            "reason": "generated file size limit exceeded",
+                        })
+                        pending.clear()
+                        break
+                    if audit.regular_file_bytes > self.max_generated_bytes:
+                        audit.scan_complete = False
+                        audit.failed_checks.append("generated_byte_limit")
+                        audit.rejected_entries.append({
+                            "path": relative_name,
+                            "size": metadata.st_size,
+                            "reason": "aggregate generated byte limit exceeded",
+                        })
+                        pending.clear()
+                        break
+                    accepted_paths.append(Path(entry.path))
+        if audit.accepted:
+            for path in sorted(accepted_paths):
+                try:
+                    audit.files.append(self.workspace.relative(path))
+                except ValueError:
+                    audit.scan_complete = False
+                    audit.failed_checks.append("output_path_scope")
+                    audit.rejected_entries.append({
+                        "path": str(path)[:1_024],
+                        "reason": "generated path escaped the case workspace",
+                    })
+                    audit.files.clear()
+                    break
+        audit.failed_checks = list(dict.fromkeys(audit.failed_checks))
+        return audit
+
+    def _generated_output_audit_value(
+        self,
+        audit: _GeneratedOutputAudit,
+    ) -> dict[str, object]:
+        return {
+            "accepted": audit.accepted,
+            "scan_complete": audit.scan_complete,
+            "regular_file_count": audit.regular_file_count,
+            "regular_file_bytes": audit.regular_file_bytes,
+            "directory_count": audit.directory_count,
+            "entries_scanned": audit.entries_scanned,
+            "max_generated_files": self.max_generated_files,
+            "max_generated_bytes": self.max_generated_bytes,
+            "max_output_file_bytes": self.max_output_file_bytes,
+            "failed_checks": audit.failed_checks,
+            "rejected_entries": audit.rejected_entries[:16],
+        }
+
+    @staticmethod
+    def _generated_output_error(audit: _GeneratedOutputAudit) -> str:
+        checks = ", ".join(audit.failed_checks) or "unknown_output_failure"
+        return f"generated output rejected: {checks}"
 
     def _persist_parsed(self, parsed: ParsedToolOutput) -> None:
         if parsed.observations:

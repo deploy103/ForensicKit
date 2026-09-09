@@ -241,6 +241,8 @@ class AnalysisEngine:
                 cancel_event=self.cancel_event,
                 max_memory_bytes=self.config.limits.tool_max_memory_bytes,
                 max_output_file_bytes=self.config.limits.tool_max_output_file_bytes,
+                max_generated_files=self.config.limits.tool_max_generated_files,
+                max_generated_bytes=self.config.limits.tool_max_generated_bytes,
             )
             considered: set[tuple[str, str, tuple[tuple[str, str], ...]]] = set()
             pending = plans
@@ -270,6 +272,9 @@ class AnalysisEngine:
                         run_id=execution.run.id, error=execution.run.error,
                     )
                     result.tool_runs.append(execution.run)
+                    self._record_tool_execution_identity(
+                        workspace, result, artifact.id, plan, execution.run,
+                    )
                     result.observations.extend(execution.observations)
                     result.findings.extend(execution.findings)
                     if execution.run.error:
@@ -404,6 +409,10 @@ class AnalysisEngine:
             findings=workspace.database.findings(artifact.id),
             tool_runs=workspace.database.tool_runs(artifact.id),
         )
+        if any(change.applied for change in rule_result.confidence_changes):
+            # Confidence changes mutate only the bounded classification list;
+            # persist them before ToolPlanner calculates evidence confidence.
+            workspace.database.update_artifact_identification(artifact)
         return profile_result, rule_result
 
     def _inspect_supplied_sqlite_wal(
@@ -1789,6 +1798,27 @@ class AnalysisEngine:
         ]
         workspace.database.add_observations(observations)
         result.observations.extend(observations)
+
+    @staticmethod
+    def _record_tool_execution_identity(workspace, result, artifact_id, plan, run) -> None:
+        """Link a finished run to the exact logical plan used to launch it."""
+
+        observation = Observation(
+            artifact_id=artifact_id,
+            key="planner.tool_execution",
+            value={
+                "run_id": run.id,
+                "tool": plan.tool,
+                "command_mode": plan.command_mode,
+                "parameters": dict(plan.parameters),
+                "status": run.status.value,
+                "exit_code": run.exit_code,
+                "command_argv": list(run.command_argv),
+            },
+            source="tool_planner",
+        )
+        workspace.database.add_observations([observation])
+        result.observations.append(observation)
 
     @staticmethod
     def _record_errors(workspace, result, artifact_id: str | None, messages, source: str) -> None:
