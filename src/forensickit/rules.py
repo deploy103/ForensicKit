@@ -6,7 +6,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 import yaml
 
-from .models import AnalysisMode, Artifact, Finding, Observation
+from .models import AnalysisMode, Artifact, Finding, Observation, ToolRun, ToolRunStatus
 from .profiles import ToolRecommendation, merge_recommendations
 
 
@@ -43,6 +43,32 @@ class RuleFindingSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class RuleObservationSpec:
+    key: str
+    value: Any
+    confidence: float = 1.0
+
+
+@dataclass(frozen=True, slots=True)
+class RuleConfidenceChange:
+    target: str
+    delta: float
+    reason: str
+    rule_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class RuleActionSpec:
+    kind: str
+    target: str
+    tool: str | None = None
+    modes: frozenset[AnalysisMode] = frozenset({AnalysisMode.DEEP})
+    command_mode: str = "default"
+    parameters: Mapping[str, str] = field(default_factory=dict)
+    priority: int = 70
+
+
+@dataclass(frozen=True, slots=True)
 class RuleDefinition:
     id: str
     profiles: frozenset[str]
@@ -50,6 +76,9 @@ class RuleDefinition:
     findings: tuple[RuleFindingSpec, ...]
     recommend_auto: tuple[str, ...]
     recommend_deep: tuple[str, ...]
+    observations: tuple[RuleObservationSpec, ...] = ()
+    confidence_changes: tuple[tuple[str, float, str], ...] = ()
+    actions: tuple[RuleActionSpec, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,7 +90,10 @@ class FiredRule:
 @dataclass(slots=True)
 class RuleEvaluationResult:
     findings: list[Finding] = field(default_factory=list)
+    observations: list[Observation] = field(default_factory=list)
     recommendations: list[ToolRecommendation] = field(default_factory=list)
+    confidence_changes: list[RuleConfidenceChange] = field(default_factory=list)
+    actions: list[RuleActionSpec] = field(default_factory=list)
     fired_rules: list[FiredRule] = field(default_factory=list)
     validation_errors: list[RuleValidationError] = field(default_factory=list)
 
@@ -146,6 +178,8 @@ class RuleEngine:
         artifact: Artifact,
         observations: Iterable[Observation] = (),
         profiles: Iterable[str] | None = None,
+        findings: Iterable[Finding] = (),
+        tool_runs: Iterable[ToolRun] = (),
         **kwargs: Any,
     ) -> RuleEvaluationResult:
         if profiles is None and "active_profiles" in kwargs:
@@ -161,6 +195,8 @@ class RuleEngine:
             str(profile).lower() for profile in profiles
         }
         active_profiles.add("generic")
+        prior_findings = tuple(item for item in findings if item.artifact_id == artifact.id)
+        prior_tool_runs = tuple(item for item in tool_runs if item.artifact_id == artifact.id)
 
         result = RuleEvaluationResult(validation_errors=list(self.validation_errors))
         recommendations: list[ToolRecommendation] = []
@@ -169,7 +205,8 @@ class RuleEngine:
                 continue
             try:
                 condition = _evaluate_condition(
-                    rule.when, artifact, observation_index, active_profiles
+                    rule.when, artifact, observation_index, active_profiles,
+                    prior_findings, prior_tool_runs,
                 )
             except Exception as exc:  # Validation should prevent this; isolate corrupted in-memory rules.
                 result.validation_errors.append(
@@ -182,6 +219,46 @@ class RuleEngine:
             fired = FiredRule(rule.id, condition.reasons)
             result.fired_rules.append(fired)
             explanation = f"Rule {rule.id} fired because: " + "; ".join(condition.reasons)
+            for spec in rule.observations:
+                result.observations.append(Observation(
+                    artifact_id=artifact.id,
+                    key=spec.key,
+                    value=spec.value,
+                    source=f"rule:{rule.id}",
+                    confidence=spec.confidence,
+                ))
+            for target, delta, change_reason in rule.confidence_changes:
+                change = RuleConfidenceChange(
+                    target=target, delta=delta, reason=change_reason, rule_id=rule.id,
+                )
+                result.confidence_changes.append(change)
+                result.observations.append(Observation(
+                    artifact_id=artifact.id,
+                    key="rule.confidence_change",
+                    value={
+                        "target": target,
+                        "delta": delta,
+                        "reason": change_reason,
+                        "rule_id": rule.id,
+                    },
+                    source=f"rule:{rule.id}",
+                    confidence=1.0,
+                ))
+            result.actions.extend(rule.actions)
+            for action in rule.actions:
+                result.observations.append(Observation(
+                    artifact_id=artifact.id,
+                    key=f"rule.{action.kind}_action",
+                    value={
+                        "target": action.target,
+                        "tool": action.tool,
+                        "modes": sorted(mode.value for mode in action.modes),
+                        "command_mode": action.command_mode,
+                        "parameters": dict(action.parameters),
+                    },
+                    source=f"rule:{rule.id}",
+                    confidence=1.0,
+                ))
             for finding_spec in rule.findings:
                 evidence = list(
                     dict.fromkeys([*condition.reasons, *finding_spec.supporting_evidence])
@@ -217,6 +294,18 @@ class RuleEngine:
                 recommendations.append(
                     ToolRecommendation(tool, frozenset({AnalysisMode.DEEP}), reason, 65)
                 )
+            for action in rule.actions:
+                if action.tool is None:
+                    continue
+                recommendations.append(ToolRecommendation(
+                    action.tool,
+                    action.modes,
+                    f"rule {rule.id} emitted {action.kind} action {action.target!r}: "
+                    + "; ".join(condition.reasons),
+                    action.priority,
+                    command_mode=action.command_mode,
+                    parameters=action.parameters,
+                ))
         result.recommendations = merge_recommendations(recommendations)
         return result
 
@@ -250,6 +339,9 @@ def _parse_rule(
     findings: list[RuleFindingSpec] = []
     auto_tools: tuple[str, ...] = ()
     deep_tools: tuple[str, ...] = ()
+    emitted_observations: list[RuleObservationSpec] = []
+    confidence_changes: list[tuple[str, float, str]] = []
+    actions: list[RuleActionSpec] = []
     if not isinstance(emit, Mapping):
         errors.append(RuleValidationError(f"{location}.emit", "emit must be a mapping", rule_id_for_error))
     else:
@@ -304,6 +396,50 @@ def _parse_rule(
             else:
                 deep_tools = parsed_deep
 
+        raw_observations = emit.get("observations", [])
+        if not isinstance(raw_observations, list):
+            errors.append(RuleValidationError(
+                f"{location}.emit.observations", "observations must be a list", rule_id_for_error
+            ))
+        else:
+            for index, raw_observation in enumerate(raw_observations):
+                spec, spec_errors = _parse_observation_spec(
+                    raw_observation, f"{location}.emit.observations[{index}]", rule_id_for_error
+                )
+                errors.extend(spec_errors)
+                if spec is not None:
+                    emitted_observations.append(spec)
+
+        raw_changes = emit.get("confidence_changes", [])
+        if not isinstance(raw_changes, list):
+            errors.append(RuleValidationError(
+                f"{location}.emit.confidence_changes", "confidence_changes must be a list",
+                rule_id_for_error,
+            ))
+        else:
+            for index, raw_change in enumerate(raw_changes):
+                change, change_errors = _parse_confidence_change(
+                    raw_change, f"{location}.emit.confidence_changes[{index}]", rule_id_for_error
+                )
+                errors.extend(change_errors)
+                if change is not None:
+                    confidence_changes.append(change)
+
+        for key, kind in (("parser_actions", "parser"), ("extractor_actions", "extractor")):
+            raw_actions = emit.get(key, [])
+            if not isinstance(raw_actions, list):
+                errors.append(RuleValidationError(
+                    f"{location}.emit.{key}", f"{key} must be a list", rule_id_for_error
+                ))
+                continue
+            for index, raw_action in enumerate(raw_actions):
+                action, action_errors = _parse_action(
+                    raw_action, f"{location}.emit.{key}[{index}]", rule_id_for_error, kind
+                )
+                errors.extend(action_errors)
+                if action is not None:
+                    actions.append(action)
+
     if errors:
         return None, errors
     return (
@@ -314,6 +450,9 @@ def _parse_rule(
             findings=tuple(findings),
             recommend_auto=auto_tools,
             recommend_deep=deep_tools,
+            observations=tuple(emitted_observations),
+            confidence_changes=tuple(confidence_changes),
+            actions=tuple(actions),
         ),
         [],
     )
@@ -372,6 +511,117 @@ def _parse_finding(
     )
 
 
+def _parse_observation_spec(
+    raw: Any, location: str, rule_id: str | None,
+) -> tuple[RuleObservationSpec | None, list[RuleValidationError]]:
+    if not isinstance(raw, Mapping):
+        return None, [RuleValidationError(location, "observation must be a mapping", rule_id)]
+    errors: list[RuleValidationError] = []
+    key = raw.get("key", raw.get("type"))
+    confidence = raw.get("confidence", 1.0)
+    if not isinstance(key, str) or not key.strip():
+        errors.append(RuleValidationError(f"{location}.key", "key must be a non-empty string", rule_id))
+    if "value" not in raw:
+        errors.append(RuleValidationError(f"{location}.value", "value is required", rule_id))
+    if (
+        isinstance(confidence, bool) or not isinstance(confidence, (int, float))
+        or not 0 <= confidence <= 1
+    ):
+        errors.append(RuleValidationError(
+            f"{location}.confidence", "confidence must be between 0 and 1", rule_id
+        ))
+    if errors:
+        return None, errors
+    return RuleObservationSpec(key.strip(), raw["value"], float(confidence)), []
+
+
+def _parse_confidence_change(
+    raw: Any, location: str, rule_id: str | None,
+) -> tuple[tuple[str, float, str] | None, list[RuleValidationError]]:
+    if not isinstance(raw, Mapping):
+        return None, [RuleValidationError(location, "confidence change must be a mapping", rule_id)]
+    errors: list[RuleValidationError] = []
+    target = raw.get("target")
+    delta = raw.get("delta")
+    reason = raw.get("reason")
+    if not isinstance(target, str) or not target.strip():
+        errors.append(RuleValidationError(f"{location}.target", "target must be a non-empty string", rule_id))
+    if isinstance(delta, bool) or not isinstance(delta, (int, float)) or not -1 <= delta <= 1:
+        errors.append(RuleValidationError(f"{location}.delta", "delta must be between -1 and 1", rule_id))
+    if not isinstance(reason, str) or not reason.strip():
+        errors.append(RuleValidationError(f"{location}.reason", "reason must be a non-empty string", rule_id))
+    if errors:
+        return None, errors
+    return (target.strip(), float(delta), reason.strip()), []
+
+
+def _parse_action(
+    raw: Any, location: str, rule_id: str | None, kind: str,
+) -> tuple[RuleActionSpec | None, list[RuleValidationError]]:
+    if isinstance(raw, str):
+        raw = {kind: raw}
+    if not isinstance(raw, Mapping):
+        return None, [RuleValidationError(location, f"{kind} action must be a mapping", rule_id)]
+    errors: list[RuleValidationError] = []
+    target = raw.get(kind, raw.get("target"))
+    tool = raw.get("tool")
+    modes = _string_sequence(raw.get("modes", ("deep",) if kind == "extractor" else ("auto", "deep")))
+    command_mode = raw.get("command_mode", "extract" if kind == "extractor" else "default")
+    parameters = raw.get("parameters", {})
+    priority = raw.get("priority", 75 if kind == "extractor" else 80)
+    if not isinstance(target, str) or not target.strip():
+        errors.append(RuleValidationError(f"{location}.{kind}", "target must be a non-empty string", rule_id))
+    if tool is not None and (not isinstance(tool, str) or not tool.strip()):
+        errors.append(RuleValidationError(f"{location}.tool", "tool must be a non-empty string", rule_id))
+    normalized_modes: set[AnalysisMode] = set()
+    if modes is None or not modes:
+        errors.append(RuleValidationError(f"{location}.modes", "modes must be a string list", rule_id))
+    else:
+        for mode in modes:
+            try:
+                normalized = AnalysisMode(mode.lower())
+            except ValueError:
+                errors.append(RuleValidationError(
+                    f"{location}.modes", f"unsupported action mode: {mode}", rule_id
+                ))
+                continue
+            if normalized not in {AnalysisMode.AUTO, AnalysisMode.DEEP}:
+                errors.append(RuleValidationError(
+                    f"{location}.modes", "actions only support auto/deep modes", rule_id
+                ))
+            else:
+                normalized_modes.add(normalized)
+    if (
+        not isinstance(command_mode, str) or not command_mode.strip()
+        or not command_mode.replace("_", "").replace("-", "").isalnum()
+    ):
+        errors.append(RuleValidationError(
+            f"{location}.command_mode", "command_mode must be a simple identifier", rule_id
+        ))
+    if not isinstance(parameters, Mapping) or any(
+        not isinstance(key, str) or not key.replace("_", "").isalnum()
+        or not isinstance(value, (str, int, float)) or isinstance(value, bool)
+        or "\x00" in str(value)
+        for key, value in (parameters.items() if isinstance(parameters, Mapping) else ())
+    ):
+        errors.append(RuleValidationError(
+            f"{location}.parameters", "parameters must map identifier keys to scalar values", rule_id
+        ))
+    if isinstance(priority, bool) or not isinstance(priority, int):
+        errors.append(RuleValidationError(f"{location}.priority", "priority must be an integer", rule_id))
+    if errors:
+        return None, errors
+    return RuleActionSpec(
+        kind=kind,
+        target=target.strip(),
+        tool=tool.strip().lower() if isinstance(tool, str) else None,
+        modes=frozenset(normalized_modes),
+        command_mode=command_mode.strip().lower(),
+        parameters={str(key): str(value) for key, value in parameters.items()},
+        priority=priority,
+    ), []
+
+
 def _validate_condition(
     condition: Any,
     location: str,
@@ -394,16 +644,21 @@ def _validate_condition(
             errors.extend(_validate_condition(child, f"{location}.{key}[{index}]", rule_id))
         return errors
 
-    selectors = set(condition) & {"observation", "artifact_type", "profile", "mime", "magic"}
+    selectors = set(condition) & {
+        "observation", "artifact_type", "profile", "mime", "magic", "finding", "tool_result"
+    }
     if len(selectors) != 1:
         return [
             RuleValidationError(
                 location,
-                "leaf condition needs exactly one selector: observation/artifact_type/profile/mime/magic",
+                "leaf condition needs exactly one selector: "
+                "observation/artifact_type/profile/mime/magic/finding/tool_result",
                 rule_id,
             )
         ]
     selector = next(iter(selectors))
+    if selector in {"finding", "tool_result"}:
+        return _validate_prior_condition(condition, selector, location, rule_id)
     if selector == "observation":
         if not isinstance(condition[selector], str) or not condition[selector].strip():
             return [RuleValidationError(f"{location}.observation", "must be a non-empty string", rule_id)]
@@ -441,14 +696,22 @@ def _evaluate_condition(
     artifact: Artifact,
     observations: Mapping[str, Sequence[Any]],
     profiles: set[str],
+    findings: Sequence[Finding],
+    tool_runs: Sequence[ToolRun],
 ) -> _ConditionResult:
     if "all" in condition:
-        children = [_evaluate_condition(child, artifact, observations, profiles) for child in condition["all"]]
+        children = [
+            _evaluate_condition(child, artifact, observations, profiles, findings, tool_runs)
+            for child in condition["all"]
+        ]
         if not all(child.matched for child in children):
             return _ConditionResult(False)
         return _ConditionResult(True, tuple(reason for child in children for reason in child.reasons))
     if "any" in condition:
-        children = [_evaluate_condition(child, artifact, observations, profiles) for child in condition["any"]]
+        children = [
+            _evaluate_condition(child, artifact, observations, profiles, findings, tool_runs)
+            for child in condition["any"]
+        ]
         matched = [child for child in children if child.matched]
         if not matched:
             return _ConditionResult(False)
@@ -466,6 +729,30 @@ def _evaluate_condition(
             return _ConditionResult(False)
         rendered = _render_values(values) if values else "<absent>"
         return _ConditionResult(True, (f"observation {key} {operator} {expected!r} (actual {rendered})",))
+
+    if "finding" in condition:
+        matches = [item for item in findings if _finding_matches(item, condition["finding"])]
+        expected_exists = condition["exists"]
+        if bool(matches) is not expected_exists:
+            return _ConditionResult(False)
+        if not matches:
+            return _ConditionResult(True, (f"prior finding {condition['finding']!r} is absent",))
+        return _ConditionResult(True, (
+            f"prior finding matched {matches[0].category!r} ({matches[0].id})",
+        ))
+
+    if "tool_result" in condition:
+        matches = [item for item in tool_runs if _tool_result_matches(item, condition["tool_result"])]
+        expected_exists = condition["exists"]
+        if bool(matches) is not expected_exists:
+            return _ConditionResult(False)
+        if not matches:
+            return _ConditionResult(True, (f"prior tool result {condition['tool_result']!r} is absent",))
+        matched = matches[-1]
+        return _ConditionResult(True, (
+            f"prior tool result matched {matched.tool!r} status={matched.status.value} "
+            f"exit_code={matched.exit_code!r} ({matched.id})",
+        ))
 
     if "artifact_type" in condition:
         expected = set(_string_sequence(condition["artifact_type"]) or ())
@@ -496,6 +783,112 @@ def _evaluate_condition(
         _ConditionResult(True, (f"artifact magic contains {matched_magic!r}",))
         if matched_magic else _ConditionResult(False)
     )
+
+
+def _validate_prior_condition(
+    condition: Mapping[str, Any], selector: str, location: str, rule_id: str | None,
+) -> list[RuleValidationError]:
+    unknown = set(condition) - {selector, "exists"}
+    if unknown:
+        return [RuleValidationError(location, f"unsupported condition keys: {sorted(unknown)}", rule_id)]
+    if not isinstance(condition.get("exists"), bool):
+        return [RuleValidationError(
+            f"{location}.exists", "prior-state condition requires a boolean exists operator", rule_id
+        )]
+    value = condition[selector]
+    if isinstance(value, str):
+        if value.strip():
+            return []
+        return [RuleValidationError(f"{location}.{selector}", "must not be empty", rule_id)]
+    if not isinstance(value, Mapping) or not value:
+        return [RuleValidationError(
+            f"{location}.{selector}", "must be a non-empty string or mapping", rule_id
+        )]
+    allowed = (
+        {"id", "title", "category", "severity", "source", "minimum_confidence"}
+        if selector == "finding"
+        else {"id", "tool", "status", "exit_code", "generated_files", "error"}
+    )
+    unknown_fields = set(value) - allowed
+    if unknown_fields:
+        return [RuleValidationError(
+            f"{location}.{selector}", f"unsupported match fields: {sorted(unknown_fields)}", rule_id
+        )]
+    errors: list[RuleValidationError] = []
+    for key, expected in value.items():
+        if key == "minimum_confidence":
+            if isinstance(expected, bool) or not isinstance(expected, (int, float)) or not 0 <= expected <= 1:
+                errors.append(RuleValidationError(
+                    f"{location}.{selector}.{key}", "must be between 0 and 1", rule_id
+                ))
+        elif key == "exit_code":
+            if expected is not None and (isinstance(expected, bool) or not isinstance(expected, int)):
+                errors.append(RuleValidationError(
+                    f"{location}.{selector}.{key}", "must be an integer or null", rule_id
+                ))
+        elif key == "status":
+            allowed_statuses = {status.value for status in ToolRunStatus}
+            if not isinstance(expected, str) or expected.casefold() not in allowed_statuses:
+                errors.append(RuleValidationError(
+                    f"{location}.{selector}.{key}",
+                    f"must be one of {sorted(allowed_statuses)}", rule_id,
+                ))
+        elif key == "generated_files":
+            if not isinstance(expected, bool):
+                errors.append(RuleValidationError(
+                    f"{location}.{selector}.{key}", "must be boolean", rule_id
+                ))
+        elif key == "error":
+            if not isinstance(expected, bool):
+                errors.append(RuleValidationError(
+                    f"{location}.{selector}.{key}", "must be boolean", rule_id
+                ))
+        elif not isinstance(expected, str) or not expected.strip():
+            errors.append(RuleValidationError(
+                f"{location}.{selector}.{key}", "must be a non-empty string", rule_id
+            ))
+    return errors
+
+
+def _finding_matches(finding: Finding, expected: Any) -> bool:
+    if isinstance(expected, str):
+        wanted = expected.strip().casefold()
+        return wanted in {
+            finding.id.casefold(), finding.title.casefold(), finding.category.casefold(),
+            finding.source.casefold(),
+        }
+    if not isinstance(expected, Mapping):
+        return False
+    for key, value in expected.items():
+        if key == "minimum_confidence":
+            if finding.confidence < float(value):
+                return False
+        elif str(getattr(finding, key, "")).casefold() != str(value).casefold():
+            return False
+    return True
+
+
+def _tool_result_matches(run: ToolRun, expected: Any) -> bool:
+    if isinstance(expected, str):
+        return run.tool.casefold() == expected.strip().casefold()
+    if not isinstance(expected, Mapping):
+        return False
+    for key, value in expected.items():
+        if key == "status":
+            if run.status.value.casefold() != str(value).casefold():
+                return False
+        elif key == "generated_files":
+            if bool(run.generated_files) is not value:
+                return False
+        elif key == "error":
+            if bool(run.error) is not value:
+                return False
+        elif key == "exit_code":
+            if run.exit_code != value:
+                return False
+        elif str(getattr(run, key, "")).casefold() != str(value).casefold():
+            return False
+    return True
 
 
 def _match_values(values: Sequence[Any], operator: str, expected: Any) -> bool:
@@ -603,9 +996,12 @@ def _infer_profiles(
 
 __all__ = [
     "FiredRule",
+    "RuleActionSpec",
+    "RuleConfidenceChange",
     "RuleDefinition",
     "RuleEngine",
     "RuleEvaluationResult",
     "RuleFindingSpec",
+    "RuleObservationSpec",
     "RuleValidationError",
 ]

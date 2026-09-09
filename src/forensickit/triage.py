@@ -16,8 +16,12 @@ from pathlib import Path
 from typing import BinaryIO
 
 from .config import AnalysisLimits
+from .browser import inspect_browser_database
+from .jumplist import inspect_jumplist
 from .models import Artifact, Observation
 from .pcap import PcapObservationEngine
+from .udf import UdfObservationEngine
+from .windows_registry import inspect_registry_activity
 
 
 _MIB = 1024 * 1024
@@ -61,6 +65,8 @@ _SIGNATURES = (
     _Signature("cpio_newc", "cpio", b"070701"),
     _Signature("cpio_crc", "cpio", b"070702"),
     _Signature("cpio_odc", "cpio", b"070707"),
+    _Signature("cpio_binary_big_endian", "cpio", b"\x71\xc7"),
+    _Signature("cpio_binary_little_endian", "cpio", b"\xc7\x71"),
     _Signature("bzip2", "bzip2", b"BZh"),
     _Signature("xz", "xz", b"\xfd7zXZ\x00"),
     _Signature("ewf", "ewf", b"EVF\x09\x0d\x0a\xff\x00"),
@@ -102,6 +108,7 @@ _EXPECTED_EXTENSIONS: dict[str, frozenset[str]] = {
     "rar": frozenset({".rar"}),
     "cpio": frozenset({".cpio", ".newc"}),
     "iso9660": frozenset({".iso"}),
+    "udf": frozenset({".udf", ".iso"}),
     "bzip2": frozenset({".bz2", ".tbz", ".tbz2"}),
     "xz": frozenset({".xz", ".txz"}),
     "pdf": frozenset({".pdf"}),
@@ -118,6 +125,7 @@ _EXPECTED_EXTENSIONS: dict[str, frozenset[str]] = {
     "ole": frozenset({".doc", ".xls", ".ppt", ".msg", ".msi", ".ole"}),
     "elf": frozenset({".elf", ".so", ".bin", ""}),
     "pe": frozenset({".exe", ".dll", ".sys", ".scr", ".ocx"}),
+    "jumplist": frozenset({".automaticdestinations-ms", ".customdestinations-ms"}),
 }
 
 
@@ -264,6 +272,24 @@ class GenericTriageEngine:
             observations.extend(self._inspect_cpio(artifact, path, actual_size))
         if detected_format == "iso9660":
             observations.extend(self._inspect_iso9660(artifact, path, actual_size))
+        udf_detected = detected_format == "udf" or (
+            detected_format == "iso9660"
+            and UdfObservationEngine.detect(path, actual_size)
+        )
+        if udf_detected:
+            observations.extend(
+                UdfObservationEngine(
+                    max_bytes=self.limits.signature_scan_bytes,
+                    max_descriptors=min(self.limits.max_artifact_count, 256),
+                    max_directory_entries=min(
+                        self.limits.max_artifact_count + 64, 4_096,
+                    ),
+                ).analyze(artifact, path, actual_size)
+            )
+            if detected_format == "udf":
+                observations.append(
+                    self._observation(artifact, "archive.container_kind", "udf")
+                )
         if detected_format in {"pcap", "pcapng"}:
             observations.extend(PcapObservationEngine(max_bytes=self.limits.signature_scan_bytes).analyze(artifact, path))
         if detected_format == "sqlite":
@@ -645,6 +671,8 @@ class GenericTriageEngine:
             return "tar"
         if detected is None and self._is_iso9660(path, size):
             return "iso9660"
+        if detected is None and UdfObservationEngine.detect(path, size):
+            return "udf"
         return detected
 
     @staticmethod
@@ -746,11 +774,13 @@ class GenericTriageEngine:
     def _inspect_cpio(
         self, artifact: Artifact, path: Path, size: int,
     ) -> list[Observation]:
-        """Walk a bounded portable-ASCII or SVR4 CPIO archive without extraction."""
+        """Walk a bounded binary, portable-ASCII, or SVR4 CPIO archive."""
         entries: list[dict[str, object]] = []
         invalid_checksums: list[dict[str, object]] = []
         formats: set[str] = set()
-        trailer: dict[str, object] | None = None
+        binary_byte_orders: set[str] = set()
+        trailers: list[dict[str, object]] = []
+        archive_segments: list[dict[str, object]] = []
         structure_error: str | None = None
         scan_truncated = False
         entry_limit_reached = False
@@ -760,7 +790,17 @@ class GenericTriageEngine:
         checksum_budget = min(self.limits.signature_scan_bytes, 16 * _MIB)
         checksum_bytes_read = 0
         bytes_read = 0
+        archive_index = 0
+        archive_start_offset = 0
+        archive_entry_start_index = 0
+        current_archive_format: str | None = None
+        current_binary_byte_order: str | None = None
+        format_consistent = True
         magic_names = {b"070701": "newc", b"070702": "crc", b"070707": "odc"}
+        binary_magic_byte_orders = {
+            b"\x71\xc7": "big",
+            b"\xc7\x71": "little",
+        }
         type_names = {
             0o010000: "fifo",
             0o020000: "character",
@@ -777,7 +817,7 @@ class GenericTriageEngine:
         )
         try:
             with path.open("rb") as stream:
-                while len(entries) < entry_limit:
+                while len(entries) + len(trailers) < entry_limit:
                     if cursor + 6 > size:
                         structure_error = f"truncated CPIO header at offset {cursor}"
                         break
@@ -785,15 +825,32 @@ class GenericTriageEngine:
                         scan_truncated = True
                         break
                     stream.seek(cursor)
-                    magic = stream.read(6)
-                    bytes_read += len(magic)
-                    format_name = magic_names.get(magic)
+                    magic_prefix = stream.read(6)
+                    bytes_read += len(magic_prefix)
+                    format_name = magic_names.get(magic_prefix)
+                    binary_byte_order = binary_magic_byte_orders.get(
+                        magic_prefix[:2]
+                    )
+                    if format_name is None and binary_byte_order is not None:
+                        format_name = "bin"
                     if format_name is None:
                         structure_error = f"invalid CPIO magic at offset {cursor}"
                         break
-                    header_length = 76 if format_name == "odc" else 110
-                    alignment = 2 if format_name == "odc" else 4
-                    numeric_encoding = "octal" if format_name == "odc" else "hexadecimal"
+                    if format_name == "bin":
+                        header_length = 26
+                        alignment = 2
+                        numeric_encoding = "binary_16_bit_words"
+                    else:
+                        header_length = 76 if format_name == "odc" else 110
+                        alignment = 2 if format_name == "odc" else 4
+                        numeric_encoding = (
+                            "octal" if format_name == "odc" else "hexadecimal"
+                        )
+                    if cursor % alignment:
+                        structure_error = (
+                            f"misaligned CPIO {format_name} header at offset {cursor}"
+                        )
+                        break
                     if cursor + header_length > size:
                         structure_error = f"truncated CPIO header at offset {cursor}"
                         break
@@ -807,7 +864,42 @@ class GenericTriageEngine:
                         structure_error = f"truncated CPIO header at offset {cursor}"
                         break
                     formats.add(format_name)
-                    if format_name == "odc":
+                    if current_archive_format is None:
+                        current_archive_format = format_name
+                    elif current_archive_format != format_name:
+                        format_consistent = False
+                    if format_name == "bin":
+                        assert binary_byte_order is not None
+                        binary_byte_orders.add(binary_byte_order)
+                        if current_binary_byte_order is None:
+                            current_binary_byte_order = binary_byte_order
+                        elif current_binary_byte_order != binary_byte_order:
+                            format_consistent = False
+                        words = [
+                            int.from_bytes(
+                                header[index:index + 2], binary_byte_order
+                            )
+                            for index in range(0, 26, 2)
+                        ]
+                        if words[0] != 0o70707:
+                            structure_error = (
+                                f"invalid binary CPIO magic at offset {cursor}"
+                            )
+                            break
+                        fields = {
+                            "device": words[1],
+                            "inode": words[2],
+                            "mode": words[3],
+                            "uid": words[4],
+                            "gid": words[5],
+                            "link_count": words[6],
+                            "rdevice": words[7],
+                            "mtime": (words[8] << 16) | words[9],
+                            "name_size": words[10],
+                            "file_size": (words[11] << 16) | words[12],
+                            "checksum": None,
+                        }
+                    elif format_name == "odc":
                         if any(byte not in b"01234567" for byte in header[6:]):
                             structure_error = f"non-octal CPIO odc header field at offset {cursor}"
                             break
@@ -877,11 +969,28 @@ class GenericTriageEngine:
                     )
                     record: dict[str, object] = {
                         "index": len(entries),
+                        "archive_index": archive_index,
+                        "archive_start_offset": archive_start_offset,
+                        "archive_entry_index": (
+                            len(entries) - archive_entry_start_index
+                        ),
                         "format": format_name,
-                        "magic": magic.decode("ascii"),
+                        "magic": "71c7" if format_name == "bin" else (
+                            magic_prefix.decode("ascii")
+                        ),
+                        "magic_raw_hex": header[:2].hex() if format_name == "bin" else (
+                            header[:6].hex()
+                        ),
                         "header_offset": cursor,
                         "header_length": header_length,
+                        "header_raw_hex": header.hex(),
                         "numeric_encoding": numeric_encoding,
+                        "binary_byte_order": (
+                            binary_byte_order if format_name == "bin" else None
+                        ),
+                        "binary_long_word_order": (
+                            "high_then_low" if format_name == "bin" else None
+                        ),
                         "alignment": alignment,
                         "name": name[:4_095],
                         "name_raw_hex": raw_name[:-1].hex(),
@@ -939,6 +1048,69 @@ class GenericTriageEngine:
                     record["name_padding_nonzero"] = any(name_padding)
                     record["data_padding_nonzero"] = any(data_padding)
 
+                    if file_type_code == 0o120000:
+                        record.update({
+                            "symlink_target_offset": data_offset,
+                            "symlink_target_length": file_size,
+                            "symlink_target_raw_hex": None,
+                            "symlink_target_raw_sha256": None,
+                            "symlink_target": None,
+                            "symlink_target_safe": None,
+                            "symlink_target_validation": "not_read",
+                        })
+                        if file_size == 0:
+                            record["symlink_target_validation"] = "empty_target"
+                        elif file_size > 4_096:
+                            record["symlink_target_validation"] = (
+                                "not_read_size_limit"
+                            )
+                        elif data_end > scan_limit:
+                            record["symlink_target_validation"] = (
+                                "not_read_scan_limit"
+                            )
+                        else:
+                            stream.seek(data_offset)
+                            raw_target = stream.read(file_size)
+                            bytes_read += len(raw_target)
+                            if len(raw_target) != file_size:
+                                record["symlink_target_validation"] = (
+                                    "truncated_read"
+                                )
+                            else:
+                                record["symlink_target_raw_hex"] = (
+                                    raw_target.hex()
+                                )
+                                record["symlink_target_raw_sha256"] = (
+                                    hashlib.sha256(raw_target).hexdigest()
+                                )
+                                if b"\x00" in raw_target:
+                                    record["symlink_target_validation"] = (
+                                        "embedded_nul"
+                                    )
+                                else:
+                                    try:
+                                        target = raw_target.decode("utf-8")
+                                    except UnicodeDecodeError:
+                                        record["symlink_target_validation"] = (
+                                            "non_utf8"
+                                        )
+                                    else:
+                                        normalized_target = target.replace(
+                                            "\\", "/"
+                                        )
+                                        record["symlink_target"] = target
+                                        record["symlink_target_safe"] = (
+                                            bool(target)
+                                            and not normalized_target.startswith("/")
+                                            and re.match(
+                                                r"^[A-Za-z]:/", normalized_target
+                                            ) is None
+                                            and ".." not in normalized_target.split("/")
+                                        )
+                                        record["symlink_target_validation"] = (
+                                            "valid"
+                                        )
+
                     if format_name == "crc":
                         checksum_remaining = checksum_budget - checksum_bytes_read
                         if file_size <= checksum_remaining:
@@ -966,10 +1138,97 @@ class GenericTriageEngine:
 
                     if name == "TRAILER!!!":
                         trailer = {**record, "valid_zero_length": file_size == 0}
+                        trailers.append(trailer)
                         if file_size != 0:
                             structure_error = "CPIO TRAILER!!! entry has nonzero data length"
                         cursor = next_header_offset
-                        break
+                        segment: dict[str, object] = {
+                            "archive_index": archive_index,
+                            "archive_start_offset": archive_start_offset,
+                            "format": current_archive_format,
+                            "binary_byte_order": current_binary_byte_order,
+                            "entry_start_index": archive_entry_start_index,
+                            "entry_count": len(entries) - archive_entry_start_index,
+                            "trailer_offset": record["header_offset"],
+                            "trailer_end_offset": next_header_offset,
+                            "inter_archive_zero_padding_offset": next_header_offset,
+                            "inter_archive_zero_padding_length": 0,
+                            "next_archive_offset": None,
+                            "complete": file_size == 0,
+                        }
+                        archive_segments.append(segment)
+                        if structure_error is not None:
+                            break
+                        bounded_end = min(size, scan_limit)
+                        if cursor >= bounded_end:
+                            if cursor < size:
+                                scan_truncated = True
+                            break
+                        padding_start = cursor
+                        next_archive_offset: int | None = None
+                        while cursor < bounded_end:
+                            stream.seek(cursor)
+                            zero_scan = stream.read(
+                                min(4_096, bounded_end - cursor)
+                            )
+                            bytes_read += len(zero_scan)
+                            if not zero_scan:
+                                structure_error = (
+                                    "CPIO inter-archive padding read ended "
+                                    f"before offset {bounded_end}"
+                                )
+                                break
+                            first_nonzero = next(
+                                (
+                                    index for index, byte in enumerate(zero_scan)
+                                    if byte != 0
+                                ),
+                                None,
+                            )
+                            if first_nonzero is not None:
+                                next_archive_offset = cursor + first_nonzero
+                                break
+                            cursor += len(zero_scan)
+                        segment["inter_archive_zero_padding_length"] = (
+                            (next_archive_offset if next_archive_offset is not None else cursor)
+                            - padding_start
+                        )
+                        if structure_error is not None:
+                            break
+                        if next_archive_offset is None:
+                            cursor = bounded_end
+                            if bounded_end < size:
+                                scan_truncated = True
+                            break
+                        stream.seek(next_archive_offset)
+                        next_magic = stream.read(
+                            min(6, bounded_end - next_archive_offset)
+                        )
+                        bytes_read += len(next_magic)
+                        next_format = magic_names.get(next_magic)
+                        if (
+                            next_format is None
+                            and next_magic[:2] in binary_magic_byte_orders
+                        ):
+                            next_format = "bin"
+                        next_alignment = 4 if next_format in {"newc", "crc"} else 2
+                        if (
+                            next_format is None
+                            or next_archive_offset % next_alignment
+                        ):
+                            structure_error = (
+                                "nonzero bytes after CPIO trailer do not begin an "
+                                f"aligned recognized header at offset {next_archive_offset}"
+                            )
+                            break
+                        segment["next_archive_offset"] = next_archive_offset
+                        cursor = next_archive_offset
+                        archive_index += 1
+                        archive_start_offset = next_archive_offset
+                        archive_entry_start_index = len(entries)
+                        current_archive_format = None
+                        current_binary_byte_order = None
+                        continue
                     entries.append(record)
                     cursor = next_header_offset
                     if cursor > scan_limit:
@@ -981,20 +1240,42 @@ class GenericTriageEngine:
         except OSError as exc:
             structure_error = str(exc)[:2_000]
 
-        if trailer is None and structure_error is None and not scan_truncated:
+        if not trailers and structure_error is None and not scan_truncated:
             structure_error = "CPIO archive ended without a TRAILER!!! entry"
+        elif (
+            len(archive_segments) <= archive_index
+            and structure_error is None
+            and not scan_truncated
+        ):
+            structure_error = (
+                f"concatenated CPIO archive {archive_index} ended without a "
+                "TRAILER!!! entry"
+            )
+        cpio_hard_link_groups, cpio_hard_link_errors = (
+            self._cpio_hard_link_groups(entries)
+        )
+        cpio_symlinks = [
+            entry for entry in entries if entry.get("file_type") == "symlink"
+        ]
         return [
             self._observation(artifact, "archive.cpio.detected", True),
             self._observation(artifact, "archive.cpio.formats", sorted(formats)),
-            self._observation(artifact, "archive.cpio.format_consistent", len(formats) <= 1),
+            self._observation(artifact, "archive.cpio.format_consistent", format_consistent),
+            self._observation(artifact, "archive.cpio.binary_byte_orders", sorted(binary_byte_orders)),
+            self._observation(artifact, "archive.cpio.archive_count", len(archive_segments)),
+            self._observation(artifact, "archive.cpio.archive_segments", archive_segments),
             self._observation(artifact, "archive.cpio.entry_count", len(entries)),
             self._observation(artifact, "archive.cpio.entries", entries),
+            self._observation(artifact, "archive.cpio.symlinks", cpio_symlinks),
+            self._observation(artifact, "archive.cpio.hard_link_groups", cpio_hard_link_groups),
+            self._observation(artifact, "archive.cpio.hard_link_errors", cpio_hard_link_errors),
             self._observation(artifact, "archive.cpio.invalid_checksums", invalid_checksums),
             self._observation(artifact, "archive.cpio.checksum_bytes_read", checksum_bytes_read),
             self._observation(artifact, "archive.cpio.checksum_byte_limit", checksum_budget),
-            self._observation(artifact, "archive.cpio.trailer_found", trailer is not None),
-            self._observation(artifact, "archive.cpio.trailer", trailer),
-            self._observation(artifact, "archive.cpio.complete", trailer is not None and structure_error is None),
+            self._observation(artifact, "archive.cpio.trailer_found", bool(trailers)),
+            self._observation(artifact, "archive.cpio.trailer", trailers[-1] if trailers else None),
+            self._observation(artifact, "archive.cpio.trailers", trailers),
+            self._observation(artifact, "archive.cpio.complete", bool(trailers) and structure_error is None and not scan_truncated),
             self._observation(artifact, "archive.cpio.scan_limit", scan_limit),
             self._observation(artifact, "archive.cpio.scan_end_offset", cursor),
             self._observation(artifact, "archive.cpio.bytes_read", bytes_read),
@@ -1003,6 +1284,154 @@ class GenericTriageEngine:
             self._observation(artifact, "archive.cpio.structure_error", structure_error),
             self._observation(artifact, "archive.container_kind", "cpio"),
         ]
+
+    @staticmethod
+    def _cpio_hard_link_groups(
+        entries: list[dict[str, object]],
+    ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+        """Reconcile inode aliases without creating host hard links."""
+        buckets: dict[tuple[object, ...], list[dict[str, object]]] = {}
+        for entry in entries:
+            if entry.get("file_type") != "regular":
+                continue
+            archive_index = entry.get("archive_index")
+            inode = entry.get("inode")
+            if (
+                not isinstance(archive_index, int)
+                or isinstance(archive_index, bool)
+                or not isinstance(inode, int)
+                or isinstance(inode, bool)
+            ):
+                continue
+            legacy_device = entry.get("legacy_device")
+            if isinstance(legacy_device, int) and not isinstance(
+                legacy_device, bool
+            ):
+                device_identity: tuple[object, ...] = (
+                    "legacy", legacy_device,
+                )
+            else:
+                major = entry.get("device_major")
+                minor = entry.get("device_minor")
+                if (
+                    not isinstance(major, int) or isinstance(major, bool)
+                    or not isinstance(minor, int) or isinstance(minor, bool)
+                ):
+                    continue
+                device_identity = ("major_minor", major, minor)
+            identity = (archive_index, *device_identity, inode)
+            buckets.setdefault(identity, []).append(entry)
+
+        groups: list[dict[str, object]] = []
+        errors: list[dict[str, object]] = []
+        for identity, members in sorted(
+            buckets.items(), key=lambda item: tuple(str(part) for part in item[0]),
+        ):
+            link_counts = sorted({
+                int(member["link_count"])
+                for member in members
+                if isinstance(member.get("link_count"), int)
+                and not isinstance(member.get("link_count"), bool)
+            })
+            if not any(link_count > 1 for link_count in link_counts):
+                continue
+            members.sort(key=lambda item: int(item.get("header_offset", 0)))
+            failed_checks: list[str] = []
+            if len(link_counts) != 1 or link_counts[0] <= 1:
+                failed_checks.append("declared_link_count_mismatch")
+                declared_link_count: int | None = None
+            else:
+                declared_link_count = link_counts[0]
+                if len(members) > declared_link_count:
+                    failed_checks.append("observed_members_exceed_declared_links")
+            metadata_identities = {
+                (
+                    member.get("format"), member.get("mode"),
+                    member.get("uid"), member.get("gid"),
+                    member.get("mtime_unix"), member.get("legacy_rdevice"),
+                    member.get("rdevice_major"), member.get("rdevice_minor"),
+                )
+                for member in members
+            }
+            if len(metadata_identities) != 1:
+                failed_checks.append("inode_metadata_mismatch")
+            payload_members = [
+                member for member in members
+                if isinstance(member.get("data_length"), int)
+                and not isinstance(member.get("data_length"), bool)
+                and int(member["data_length"]) > 0
+            ]
+            if len(payload_members) != 1:
+                failed_checks.append("data_bearing_member_count")
+            canonical_candidate = (
+                payload_members[0] if len(payload_members) == 1 else None
+            )
+            group_id = ":".join(str(part) for part in identity)
+            failed_checks = list(dict.fromkeys(failed_checks))
+            reconciled = not failed_checks and canonical_candidate is not None
+            canonical = canonical_candidate if reconciled else None
+            complete = bool(
+                reconciled
+                and declared_link_count is not None
+                and len(members) == declared_link_count
+            )
+            member_summaries = [
+                {
+                    "header_offset": member.get("header_offset"),
+                    "name": member.get("name"),
+                    "path_safe": member.get("path_safe"),
+                    "data_offset": member.get("data_offset"),
+                    "data_length": member.get("data_length"),
+                    "link_count": member.get("link_count"),
+                    "role": (
+                        "canonical" if member is canonical
+                        else "alias" if reconciled else "ambiguous"
+                    ),
+                }
+                for member in members
+            ]
+            group: dict[str, object] = {
+                "group_id": group_id,
+                "archive_index": identity[0],
+                "device_identity": list(identity[1:-1]),
+                "inode": identity[-1],
+                "declared_link_count": declared_link_count,
+                "observed_member_count": len(members),
+                "complete": complete,
+                "partial": reconciled and not complete,
+                "canonical_header_offset": (
+                    canonical.get("header_offset") if canonical else None
+                ),
+                "canonical_name": canonical.get("name") if canonical else None,
+                "members": member_summaries,
+                "failed_checks": failed_checks,
+                "reconciled": reconciled,
+                "host_hard_link_created": False,
+            }
+            groups.append(group)
+            for member, summary in zip(members, member_summaries, strict=True):
+                member.update({
+                    "cpio_hard_link_group_id": group_id,
+                    "cpio_hard_link_role": summary["role"],
+                    "cpio_hard_link_reconciled": reconciled,
+                    "cpio_hard_link_complete": complete,
+                    "cpio_hard_link_canonical_header_offset": group[
+                        "canonical_header_offset"
+                    ],
+                    "cpio_hard_link_canonical_name": group["canonical_name"],
+                    "cpio_hard_link_extraction_eligible": bool(
+                        reconciled and member is canonical
+                    ),
+                })
+            if failed_checks:
+                errors.append({
+                    "reason": "cpio_hard_link_inconsistency",
+                    "group_id": group_id,
+                    "archive_index": identity[0],
+                    "failed_checks": failed_checks,
+                    "members": member_summaries,
+                })
+        return groups, errors
 
     def _inspect_iso9660(
         self, artifact: Artifact, path: Path, size: int,
@@ -1918,12 +2347,87 @@ class GenericTriageEngine:
                     })
         rock_ridge_zisofs: list[dict[str, object]] = []
         rock_ridge_zisofs_errors: list[dict[str, object]] = []
+        extended_attributes: list[dict[str, object]] = []
+        extended_attribute_errors: list[dict[str, object]] = []
+        multi_extent_extended_attribute_consistency: list[dict[str, object]] = []
         if (
             pvd is not None
             and pvd.get("valid") is True
             and isinstance(pvd.get("declared_volume_bytes"), int)
             and not isinstance(pvd.get("declared_volume_bytes"), bool)
         ):
+            (
+                primary_extended_attributes,
+                primary_extended_attribute_errors,
+            ) = self._iso9660_extended_attributes(
+                path,
+                all_directory_entries,
+                evidence_size=size,
+                declared_volume_bytes=int(pvd["declared_volume_bytes"]),
+                namespace="primary",
+            )
+            extended_attributes.extend(primary_extended_attributes)
+            extended_attribute_errors.extend(primary_extended_attribute_errors)
+            self._iso9660_enrich_path_table_xar_reconciliation(
+                path_table_reconciliation,
+                path_table_comparison,
+                all_directory_entries,
+            )
+            (
+                primary_multi_extent_xar_consistency,
+                primary_multi_extent_xar_errors,
+            ) = self._iso9660_reconcile_multi_extent_extended_attributes(
+                all_directory_entries,
+                namespace="primary",
+            )
+            multi_extent_extended_attribute_consistency.extend(
+                primary_multi_extent_xar_consistency
+            )
+            extended_attribute_errors.extend(primary_multi_extent_xar_errors)
+            multi_extent_errors.extend(primary_multi_extent_xar_errors)
+            if (
+                active_joliet_descriptor is not None
+                and isinstance(joliet_entries, list)
+                and isinstance(
+                    active_joliet_descriptor.get("declared_volume_bytes"), int,
+                )
+                and not isinstance(
+                    active_joliet_descriptor.get("declared_volume_bytes"), bool,
+                )
+            ):
+                (
+                    joliet_extended_attributes,
+                    joliet_extended_attribute_errors,
+                ) = self._iso9660_extended_attributes(
+                    path,
+                    joliet_entries,
+                    evidence_size=size,
+                    declared_volume_bytes=int(
+                        active_joliet_descriptor["declared_volume_bytes"]
+                    ),
+                    namespace="joliet",
+                )
+                extended_attributes.extend(joliet_extended_attributes)
+                extended_attribute_errors.extend(
+                    joliet_extended_attribute_errors
+                )
+                self._iso9660_enrich_path_table_xar_reconciliation(
+                    joliet_path_table_reconciliation,
+                    joliet_path_table_comparison,
+                    joliet_entries,
+                )
+                (
+                    joliet_multi_extent_xar_consistency,
+                    joliet_multi_extent_xar_errors,
+                ) = self._iso9660_reconcile_multi_extent_extended_attributes(
+                    joliet_entries,
+                    namespace="joliet",
+                )
+                multi_extent_extended_attribute_consistency.extend(
+                    joliet_multi_extent_xar_consistency
+                )
+                extended_attribute_errors.extend(joliet_multi_extent_xar_errors)
+                multi_extent_errors.extend(joliet_multi_extent_xar_errors)
             (
                 rock_ridge_zisofs,
                 rock_ridge_zisofs_errors,
@@ -1962,6 +2466,22 @@ class GenericTriageEngine:
             self._observation(artifact, "archive.iso9660.directory_entries", all_directory_entries),
             self._observation(artifact, "archive.iso9660.regular_files", regular_files),
             self._observation(artifact, "archive.iso9660.regular_file_count", len(regular_files)),
+            self._observation(artifact, "archive.iso9660.extended_attributes", extended_attributes),
+            self._observation(artifact, "archive.iso9660.extended_attribute_errors", extended_attribute_errors),
+            self._observation(artifact, "archive.iso9660.multi_extent_extended_attribute_consistency", multi_extent_extended_attribute_consistency),
+            self._observation(artifact, "archive.iso9660.extended_attribute_bytes_read", sum(
+                max(
+                    (
+                        int(record.get("bytes_read_total_after_record", 0))
+                        for record in extended_attributes
+                        if record.get("namespace") == namespace
+                    ),
+                    default=0,
+                )
+                for namespace in {"primary", "joliet"}
+            )),
+            self._observation(artifact, "archive.iso9660.extended_attribute_byte_limit_per_namespace", min(self.limits.signature_scan_bytes, 8 * _MIB)),
+            self._observation(artifact, "archive.iso9660.extended_attribute_record_limit_per_namespace", min(self.limits.max_artifact_count + 64, 4_096)),
             self._observation(artifact, "archive.iso9660.multi_extent_chains", multi_extent_chains),
             self._observation(artifact, "archive.iso9660.multi_extent_errors", multi_extent_errors),
             self._observation(artifact, "archive.iso9660.subdirectory_inventory", directory_inventory),
@@ -2174,6 +2694,19 @@ class GenericTriageEngine:
                     failed_checks.append(f"segment_{segment_index}_block_size_mismatch")
                 if identifier_key(segment) != expected_identifier:
                     failed_checks.append(f"segment_{segment_index}_identifier_mismatch")
+                for flag_name in (
+                    "hidden", "directory", "associated_file", "record_format",
+                ):
+                    if segment.get(flag_name) != leader.get(flag_name):
+                        failed_checks.append(
+                            f"segment_{segment_index}_{flag_name}_flag_mismatch"
+                        )
+                if segment.get("identifier_length") != leader.get(
+                    "identifier_length"
+                ):
+                    failed_checks.append(
+                        f"segment_{segment_index}_identifier_length_mismatch"
+                    )
                 if (
                     segment.get("rock_ridge_symlink") is True
                     or segment.get("rock_ridge_non_regular") is True
@@ -2239,7 +2772,8 @@ class GenericTriageEngine:
                         "record_offset", "record_length", "record_raw_hex",
                         "identifier_length", "identifier_raw_hex",
                         "identifier_encoding", "file_identifier", "logical_name",
-                        "version", "extended_attribute_blocks",
+                        "archive_path", "file_type", "path_safe", "version",
+                        "extended_attribute_blocks",
                         "logical_block_size", "extent_block",
                         "extent_block_big_endian", "extent_both_endian_match",
                         "data_offset", "data_length", "data_length_big_endian",
@@ -2247,7 +2781,9 @@ class GenericTriageEngine:
                         "flags_raw", "multi_extent", "file_unit_size",
                         "interleave_gap_size", "volume_sequence_number",
                         "volume_sequence_number_big_endian", "valid",
-                        "failed_checks",
+                        "identifier_padding_length", "identifier_padding_raw_hex",
+                        "hidden", "directory", "associated_file", "record_format",
+                        "protection", "failed_checks",
                     )
                 },
                 "susp_continuation_areas": (
@@ -2379,6 +2915,514 @@ class GenericTriageEngine:
             return None
         return ((offset, length),)
 
+    def _iso9660_extended_attributes(
+        self,
+        path: Path,
+        directory_entries: list[dict[str, object]],
+        *,
+        evidence_size: int,
+        declared_volume_bytes: int,
+        namespace: str = "primary",
+    ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+        """Validate bounded ECMA-119 extended-attribute records without interpreting use data."""
+        records: list[dict[str, object]] = []
+        errors: list[dict[str, object]] = []
+        record_limit = min(self.limits.max_artifact_count + 64, 4_096)
+        byte_limit = min(self.limits.signature_scan_bytes, 8 * _MIB)
+        bytes_read = 0
+        cache: dict[tuple[int, int], tuple[bytes | None, str | None]] = {}
+        candidates = [
+            entry for entry in directory_entries
+            if isinstance(entry, dict)
+            and isinstance(entry.get("extended_attribute_blocks"), int)
+            and not isinstance(entry.get("extended_attribute_blocks"), bool)
+            and int(entry["extended_attribute_blocks"]) > 0
+        ]
+        for candidate_index, entry in enumerate(candidates):
+            if candidate_index >= record_limit:
+                entry["extraction_eligible"] = False
+                entry["iso9660_extended_attribute_valid"] = False
+                if candidate_index == record_limit:
+                    errors.append({
+                        "reason": "extended_attribute_record_limit",
+                        "candidate_count": len(candidates),
+                        "record_limit": record_limit,
+                    })
+                continue
+            entry_was_extraction_eligible = (
+                entry.get("extraction_eligible") is True
+            )
+            entry["extraction_eligible"] = False
+            failed_checks: list[str] = []
+            extent_block = entry.get("extent_block")
+            block_size = entry.get("logical_block_size")
+            block_count = entry.get("extended_attribute_blocks")
+            record: dict[str, object] = {
+                "directory_record_offset": entry.get("record_offset"),
+                "namespace": namespace,
+                "archive_path": entry.get("archive_path"),
+                "file_type": entry.get("file_type"),
+                "extent_block": extent_block,
+                "logical_block_size": block_size,
+                "extended_attribute_blocks": block_count,
+                "record_limit": record_limit,
+                "byte_limit": byte_limit,
+                "failed_checks": failed_checks,
+                "valid": False,
+                "extraction_eligible": False,
+                "directory_record_extraction_eligible_before_validation": (
+                    entry_was_extraction_eligible
+                ),
+            }
+            records.append(record)
+            entry["iso9660_extended_attribute"] = record
+            entry["iso9660_extended_attribute_valid"] = False
+            if (
+                not isinstance(extent_block, int) or isinstance(extent_block, bool)
+                or not isinstance(block_size, int) or isinstance(block_size, bool)
+                or not isinstance(block_count, int) or isinstance(block_count, bool)
+                or extent_block < 0 or block_size <= 0 or block_count <= 0
+            ):
+                failed_checks.append("extended_attribute_range_fields")
+                xar_offset = None
+                xar_length = None
+            else:
+                xar_offset = extent_block * block_size
+                xar_length = block_count * block_size
+                record.update({
+                    "offset": xar_offset,
+                    "length": xar_length,
+                    "end_offset": xar_offset + xar_length,
+                    "data_offset": entry.get("data_offset"),
+                    "data_starts_after_record": (
+                        entry.get("data_offset") == xar_offset + xar_length
+                    ),
+                })
+                if (
+                    xar_length < 250
+                    or xar_offset + xar_length > evidence_size
+                    or xar_offset + xar_length > declared_volume_bytes
+                ):
+                    failed_checks.append("extended_attribute_range")
+                if entry.get("data_offset") != xar_offset + xar_length:
+                    failed_checks.append("extended_attribute_data_offset")
+                cache_key = (xar_offset, xar_length)
+                if cache_key not in cache and bytes_read + xar_length > byte_limit:
+                    failed_checks.append("extended_attribute_byte_limit")
+            if failed_checks:
+                record["failed_checks"] = list(dict.fromkeys(failed_checks))
+                errors.append({
+                    "reason": "invalid_extended_attribute_record",
+                    "directory_record_offset": entry.get("record_offset"),
+                    "archive_path": entry.get("archive_path"),
+                    "failed_checks": record["failed_checks"],
+                })
+                continue
+            assert isinstance(xar_offset, int)
+            assert isinstance(xar_length, int)
+            cache_key = (xar_offset, xar_length)
+            raw, read_error = cache.get(cache_key, (None, None))
+            if cache_key not in cache:
+                try:
+                    with path.open("rb") as stream:
+                        stream.seek(xar_offset)
+                        raw = stream.read(xar_length)
+                except OSError as exc:
+                    read_error = str(exc)[:2_000]
+                cache[cache_key] = (raw, read_error)
+                bytes_read += len(raw) if raw is not None else 0
+            record["shared_range_cache_hit"] = sum(
+                1 for previous in records[:-1]
+                if previous.get("offset") == xar_offset
+                and previous.get("length") == xar_length
+            ) > 0
+            record["range_read_bytes"] = 0 if record["shared_range_cache_hit"] else (
+                len(raw) if raw is not None else 0
+            )
+            record["bytes_read_total_after_record"] = bytes_read
+            if read_error is not None:
+                record["read_error"] = read_error
+                failed_checks.append("extended_attribute_read")
+            if raw is None or len(raw) != xar_length:
+                failed_checks.append("extended_attribute_truncated")
+                raw = raw or b""
+            if failed_checks:
+                record["failed_checks"] = list(dict.fromkeys(failed_checks))
+                errors.append({
+                    "reason": "invalid_extended_attribute_record",
+                    "directory_record_offset": entry.get("record_offset"),
+                    "archive_path": entry.get("archive_path"),
+                    "failed_checks": record["failed_checks"],
+                })
+                continue
+
+            owner_le = int.from_bytes(raw[0:2], "little")
+            owner_be = int.from_bytes(raw[2:4], "big")
+            group_le = int.from_bytes(raw[4:6], "little")
+            group_be = int.from_bytes(raw[6:8], "big")
+            permissions = int.from_bytes(raw[8:10], "little")
+            timestamps: dict[str, dict[str, object]] = {}
+            for name, start in (
+                ("creation", 10), ("modification", 27),
+                ("expiration", 44), ("effective", 61),
+            ):
+                timestamp_raw = raw[start:start + 17]
+                unspecified = timestamp_raw == b"0" * 16 + b"\x00"
+                if unspecified:
+                    utc = None
+                    valid = True
+                    offset_units = 0
+                else:
+                    utc, valid, offset_units = self._iso9660_long_recording_time(
+                        timestamp_raw
+                    )
+                timestamps[name] = {
+                    "offset": xar_offset + start,
+                    "raw_hex": timestamp_raw.hex(),
+                    "utc": utc,
+                    "valid": valid,
+                    "unspecified": unspecified,
+                    "gmt_offset_15_minutes": offset_units,
+                }
+                if not valid:
+                    failed_checks.append(f"{name}_time")
+            record_format = raw[78]
+            record_attributes = raw[79]
+            record_length_le = int.from_bytes(raw[80:82], "little")
+            record_length_be = int.from_bytes(raw[82:84], "big")
+            system_identifier_raw = raw[84:116]
+            version = raw[180]
+            escape_length = raw[181]
+            reserved = raw[182:246]
+            application_length_le = int.from_bytes(raw[246:248], "little")
+            application_length_be = int.from_bytes(raw[248:250], "big")
+            meaningful_length = 250 + application_length_le + escape_length
+            application_offset = xar_offset + 250
+            escape_offset = application_offset + application_length_le
+            tail = raw[meaningful_length:] if meaningful_length <= len(raw) else b""
+            record.update({
+                "raw_sha256": hashlib.sha256(raw).hexdigest(),
+                "raw_preview_hex": raw[:256].hex(),
+                "raw_preview_truncated": len(raw) > 256,
+                "owner_id": owner_le,
+                "owner_id_big_endian": owner_be,
+                "owner_id_both_endian_match": owner_le == owner_be,
+                "group_id": group_le,
+                "group_id_big_endian": group_be,
+                "group_id_both_endian_match": group_le == group_be,
+                "permissions_raw_hex": raw[8:10].hex(),
+                "permissions": f"0x{permissions:04x}",
+                "mandatory_permission_bits_valid": permissions & 0xAAAA == 0xAAAA,
+                "timestamps": timestamps,
+                "record_format": record_format,
+                "record_attributes": record_attributes,
+                "record_length": record_length_le,
+                "record_length_big_endian": record_length_be,
+                "record_length_both_endian_match": (
+                    record_length_le == record_length_be
+                ),
+                "system_identifier_offset": xar_offset + 84,
+                "system_identifier_raw_hex": system_identifier_raw.hex(),
+                "system_identifier": system_identifier_raw.decode(
+                    "ascii", errors="replace"
+                ).rstrip(" \x00"),
+                "system_use_offset": xar_offset + 116,
+                "system_use_length": 64,
+                "system_use_raw_hex": raw[116:180].hex(),
+                "version": version,
+                "escape_sequence_length": escape_length,
+                "reserved_offset": xar_offset + 182,
+                "reserved_length": 64,
+                "reserved_all_zero": not any(reserved),
+                "application_use_length": application_length_le,
+                "application_use_length_big_endian": application_length_be,
+                "application_use_length_both_endian_match": (
+                    application_length_le == application_length_be
+                ),
+                "application_use_offset": application_offset,
+                "application_use_raw_sha256": hashlib.sha256(
+                    raw[250:250 + application_length_le]
+                ).hexdigest() if meaningful_length <= len(raw) else None,
+                "application_use_preview_hex": raw[
+                    250:250 + min(application_length_le, 256)
+                ].hex(),
+                "escape_sequences_offset": escape_offset,
+                "escape_sequences_raw_hex": raw[
+                    250 + application_length_le:meaningful_length
+                ].hex() if meaningful_length <= len(raw) else "",
+                "meaningful_length": meaningful_length,
+                "padding_length": len(tail),
+                "padding_all_zero": not any(tail),
+            })
+            if owner_le != owner_be:
+                failed_checks.append("owner_id_both_endian")
+            if group_le != group_be:
+                failed_checks.append("group_id_both_endian")
+            if (owner_le == 0) != (group_le == 0):
+                failed_checks.append("owner_group_zero_consistency")
+            if permissions & 0xAAAA != 0xAAAA:
+                failed_checks.append("mandatory_permission_bits")
+            if record_format not in {0, 1, 2, 3} and record_format < 128:
+                failed_checks.append("record_format")
+            if record_format != 0 and record_attributes > 2:
+                failed_checks.append("record_attributes")
+            if record_length_le != record_length_be:
+                failed_checks.append("record_length_both_endian")
+            if record_format == 0 and record_length_le != 0:
+                failed_checks.append("record_length_for_unspecified_format")
+            if record_format == 1 and record_length_le == 0:
+                failed_checks.append("fixed_record_length")
+            if record_format in {2, 3} and not 1 <= record_length_le <= 32_767:
+                failed_checks.append("variable_record_maximum_length")
+            if version != 1:
+                failed_checks.append("extended_attribute_version")
+            if any(reserved):
+                failed_checks.append("reserved_bytes")
+            if application_length_le != application_length_be:
+                failed_checks.append("application_length_both_endian")
+            if meaningful_length > xar_length:
+                failed_checks.append("variable_fields_within_record")
+            if meaningful_length <= xar_length and any(tail):
+                failed_checks.append("padding_bytes")
+            record_flag = entry.get("record_format") is True
+            protection_flag = entry.get("protection") is True
+            if record_flag != (record_format != 0):
+                failed_checks.append("directory_record_format_flag")
+            if protection_flag and (
+                owner_le == 0 or group_le == 0 or not permissions & 0x5555
+            ):
+                failed_checks.append("directory_protection_flag")
+            if not protection_flag and (
+                owner_le != 0 or group_le != 0 or permissions & 0x5555
+            ):
+                failed_checks.append("directory_protection_flag")
+            failed_checks = list(dict.fromkeys(failed_checks))
+            extraction_eligible = bool(
+                not failed_checks
+                and entry.get("valid") is True
+                and entry.get("file_type") == "regular"
+                and entry.get("file_unit_size") in {0, None}
+                and entry.get("interleave_gap_size") in {0, None}
+                and entry.get("path_safe") is True
+            )
+            record.update({
+                "failed_checks": failed_checks,
+                "valid": not failed_checks,
+                "extraction_eligible": extraction_eligible,
+            })
+            entry["iso9660_extended_attribute_valid"] = not failed_checks
+            entry["iso9660_extended_attribute_extraction_eligible"] = (
+                extraction_eligible
+            )
+            if extraction_eligible and entry_was_extraction_eligible:
+                entry["extraction_eligible"] = True
+            if failed_checks:
+                errors.append({
+                    "reason": "invalid_extended_attribute_record",
+                    "directory_record_offset": entry.get("record_offset"),
+                    "archive_path": entry.get("archive_path"),
+                    "failed_checks": failed_checks,
+                })
+        return records, errors
+
+    @staticmethod
+    def _iso9660_reconcile_multi_extent_extended_attributes(
+        directory_entries: list[dict[str, object]],
+        *,
+        namespace: str,
+    ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+        """Apply ECMA-119 7.4.6/10.6 XAR rules across file sections."""
+        consistency_records: list[dict[str, object]] = []
+        errors: list[dict[str, object]] = []
+        leaders = [
+            entry for entry in directory_entries
+            if isinstance(entry, dict)
+            and entry.get("multi_extent_chain_role") == "head"
+            and isinstance(entry.get("multi_extent_chain"), dict)
+        ]
+        for leader in leaders:
+            chain = leader["multi_extent_chain"]
+            assert isinstance(chain, dict)
+            chain_id = chain.get("chain_id")
+            expected_count = chain.get("segment_count")
+            segments = sorted(
+                (
+                    entry for entry in directory_entries
+                    if isinstance(entry, dict)
+                    and entry.get("multi_extent_chain_id") == chain_id
+                    and entry.get("multi_extent_chain_role") != "overflow"
+                    and isinstance(entry.get("multi_extent_segment_index"), int)
+                    and not isinstance(
+                        entry.get("multi_extent_segment_index"), bool
+                    )
+                ),
+                key=lambda item: int(item["multi_extent_segment_index"]),
+            )
+            failed_checks: list[str] = []
+            if (
+                not isinstance(expected_count, int)
+                or isinstance(expected_count, bool)
+                or len(segments) != expected_count
+                or [
+                    segment.get("multi_extent_segment_index")
+                    for segment in segments
+                ] != list(range(len(segments)))
+            ):
+                failed_checks.append("segment_inventory")
+
+            present_indices: list[int] = []
+            valid_indices: list[int] = []
+            record_formats: list[int] = []
+            record_attributes: list[int] = []
+            fixed_record_lengths: list[int] = []
+            segment_summaries: list[dict[str, object]] = []
+            record_metadata_required = any(
+                segment.get("record_format") is True for segment in segments
+            )
+            for segment_index, segment in enumerate(segments):
+                block_count = segment.get("extended_attribute_blocks")
+                xar = segment.get("iso9660_extended_attribute")
+                present = (
+                    isinstance(block_count, int)
+                    and not isinstance(block_count, bool)
+                    and block_count > 0
+                )
+                valid = bool(
+                    present
+                    and isinstance(xar, dict)
+                    and xar.get("valid") is True
+                    and xar.get("extraction_eligible") is True
+                    and xar.get("failed_checks") == []
+                    and segment.get("iso9660_extended_attribute_valid") is True
+                    and segment.get(
+                        "iso9660_extended_attribute_extraction_eligible"
+                    ) is True
+                )
+                if present:
+                    present_indices.append(segment_index)
+                if present and not valid:
+                    failed_checks.append(
+                        f"segment_{segment_index}_extended_attribute_invalid"
+                    )
+                if valid:
+                    assert isinstance(xar, dict)
+                    valid_indices.append(segment_index)
+                    record_format = xar.get("record_format")
+                    record_attribute = xar.get("record_attributes")
+                    record_length = xar.get("record_length")
+                    if isinstance(record_format, int) and not isinstance(
+                        record_format, bool
+                    ):
+                        record_formats.append(record_format)
+                        record_metadata_required = (
+                            record_metadata_required or record_format != 0
+                        )
+                    if isinstance(record_attribute, int) and not isinstance(
+                        record_attribute, bool
+                    ):
+                        record_attributes.append(record_attribute)
+                    if record_format == 1 and isinstance(
+                        record_length, int
+                    ) and not isinstance(record_length, bool):
+                        fixed_record_lengths.append(record_length)
+                segment_summaries.append({
+                    "segment_index": segment_index,
+                    "directory_record_offset": segment.get("record_offset"),
+                    "extended_attribute_blocks": block_count,
+                    "present": present,
+                    "valid": valid,
+                    "offset": xar.get("offset") if isinstance(xar, dict) else None,
+                    "length": xar.get("length") if isinstance(xar, dict) else None,
+                    "raw_sha256": (
+                        xar.get("raw_sha256") if isinstance(xar, dict) else None
+                    ),
+                    "record_format": (
+                        xar.get("record_format") if isinstance(xar, dict) else None
+                    ),
+                    "record_attributes": (
+                        xar.get("record_attributes")
+                        if isinstance(xar, dict) else None
+                    ),
+                    "record_length": (
+                        xar.get("record_length") if isinstance(xar, dict) else None
+                    ),
+                })
+
+            if record_metadata_required:
+                for segment_index in range(len(segments)):
+                    if segment_index not in valid_indices:
+                        failed_checks.append(
+                            f"segment_{segment_index}_record_metadata_missing"
+                        )
+            if len(set(record_formats)) > 1:
+                failed_checks.append("record_format_mismatch")
+            if len(set(record_attributes)) > 1:
+                failed_checks.append("record_attributes_mismatch")
+            if len(set(fixed_record_lengths)) > 1:
+                failed_checks.append("fixed_record_length_mismatch")
+            failed_checks = list(dict.fromkeys(failed_checks))
+            structurally_complete = bool(
+                chain.get("complete") is True
+                and chain.get("failed_checks") == []
+            )
+            extraction_eligible = bool(
+                structurally_complete
+                and not failed_checks
+                and leader.get("extraction_eligible") is True
+            )
+            consistency: dict[str, object] = {
+                "chain_id": chain_id,
+                "namespace": namespace,
+                "archive_path": leader.get("archive_path"),
+                "segment_count": len(segments),
+                "present_segment_indices": present_indices,
+                "valid_segment_indices": valid_indices,
+                "record_metadata_required_for_all_sections": (
+                    record_metadata_required
+                ),
+                "record_format_values": sorted(set(record_formats)),
+                "record_attribute_values": sorted(set(record_attributes)),
+                "fixed_record_length_values": sorted(
+                    set(fixed_record_lengths)
+                ),
+                "segments": segment_summaries,
+                "failed_checks": failed_checks,
+                "valid": not failed_checks,
+                "extraction_eligible": extraction_eligible,
+            }
+            consistency_records.append(consistency)
+            chain["extended_attribute_consistency"] = consistency
+            chain["extraction_eligible"] = extraction_eligible
+            leader["multi_extent_extended_attribute_consistency"] = consistency
+            leader["extraction_eligible"] = extraction_eligible
+
+            provenance_segments = chain.get("segments")
+            if isinstance(provenance_segments, list):
+                for segment_index, segment in enumerate(segments):
+                    if segment_index >= len(provenance_segments):
+                        break
+                    snapshot = provenance_segments[segment_index]
+                    if not isinstance(snapshot, dict):
+                        continue
+                    for key in (
+                        "iso9660_extended_attribute",
+                        "iso9660_extended_attribute_valid",
+                        "iso9660_extended_attribute_extraction_eligible",
+                    ):
+                        if key in segment:
+                            snapshot[key] = segment[key]
+            if failed_checks:
+                errors.append({
+                    "reason": "multi_extent_extended_attribute_inconsistency",
+                    "chain_id": chain_id,
+                    "namespace": namespace,
+                    "archive_path": leader.get("archive_path"),
+                    "first_record_offset": leader.get("record_offset"),
+                    "failed_checks": failed_checks,
+                    "segments": segment_summaries,
+                })
+        return consistency_records, errors
+
     def _iso9660_rock_ridge_hard_links(
         self,
         regular_files: list[dict[str, object]],
@@ -2454,6 +3498,7 @@ class GenericTriageEngine:
             member_details: list[dict[str, object]] = []
             identities: list[tuple[tuple[int, int], ...] | None] = []
             zisofs_identities: list[tuple[object, ...] | None] = []
+            extended_attribute_identities: list[tuple[object, ...] | None] = []
             for record in records:
                 identity = self._iso9660_logical_extent_identity(record)
                 identities.append(identity)
@@ -2469,6 +3514,38 @@ class GenericTriageEngine:
                     if isinstance(zisofs_claim, dict) else None
                 )
                 zisofs_identities.append(zisofs_identity)
+                multi_extent_xar = record.get(
+                    "multi_extent_extended_attribute_consistency"
+                )
+                extended_attribute = record.get("iso9660_extended_attribute")
+                if isinstance(multi_extent_xar, dict) and isinstance(
+                    multi_extent_xar.get("segments"), list
+                ):
+                    extended_attribute_identity = tuple(
+                        (
+                            item.get("length"), item.get("raw_sha256"),
+                            item.get("record_format"),
+                            item.get("record_attributes"),
+                            item.get("record_length"),
+                        )
+                        if isinstance(item, dict) and item.get("present") is True
+                        else None
+                        for item in multi_extent_xar["segments"]
+                    )
+                else:
+                    extended_attribute_identity = (
+                        (
+                            extended_attribute.get("length"),
+                            extended_attribute.get("raw_sha256"),
+                            extended_attribute.get("record_format"),
+                            extended_attribute.get("record_attributes"),
+                            extended_attribute.get("record_length"),
+                        )
+                        if isinstance(extended_attribute, dict) else None
+                    )
+                extended_attribute_identities.append(
+                    extended_attribute_identity
+                )
                 member_details.append({
                     "record_offset": record.get("record_offset"),
                     "file_identifier": record.get("file_identifier"),
@@ -2489,6 +3566,7 @@ class GenericTriageEngine:
                         if identity is not None else None
                     ),
                     "zisofs_claim": zisofs_claim,
+                    "extended_attribute_identity": extended_attribute_identity,
                     "extraction_eligible_before_reconciliation": record.get(
                         "extraction_eligible"
                     ),
@@ -2517,6 +3595,8 @@ class GenericTriageEngine:
                 failed_checks.append("logical_extent_mismatch")
             if len(set(zisofs_identities)) > 1:
                 failed_checks.append("zisofs_semantics_mismatch")
+            if len(set(extended_attribute_identities)) > 1:
+                failed_checks.append("extended_attribute_semantics_mismatch")
 
             failed_checks = list(dict.fromkeys(failed_checks))
             verified = len(records) >= 2 and same_extent and not failed_checks
@@ -2873,6 +3953,12 @@ class GenericTriageEngine:
                 and file_record.get("multi_extent") is not True
                 and file_record.get("file_unit_size") in {0, None}
                 and file_record.get("interleave_gap_size") in {0, None}
+                and (
+                    file_record.get("extended_attribute_blocks") in {0, None}
+                    or file_record.get(
+                        "iso9660_extended_attribute_extraction_eligible"
+                    ) is True
+                )
             )
             record.update({
                 "compressed_blocks": compressed_blocks,
@@ -3595,7 +4681,23 @@ class GenericTriageEngine:
                     else 1 <= parent_number < directory_number
                 )
                 data_offset = (extent_block + extended_attribute_blocks) * block_size
-                extent_valid = 0 <= data_offset < min(evidence_size, declared_volume_bytes)
+                xar_offset = extent_block * block_size
+                xar_length = extended_attribute_blocks * block_size
+                xar_end = xar_offset + xar_length
+                extended_attribute_range_valid = bool(
+                    extended_attribute_blocks == 0
+                    or (
+                        xar_length >= 250
+                        and xar_offset >= 0
+                        and xar_end <= evidence_size
+                        and xar_end <= declared_volume_bytes
+                        and data_offset == xar_end
+                    )
+                )
+                extent_valid = bool(
+                    0 <= data_offset < min(evidence_size, declared_volume_bytes)
+                    and extended_attribute_range_valid
+                )
                 entry = {
                     "namespace": namespace,
                     "directory_number": directory_number,
@@ -3611,6 +4713,16 @@ class GenericTriageEngine:
                     "path_safe": path_safe,
                     "extended_attribute_blocks": extended_attribute_blocks,
                     "extent_block": extent_block,
+                    "extended_attribute_offset": (
+                        xar_offset if extended_attribute_blocks else None
+                    ),
+                    "extended_attribute_length": xar_length,
+                    "extended_attribute_end_offset": (
+                        xar_end if extended_attribute_blocks else None
+                    ),
+                    "extended_attribute_range_valid": (
+                        extended_attribute_range_valid
+                    ),
                     "data_offset": data_offset,
                     "extent_start_within_evidence_and_volume": extent_valid,
                     "parent_directory_number": parent_number,
@@ -3748,6 +4860,14 @@ class GenericTriageEngine:
                     root_self.get("record_offset") if root_self else root.get("record_offset")
                 ),
                 "extent_block": root.get("extent_block"),
+                "extended_attribute_blocks": (
+                    root_self.get("extended_attribute_blocks")
+                    if root_self else root.get("extended_attribute_blocks")
+                ),
+                "data_offset": (
+                    root_self.get("data_offset")
+                    if root_self else root.get("data_offset")
+                ),
                 "file_identifier": ".",
                 "archive_path": "/",
             }]
@@ -3769,6 +4889,22 @@ class GenericTriageEngine:
                     "path_table_entry_offset": path_entry.get("offset"),
                     "path_table_archive_path": path_entry.get("archive_path"),
                     "extent_block": path_entry.get("extent_block"),
+                    "path_table_extended_attribute_blocks": path_entry.get(
+                        "extended_attribute_blocks"
+                    ),
+                    "path_table_extended_attribute_offset": path_entry.get(
+                        "extended_attribute_offset"
+                    ),
+                    "path_table_extended_attribute_length": path_entry.get(
+                        "extended_attribute_length"
+                    ),
+                    "path_table_extended_attribute_end_offset": path_entry.get(
+                        "extended_attribute_end_offset"
+                    ),
+                    "path_table_extended_attribute_range_valid": path_entry.get(
+                        "extended_attribute_range_valid"
+                    ),
+                    "path_table_data_offset": path_entry.get("data_offset"),
                     "directory_record_match_count": len(matches),
                     "directory_record_offset": (
                         matches[0].get("record_offset") if len(matches) == 1 else None
@@ -3776,13 +4912,124 @@ class GenericTriageEngine:
                     "directory_record_archive_path": (
                         matches[0].get("archive_path") if len(matches) == 1 else None
                     ),
-                    "reconciled": len(matches) == 1,
+                    "directory_record_extended_attribute_blocks": (
+                        matches[0].get("extended_attribute_blocks")
+                        if len(matches) == 1 else None
+                    ),
+                    "directory_record_data_offset": (
+                        matches[0].get("data_offset")
+                        if len(matches) == 1 else None
+                    ),
+                    "extended_attribute_length_match": bool(
+                        len(matches) == 1
+                        and matches[0].get("extended_attribute_blocks")
+                        == path_entry.get("extended_attribute_blocks")
+                    ),
+                    "data_offset_match": bool(
+                        len(matches) == 1
+                        and matches[0].get("data_offset")
+                        == path_entry.get("data_offset")
+                    ),
                 }
+                record["reconciled"] = bool(
+                    len(matches) == 1
+                    and record["extended_attribute_length_match"] is True
+                    and record["data_offset_match"] is True
+                    and record[
+                        "path_table_extended_attribute_range_valid"
+                    ] is True
+                )
                 reconciliation.append(record)
         comparison["all_entries_reconciled"] = bool(
             reconciliation and all(item["reconciled"] for item in reconciliation)
         ) if comparison.get("consistent") is True else False
         return tables, comparison, reconciliation
+
+    @staticmethod
+    def _iso9660_enrich_path_table_xar_reconciliation(
+        reconciliation: list[dict[str, object]],
+        comparison: dict[str, object],
+        directory_entries: list[dict[str, object]],
+    ) -> None:
+        """Bind reconciled path entries to the directory XAR validation verdict."""
+        by_offset = {
+            entry.get("record_offset"): entry
+            for entry in directory_entries
+            if isinstance(entry, dict)
+            and isinstance(entry.get("record_offset"), int)
+            and not isinstance(entry.get("record_offset"), bool)
+        }
+        for item in reconciliation:
+            if not isinstance(item, dict):
+                continue
+            directory_record = by_offset.get(item.get("directory_record_offset"))
+            block_count = item.get("directory_record_extended_attribute_blocks")
+            xar = (
+                directory_record.get("iso9660_extended_attribute")
+                if isinstance(directory_record, dict) else None
+            )
+            xar_required = bool(
+                isinstance(block_count, int)
+                and not isinstance(block_count, bool)
+                and block_count > 0
+            )
+            xar_valid = bool(
+                not xar_required
+                or (
+                    isinstance(directory_record, dict)
+                    and isinstance(xar, dict)
+                    and xar.get("valid") is True
+                    and xar.get("failed_checks") == []
+                    and directory_record.get(
+                        "iso9660_extended_attribute_valid"
+                    ) is True
+                )
+            )
+            item.update({
+                "directory_extended_attribute_validation_required": xar_required,
+                "directory_extended_attribute_valid": (
+                    xar_valid if isinstance(directory_record, dict) else False
+                ),
+                "directory_extended_attribute_offset": (
+                    xar.get("offset") if isinstance(xar, dict) else None
+                ),
+                "directory_extended_attribute_length": (
+                    xar.get("length") if isinstance(xar, dict) else 0
+                ),
+                "directory_extended_attribute_raw_sha256": (
+                    xar.get("raw_sha256") if isinstance(xar, dict) else None
+                ),
+            })
+            item["reconciled"] = bool(
+                item.get("reconciled") is True
+                and isinstance(directory_record, dict)
+                and xar_valid
+                and (
+                    not xar_required
+                    or (
+                        xar.get("offset")
+                        == item.get("path_table_extended_attribute_offset")
+                        and xar.get("length")
+                        == item.get("path_table_extended_attribute_length")
+                    )
+                )
+            )
+        if comparison.get("consistent") is True:
+            comparison["all_entries_reconciled"] = bool(
+                reconciliation
+                and all(
+                    isinstance(item, dict) and item.get("reconciled") is True
+                    for item in reconciliation
+                )
+            )
+            comparison["extended_attribute_entries_reconciled"] = sum(
+                1 for item in reconciliation
+                if isinstance(item, dict)
+                and item.get(
+                    "directory_extended_attribute_validation_required"
+                ) is True
+                and item.get("reconciled") is True
+            )
 
     def _iso9660_walk_namespace(
         self,
@@ -5063,6 +6310,14 @@ class GenericTriageEngine:
             failed_checks.append("extent_within_declared_volume")
         if not path_safe:
             failed_checks.append("file_identifier_path_safe")
+        if identifier_padding and raw[identifier_end] != 0:
+            failed_checks.append("file_identifier_padding")
+        if flags & 0x60:
+            failed_checks.append("reserved_file_flags")
+        if extended_attribute_blocks == 0 and flags & 0x18:
+            failed_checks.append("extended_attribute_flags_without_record")
+        if flags & 0x02 and flags & 0x8C:
+            failed_checks.append("directory_file_flags")
         record.update({
             "extended_attribute_blocks": extended_attribute_blocks,
             "logical_block_size": logical_block_size,
@@ -5100,6 +6355,9 @@ class GenericTriageEngine:
             "archive_name": logical_name,
             "version": version,
             "identifier_padding_length": identifier_padding,
+            "identifier_padding_raw_hex": raw[
+                identifier_end:identifier_end + identifier_padding
+            ].hex(),
             "path_safe": path_safe,
             "system_use_offset_in_record": system_use_offset,
             "system_use_length": len(raw) - system_use_offset,
@@ -6547,6 +7805,22 @@ class GenericTriageEngine:
                 self._observation(artifact, "mobile.ios_manifest_error", ios_manifest_error, confidence=0.8),
             )
         )
+        browser = inspect_browser_database(
+            path,
+            immutable=True,
+            max_records=min(self.limits.max_strings, 2_000),
+        )
+        if browser.family is not None:
+            observations.extend((
+                self._observation(artifact, "browser.detected", True, confidence=0.96),
+                self._observation(artifact, "browser.family", browser.family, confidence=0.96),
+                self._observation(artifact, "browser.profile", browser.profile, confidence=0.96),
+                self._observation(artifact, "browser.records", browser.records, confidence=0.92),
+                self._observation(artifact, "browser.record_count", len(browser.records), confidence=0.92),
+                self._observation(artifact, "browser.records_truncated", browser.truncated, confidence=0.92),
+                self._observation(artifact, "browser.parse_errors", browser.errors, confidence=0.8),
+                self._observation(artifact, "browser.wal_applied", False),
+            ))
         return observations
 
     def _inspect_ooxml(self, artifact: Artifact, path: Path) -> list[Observation]:
@@ -13042,6 +14316,27 @@ class GenericTriageEngine:
             self._observation(artifact, "windows.lnk_signature", lnk),
             self._observation(artifact, "windows.prefetch_signature", prefetch),
         ]
+        jump_list_suffix = artifact.logical_name.casefold().endswith(
+            (".automaticdestinations-ms", ".customdestinations-ms")
+        )
+        if header.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1") or lnk or jump_list_suffix:
+            jump_list = inspect_jumplist(
+                path,
+                logical_name=artifact.logical_name,
+                max_bytes=min(self.limits.signature_scan_bytes, 64 * _MIB),
+                max_entries=min(self.limits.max_artifact_count, 4_096),
+            )
+            observations.extend((
+                self._observation(artifact, "windows.jumplist_signature", jump_list.kind is not None),
+                self._observation(artifact, "jumplist.kind", jump_list.kind),
+                self._observation(artifact, "jumplist.valid", jump_list.valid),
+                self._observation(artifact, "jumplist.application_id", jump_list.application_id),
+                self._observation(artifact, "jumplist.destlist_header", jump_list.destlist_header),
+                self._observation(artifact, "jumplist.destinations", jump_list.destinations),
+                self._observation(artifact, "jumplist.link_streams", jump_list.streams),
+                self._observation(artifact, "jumplist.errors", jump_list.errors, confidence=0.8),
+                self._observation(artifact, "jumplist.truncated", jump_list.truncated),
+            ))
         if recycle_bin_candidate:
             observations.extend(self._inspect_recycle_bin_item(artifact, path, size))
         if lnk:
@@ -13393,6 +14688,18 @@ class GenericTriageEngine:
         observations.append(
             self._observation(artifact, "registry.execution_value_data", recovered_commands)
         )
+        activity = inspect_registry_activity(path)
+        observations.extend((
+            self._observation(artifact, "registry.amcache.detected", activity.amcache_detected, confidence=0.96),
+            self._observation(artifact, "registry.amcache.schema", activity.amcache_schema, confidence=0.94),
+            self._observation(artifact, "registry.amcache.records", activity.amcache_records, confidence=0.92),
+            self._observation(artifact, "registry.amcache.records_truncated", activity.truncated, confidence=0.92),
+            self._observation(artifact, "registry.shimcache.detected", activity.shimcache_detected, confidence=0.96),
+            self._observation(artifact, "registry.shimcache.formats", activity.shimcache_formats, confidence=0.92),
+            self._observation(artifact, "registry.shimcache.records", activity.shimcache_records, confidence=0.9),
+            self._observation(artifact, "registry.shimcache.records_truncated", activity.truncated, confidence=0.9),
+            self._observation(artifact, "registry.activity_errors", activity.errors, confidence=0.8),
+        ))
         hbin_count, hbin_valid, hbin_samples = self._registry_hbin_inventory(path, artifact.size)
         observations.extend((
             self._observation(artifact, "registry.hbin_count", hbin_count),
@@ -14854,7 +16161,9 @@ def _format_from_header_bytes(header: bytes) -> str | None:
         return "pe"
     if header.startswith((b"Rar!\x1a\x07\x00", b"Rar!\x1a\x07\x01\x00")):
         return "rar"
-    if header.startswith((b"070701", b"070702", b"070707")):
+    if header.startswith((
+        b"070701", b"070702", b"070707", b"\x71\xc7", b"\xc7\x71",
+    )):
         return "cpio"
     if header.startswith(b"BZh"):
         return "bzip2"

@@ -6,7 +6,7 @@ from .base import BaseProfile, ProfileContext, ProfileResult
 
 ARCHIVE_TYPES = {
     "archive", "container", "zip", "7z", "rar", "tar", "cpio", "gzip", "gz", "bzip2", "xz",
-    "cab", "iso", "iso9660", "jar", "apk", "ooxml",
+    "cab", "iso", "iso9660", "udf", "jar", "apk", "ooxml",
 }
 
 
@@ -140,8 +140,9 @@ class ArchiveProfile(BaseProfile):
                     category="archive_structure_anomaly",
                     confidence=0.97,
                     explanation=(
-                        "Bounded native odc/newc/CRC parsing found a malformed range/header, mixed entry formats, "
-                        "a CRC byte-sum mismatch, or a nonzero checksum field in a non-CRC newc entry."
+                        "Bounded native binary/odc/newc/CRC parsing found a malformed range/header, "
+                        "mixed format or binary byte order, a CRC byte-sum mismatch, or a nonzero "
+                        "checksum field in a non-CRC newc entry."
                     ),
                     evidence=(
                         [str(item)[:2_000] for item in cpio_invalid[:16]]
@@ -149,6 +150,105 @@ class ArchiveProfile(BaseProfile):
                         + ([f"format_consistent={cpio_consistent}"] if cpio_consistent is False else [])
                         + ([cpio_error] if cpio_error else [])
                     ),
+                    severity="medium",
+                )
+            )
+        cpio_hard_link_groups = next(
+            (
+                value for value in context.values("archive.cpio.hard_link_groups")
+                if isinstance(value, list)
+            ),
+            [],
+        )
+        cpio_hard_link_errors = next(
+            (
+                value for value in context.values("archive.cpio.hard_link_errors")
+                if isinstance(value, list)
+            ),
+            [],
+        )
+        reconciled_cpio_hard_links = [
+            item for item in cpio_hard_link_groups
+            if isinstance(item, dict) and item.get("reconciled") is True
+        ]
+        if reconciled_cpio_hard_links:
+            result.findings.append(
+                self.finding(
+                    context,
+                    title="CPIO hard-link inode aliases reconciled",
+                    category="archive_hard_link_metadata",
+                    confidence=0.99,
+                    explanation=(
+                        "Regular-file records with the same archive/device/inode and a consistent "
+                        "link count contain exactly one data-bearing member. Only that canonical "
+                        "payload may become a child; aliases remain metadata and no host hard link "
+                        "is created."
+                    ),
+                    evidence=[
+                        str(item)[:2_000]
+                        for item in reconciled_cpio_hard_links[:16]
+                    ],
+                    severity="info",
+                )
+            )
+        if cpio_hard_link_errors:
+            result.findings.append(
+                self.finding(
+                    context,
+                    title="CPIO hard-link inode group is ambiguous or inconsistent",
+                    category="cpio_hard_link_anomaly",
+                    confidence=0.98,
+                    explanation=(
+                        "A shared archive/device/inode has conflicting link counts or metadata, "
+                        "too many observed aliases, or does not contain exactly one data-bearing "
+                        "member. Every member in the group remains metadata-only."
+                    ),
+                    evidence=[
+                        str(item)[:2_000] for item in cpio_hard_link_errors[:16]
+                    ],
+                    severity="medium",
+                )
+            )
+        cpio_symlinks = [
+            item for item in cpio_entries
+            if isinstance(item, dict)
+            and item.get("file_type") == "symlink"
+            and item.get("symlink_target_validation") == "valid"
+        ]
+        if cpio_symlinks:
+            result.findings.append(
+                self.finding(
+                    context,
+                    title="CPIO symbolic-link targets inventoried",
+                    category="archive_symlink_metadata",
+                    confidence=0.99,
+                    explanation=(
+                        "Bounded UTF-8 symbolic-link payloads retain exact offsets, lengths, "
+                        "hashes, decoded targets, and traversal safety metadata. Links remain "
+                        "evidence-only and are never followed or created on the host."
+                    ),
+                    evidence=[str(item)[:2_000] for item in cpio_symlinks[:16]],
+                    severity="info",
+                )
+            )
+        unsafe_cpio_symlinks = [
+            item for item in cpio_symlinks
+            if item.get("symlink_target_safe") is False
+        ]
+        if unsafe_cpio_symlinks:
+            result.findings.append(
+                self.finding(
+                    context,
+                    title="CPIO symbolic link has an unsafe target path",
+                    category="archive_unsafe_link_target",
+                    confidence=0.99,
+                    explanation=(
+                        "A decoded symbolic-link target is absolute, drive-rooted, or contains "
+                        "a parent-directory component. It is retained only as metadata."
+                    ),
+                    evidence=[
+                        str(item)[:2_000] for item in unsafe_cpio_symlinks[:16]
+                    ],
                     severity="medium",
                 )
             )
@@ -165,9 +265,89 @@ class ArchiveProfile(BaseProfile):
                     confidence=0.99,
                     explanation=(
                         "One or more CPIO names are absolute or contain a parent-directory component. "
-                        "The built-in extractor will retain their metadata but never materialize them."
+                        "The built-in extractor retains their metadata but never materializes them."
                     ),
                     evidence=[str(item)[:2_000] for item in unsafe_cpio_entries[:16]],
+                    severity="medium",
+                )
+            )
+        udf_detected = context.truthy("archive.udf.detected")
+        udf_valid = context.truthy("archive.udf.valid")
+        udf_errors = next(
+            (
+                value for value in context.values("archive.udf.errors")
+                if isinstance(value, list)
+            ),
+            [],
+        )
+        if udf_valid:
+            udf_evidence: list[str] = []
+            for key in (
+                "archive.udf.revision_identifier",
+                "archive.udf.active_anchor",
+                "archive.udf.volume_descriptor_comparison",
+                "archive.udf.file_set",
+            ):
+                values = context.values(key)
+                if values:
+                    udf_evidence.append(f"{key}={values[0]}"[:2_000])
+            result.findings.append(
+                self.finding(
+                    context,
+                    title="UDF volume descriptor copies validated",
+                    category="archive_udf_metadata",
+                    confidence=0.99,
+                    explanation=(
+                        "The bounded BEA/NSR/TEA recognition sequence, anchor pointer, "
+                        "descriptor-tag checksums/CRCs, partition maps, and main/reserve "
+                        "volume descriptor semantics agree. No UDF file content is yet "
+                        "materialized by the native parser."
+                    ),
+                    evidence=udf_evidence,
+                    severity="info",
+                )
+            )
+            udf_file_set = next(
+                (
+                    value for value in context.values("archive.udf.file_set")
+                    if isinstance(value, dict) and value.get("valid") is True
+                ),
+                None,
+            )
+            if udf_file_set is not None:
+                result.findings.append(
+                    self.finding(
+                        context,
+                        title="UDF file set and bounded directory tree validated",
+                        category="archive_udf_file_set_metadata",
+                        confidence=0.99,
+                        explanation=(
+                            "A validated Type-1 partition map resolves the LVD file-set "
+                            "address to an exact FSD and directory File Entry/Extended "
+                            "File Entry. Its short/long allocation descriptors resolve exact "
+                            "root-directory extents whose bounded FID tags, CRC coverage, CS0 "
+                            "names, padding, and parent record agree. Active child FE/EFE tags, "
+                            "types, and allocation metadata are checked through a bounded nested "
+                            "directory tree without reading or materializing file content."
+                        ),
+                        evidence=[str(udf_file_set)[:2_000]],
+                        severity="info",
+                    )
+                )
+        elif udf_detected:
+            result.findings.append(
+                self.finding(
+                    context,
+                    title="UDF anchor or volume descriptor structure is inconsistent",
+                    category="udf_structure_anomaly",
+                    confidence=0.98,
+                    explanation=(
+                        "A recognized UDF volume failed anchor range, descriptor-tag "
+                        "checksum/CRC/location, partition/LVD framing, termination, "
+                        "main/reserve semantics, FSD/root ICB, or root FID validation. "
+                        "Native file traversal remains disabled."
+                    ),
+                    evidence=[str(item)[:2_000] for item in udf_errors[:16]],
                     severity="medium",
                 )
             )
@@ -294,6 +474,67 @@ class ArchiveProfile(BaseProfile):
                         "bytes remain evidence and the affected metadata is not trusted for extraction."
                     ),
                     evidence=[str(item)[:2_000] for item in iso_susp_errors[:16]],
+                    severity="medium",
+                )
+            )
+        extended_attributes = next(
+            (
+                value for value in context.values(
+                    "archive.iso9660.extended_attributes"
+                )
+                if isinstance(value, list)
+            ),
+            [],
+        )
+        extended_attribute_errors = next(
+            (
+                value for value in context.values(
+                    "archive.iso9660.extended_attribute_errors"
+                )
+                if isinstance(value, list)
+            ),
+            [],
+        )
+        valid_extended_attributes = [
+            item for item in extended_attributes
+            if isinstance(item, dict) and item.get("valid") is True
+        ]
+        if valid_extended_attributes:
+            result.findings.append(
+                self.finding(
+                    context,
+                    title="ISO 9660 extended-attribute records validated",
+                    category="archive_extended_attribute_metadata",
+                    confidence=0.99,
+                    explanation=(
+                        "One or more ECMA-119 extended-attribute block ranges passed bounded "
+                        "both-endian, permission, time, record-format, version, reserved, and "
+                        "variable-field checks. Opaque system/application use bytes retain exact "
+                        "hash provenance; eligible file data begins only after the complete record."
+                    ),
+                    evidence=[
+                        str(item)[:2_000]
+                        for item in valid_extended_attributes[:16]
+                    ],
+                    severity="info",
+                )
+            )
+        if extended_attribute_errors:
+            result.findings.append(
+                self.finding(
+                    context,
+                    title="ISO 9660 extended-attribute record is malformed or unsupported",
+                    category="iso9660_extended_attribute_anomaly",
+                    confidence=0.98,
+                    explanation=(
+                        "An extended-attribute range, fixed field, variable field, padding, "
+                        "directory-record flag relationship, or configured resource bound failed "
+                        "validation. Affected regular-file extents remain metadata-only."
+                    ),
+                    evidence=[
+                        str(item)[:2_000]
+                        for item in extended_attribute_errors[:16]
+                    ],
                     severity="medium",
                 )
             )
@@ -528,8 +769,9 @@ class ArchiveProfile(BaseProfile):
                     explanation=(
                         "One or more bounded path-table copies failed framing/range/parent checks, "
                         "the mandatory little- and big-endian tables differ, or a directory extent "
-                        "did not uniquely match the active directory walk. Divergent tables are never "
-                        "selected as authoritative."
+                        "and its extended-attribute length/data start did not uniquely match the "
+                        "validated active directory walk. Divergent tables are never selected as "
+                        "authoritative."
                     ),
                     evidence=(
                         [f"comparison={path_table_comparison}"]
@@ -587,9 +829,9 @@ class ArchiveProfile(BaseProfile):
                     confidence=0.97,
                     explanation=(
                         "One or more bounded Joliet path-table copies failed framing, strict "
-                        "UCS-2BE, range, or parent checks; cross-endian copies differ; or an extent/name "
-                        "did not uniquely match the active Joliet directory walk. No divergent copy is "
-                        "selected as authoritative."
+                        "UCS-2BE, range, or parent checks; cross-endian copies differ; or an "
+                        "extent/name/XAR data start did not uniquely match the validated active "
+                        "Joliet directory walk. No divergent copy is selected as authoritative."
                     ),
                     evidence=(
                         [f"comparison={joliet_path_table_comparison}"]
@@ -721,8 +963,8 @@ class ArchiveProfile(BaseProfile):
                     explanation=(
                         "A regular-file PX claim lacks a serial, has an invalid link count, exceeds its "
                         "declared member count, disagrees across aliases, or maps one serial to different "
-                        "extent or zisofs semantic identities. Such records are not reconciled as "
-                        "hard-link aliases."
+                        "extent, extended-attribute, or zisofs semantic identities. Such records are "
+                        "not reconciled as hard-link aliases."
                     ),
                     evidence=[
                         str(item)[:2_000]
@@ -786,7 +1028,9 @@ class ArchiveProfile(BaseProfile):
         )
         assembled_multi_extents = [
             item for item in multi_extent_chains
-            if isinstance(item, dict) and item.get("complete") is True
+            if isinstance(item, dict)
+            and item.get("complete") is True
+            and item.get("extraction_eligible") is True
         ]
         if assembled_multi_extents:
             result.findings.append(
@@ -797,8 +1041,9 @@ class ArchiveProfile(BaseProfile):
                     confidence=0.99,
                     explanation=(
                         "Adjacent, identifier/version-consistent regular-file records form complete "
-                        "non-interleaved chains. Each image-bounded extent retains its directory-record "
-                        "provenance and may be copied only in recorded order."
+                        "non-interleaved chains. Each image-bounded extent and any associated XAR "
+                        "retains exact provenance; record format/attributes and fixed record length "
+                        "are consistent across file sections before copying in recorded order."
                     ),
                     evidence=[str(item)[:2_000] for item in assembled_multi_extents[:16]],
                     severity="info",
@@ -813,7 +1058,8 @@ class ArchiveProfile(BaseProfile):
                     confidence=0.98,
                     explanation=(
                         "A multi-extent leader was not followed by a bounded, adjacent, matching final "
-                        "record, or a segment failed range/layout validation. The chain remains "
+                        "record, a segment failed range/layout validation, or per-section extended "
+                        "attributes violated required record metadata consistency. The chain remains "
                         "metadata-only and is never partially materialized."
                     ),
                     evidence=[str(item)[:2_000] for item in multi_extent_errors[:16]],

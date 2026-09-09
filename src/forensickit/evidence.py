@@ -53,6 +53,7 @@ class EvidenceManager:
                 logical_name=source.name,
                 sha256=sha256,
                 size=size,
+                source_path=str(source),
             )
             self.workspace.database.add_artifact(artifact)
             return artifact

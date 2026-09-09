@@ -1405,6 +1405,17 @@ def parse_volatility3(
     for row in structured_rows:
         normalized = {str(key)[:200]: str(value)[:2_000] for key, value in row.items()}
         lowered = {key.lower().replace(" ", "").replace("_", "") for key in normalized}
+        if "windows_info" in plugin:
+            variable = next(
+                (value for key, value in normalized.items() if key.casefold() in {"variable", "name", "field"}),
+                None,
+            )
+            value = next(
+                (value for key, value in normalized.items() if key.casefold() in {"value", "data"}),
+                None,
+            )
+            if variable and value is not None and len(info) < 200:
+                info[str(variable)[:200]] = str(value)[:2_000]
         if "pid" in lowered and "ppid" in lowered:
             if len(processes) < 1_000:
                 processes.append(normalized)
@@ -1429,15 +1440,16 @@ def parse_volatility3(
         if "malfind" in plugin and len(malfind_rows) < 1_000:
             malfind_rows.append(normalized)
     lines = [line.rstrip() for line in stdout.splitlines() if line.strip()]
-    for line in lines:
-        if "\t" in line:
-            key, value = line.split("\t", 1)
-            if key.strip() and value.strip() and len(key) < 120:
-                info[key.strip()] = value.strip()[:2000]
-        elif ":" in line and len(line) < 4000:
-            key, value = line.split(":", 1)
-            if key.strip() and value.strip():
-                info.setdefault(key.strip(), value.strip()[:2000])
+    if not structured_rows:
+        for line in lines:
+            if "\t" in line:
+                key, value = line.split("\t", 1)
+                if key.strip() and value.strip() and len(key) < 120:
+                    info[key.strip()] = value.strip()[:2000]
+            elif ":" in line and len(line) < 4000:
+                key, value = line.split(":", 1)
+                if key.strip() and value.strip():
+                    info.setdefault(key.strip(), value.strip()[:2000])
     header_index = next((index for index, line in enumerate(lines) if re.search(r"\bPID\b", line) and re.search(r"\bPPID\b", line)), None)
     if header_index is not None:
         headers = re.split(r"\s{2,}|\t", lines[header_index].strip())
@@ -1518,10 +1530,85 @@ def parse_volatility3(
         observations.append(_observation(artifact_id, "memory.volatility.pslist", processes[:1000], source))
     if "psscan" in plugin:
         observations.append(_observation(artifact_id, "memory.volatility.psscan", processes[:1000], source))
+    if "windows_info" in plugin:
+        observations.append(_observation(artifact_id, "memory.volatility.kernel_info", info, source, 0.9))
     banner = next((value for key, value in info.items() if "kernel" in key.lower() or "banner" in key.lower()), None)
     if banner:
         observations.append(_observation(artifact_id, "memory.os_banner", banner, source, 0.9))
-    return ParsedToolOutput(observations=observations)
+    failure = _classify_volatility_failure(stdout, stderr, exit_code)
+    findings: list[Finding] = []
+    if failure is not None:
+        observations.append(_observation(
+            artifact_id, "memory.volatility.failure", failure, source, 0.95,
+        ))
+        explanations = {
+            "symbols_missing": (
+                "Volatility could not satisfy a symbol-table requirement. Stage the matching "
+                "Windows symbol table or Linux ISF in the offline symbol path and retry; this "
+                "is distinct from evidence corruption."
+            ),
+            "image_or_layer_mismatch": (
+                "Volatility could not construct or validate the required memory layer. Confirm "
+                "that the input is a supported full-system image and that its architecture/image "
+                "type matches the selected plugin."
+            ),
+            "plugin_or_argument_unsupported": (
+                "The installed Volatility build rejected the plugin or one of its arguments. "
+                "Review the recorded version and `vol --help`/plugin help on the prepared machine."
+            ),
+            "plugin_failed": (
+                "The Volatility plugin failed for a reason not safely attributable to symbols or "
+                "image-layer mismatch. Inspect preserved stdout/stderr before retrying."
+            ),
+        }
+        findings.append(_finding(
+            artifact_id,
+            title=f"Volatility analysis incomplete: {failure['category']}",
+            category="memory_volatility_failure",
+            explanation=explanations[str(failure["category"])],
+            source=source,
+            confidence=0.95,
+            severity="info",
+            evidence=[str(item)[:2_000] for item in failure.get("detail", [])[:20]],
+        ))
+    return ParsedToolOutput(observations=observations, findings=findings)
+
+
+def _classify_volatility_failure(
+    stdout: str,
+    stderr: str,
+    exit_code: int | None,
+) -> dict[str, object] | None:
+    combined = f"{stderr}\n{stdout}"[:4 * 1024 * 1024]
+    lowered = combined.casefold()
+    category: str | None = None
+    if any(marker in lowered for marker in (
+        "symbol table", "symbol_table_name", "symbols are required",
+        "isf file", "pdbconv", "pdb file", "missing symbols",
+    )) or (
+        "unsatisfied requirement" in lowered
+        and any(marker in lowered for marker in ("kernel", "nt_symbols", "symbol"))
+    ):
+        category = "symbols_missing"
+    elif any(marker in lowered for marker in (
+        "translation layer requirement", "unable to validate the plugin requirements",
+        "no suitable layers", "failed to construct", "invalid memory layer",
+        "layer requirement",
+    )):
+        category = "image_or_layer_mismatch"
+    elif any(marker in lowered for marker in (
+        "unrecognized arguments", "invalid choice", "plugin not found",
+        "invalid plugin", "unknown plugin", "the following arguments are required",
+    )):
+        category = "plugin_or_argument_unsupported"
+    elif exit_code not in {None, 0}:
+        category = "plugin_failed"
+    if category is None:
+        return None
+    detail = _nonempty_lines(stderr, maximum=20)
+    if not detail:
+        detail = _nonempty_lines(stdout, maximum=20)
+    return {"category": category, "exit_code": exit_code, "detail": detail}
 
 
 def _volatility_structured_output(stdout: str) -> tuple[list[dict[str, object]], dict[str, str]]:

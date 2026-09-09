@@ -28,6 +28,7 @@ _FORMAT_INFO: dict[str, _FormatInfo] = {
     "rar": _FormatInfo("archive", "archive", "application/vnd.rar", "RAR archive data", 0.99),
     "cpio": _FormatInfo("archive", "archive", "application/x-cpio", "ASCII cpio archive", 0.99),
     "iso9660": _FormatInfo("archive", "archive", "application/x-iso9660-image", "ISO 9660 filesystem image", 0.99),
+    "udf": _FormatInfo("archive", "archive", "application/x-udf", "UDF filesystem image", 0.99),
     "bzip2": _FormatInfo("archive", "archive", "application/x-bzip2", "bzip2 compressed data", 0.98),
     "xz": _FormatInfo("archive", "archive", "application/x-xz", "XZ compressed data", 0.99),
     "ewf": _FormatInfo("disk", "disk", "application/x-ewf", "EWF forensic image", 0.99),
@@ -42,6 +43,7 @@ _FORMAT_INFO: dict[str, _FormatInfo] = {
     "registry": _FormatInfo("registry", "windows", "application/x-windows-registry", "Windows Registry hive", 0.99),
     "lnk": _FormatInfo("windows", "windows", "application/x-ms-shortcut", "Windows shell link", 0.99),
     "prefetch": _FormatInfo("windows", "windows", "application/octet-stream", "Windows Prefetch file", 0.97),
+    "jumplist": _FormatInfo("windows", "windows", "application/x-ms-jumplist", "Windows Jump List", 0.98),
     "recycle_bin": _FormatInfo("windows", "windows", "application/octet-stream", "Windows Recycle Bin $I metadata", 0.96),
     "pdf": _FormatInfo("pdf", "pdf", "application/pdf", "PDF document", 0.99),
     "pcap": _FormatInfo("pcap", "pcap", "application/vnd.tcpdump.pcap", "packet capture data", 0.99),
@@ -223,6 +225,8 @@ class IdentificationEngine:
 
         if values.get("windows.recycle_bin_valid") is True:
             return "recycle_bin"
+        if values.get("jumplist.valid") is True:
+            return "jumplist"
 
         header_format = values.get("triage.detected_header_format")
         if header_format in _FORMAT_INFO and header_format != "unknown":
@@ -252,6 +256,7 @@ class IdentificationEngine:
             ("jpeg image", "jpeg"), ("zip archive", "zip"), ("7-zip", "7z"),
             ("cpio archive", "cpio"),
             ("iso 9660", "iso9660"),
+            ("udf filesystem", "udf"),
             ("elf", "elf"), ("ms-dos executable", "pe"), ("compound document", "ole"),
             ("ewf", "ewf"),
         )
@@ -307,6 +312,8 @@ class IdentificationEngine:
             return f"external file/libmagic parser reported: {file_description[:300]}"
         if format_name in {"disk_mbr", "disk_gpt", "memory", "ewf"}:
             return f"disk/memory signature observation identified {format_name} evidence"
+        if format_name == "udf":
+            return "fixed-sector UDF BEA/NSR volume recognition sequence was observed"
         return f"validated {format_name} header signature at offset 0"
 
     @staticmethod
@@ -456,7 +463,7 @@ def _profile_for_artifact_type(artifact_type: str) -> str | None:
 
 
 def _artifact_type_for_embedded_format(format_name: str) -> str | None:
-    if format_name in {"zip", "7z", "gzip", "rar", "cpio", "iso9660", "bzip2", "xz"}:
+    if format_name in {"zip", "7z", "gzip", "rar", "cpio", "iso9660", "udf", "bzip2", "xz"}:
         return "archive"
     if format_name in {"png", "jpeg"}:
         return "image"

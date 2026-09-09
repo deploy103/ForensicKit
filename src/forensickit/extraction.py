@@ -18,8 +18,10 @@ from pathlib import Path, PurePosixPath
 from typing import BinaryIO
 
 from .config import AnalysisLimits
+from .jumplist import automatic_link_streams, custom_link_ranges, inspect_jumplist
 from .models import Artifact, Finding, ToolRun, new_id
 from .pcap import iter_ftp_auth_tls_transitions, iter_ftp_retr_objects, iter_http_response_objects, iter_imap_fetch_objects, iter_imap_starttls_transitions, iter_pop3_retr_objects, iter_pop3_stls_transitions, iter_smb2_close_operations, iter_smb2_create_operations, iter_smb2_directory_listings, iter_smb2_negotiate_operations, iter_smb2_read_objects, iter_smb2_set_info_operations, iter_smb2_write_objects, iter_smb3_transform_records, iter_smtp_bdat_objects, iter_smtp_data_objects, iter_smtp_starttls_transitions
+from .udf import UdfObservationEngine
 from .workspace import CaseWorkspace, safe_name
 
 
@@ -84,6 +86,7 @@ class ExtractionManager:
             size=size,
             depth=parent.depth + 1,
             created_by_tool_run_id=created_by_tool_run_id,
+            source_path=parent.source_path,
         )
         self.workspace.database.add_artifact(artifact)
         self.extracted_bytes += size
@@ -137,6 +140,84 @@ class ExtractionManager:
                     supporting_evidence=[f"tool_run:{run.id}", *[child.id for child in result.artifacts]],
                 )
             )
+        return result
+
+    def extract_jumplist_links(self, artifact: Artifact) -> ExtractionResult:
+        """Materialize structurally validated embedded shortcuts as children."""
+        result = ExtractionResult()
+        source = self.workspace.resolve_stored_path(artifact.path)
+        maximum = min(self.limits.signature_scan_bytes, 64 * 1024 * 1024)
+        inspection = inspect_jumplist(
+            source,
+            logical_name=artifact.logical_name,
+            max_bytes=maximum,
+            max_entries=min(self.limits.max_artifact_count, 4_096),
+        )
+        if not inspection.valid or inspection.kind is None:
+            return result
+        target_root = self.workspace.path("extracted", artifact.id, "builtin_jumplist")
+        target_root.mkdir(parents=True, exist_ok=True)
+        try:
+            if inspection.kind == "automatic_destinations":
+                payloads = [
+                    (name, payload, f"cfb_stream:{name}")
+                    for name, payload in automatic_link_streams(
+                        source,
+                        max_bytes=maximum,
+                        max_entries=min(self.limits.max_artifact_count, 4_096),
+                    )
+                ]
+            else:
+                ranges = custom_link_ranges(
+                    source,
+                    max_bytes=maximum,
+                    max_entries=min(self.limits.max_artifact_count, 4_096),
+                )
+                payloads = []
+                with source.open("rb") as stream:
+                    for index, (start, end) in enumerate(ranges):
+                        stream.seek(start)
+                        payloads.append((
+                            f"custom-{index:04d}", stream.read(end - start),
+                            f"file_range:{start}-{end}",
+                        ))
+        except (OSError, ValueError) as exc:
+            result.errors.append(f"Jump List extraction failed: {exc}")
+            return result
+        evidence: list[str] = []
+        for name, payload, provenance in payloads:
+            reason = self.can_register(artifact, len(payload))
+            if reason:
+                result.errors.append(f"skipped Jump List stream {name!r}: {reason}")
+                continue
+            output = target_root / f"{safe_name(name)}.lnk"
+            try:
+                with output.open("xb") as writer:
+                    writer.write(payload)
+            except OSError as exc:
+                result.errors.append(f"failed Jump List stream {name!r}: {exc}")
+                continue
+            child = self.register_file(output, artifact, f"{name}.lnk")
+            if child is None:
+                result.errors.append(f"skipped Jump List stream {name!r}: duplicate or extraction limit")
+                continue
+            result.artifacts.append(child)
+            result.extracted_bytes += child.size
+            evidence.append(f"child:{child.id};source:{provenance};length:{len(payload)}")
+        if result.artifacts:
+            result.findings.append(Finding(
+                artifact_id=artifact.id,
+                title=f"Extracted {len(result.artifacts)} Jump List shortcut(s)",
+                category="windows_jumplist_extraction",
+                severity="info",
+                confidence=0.98,
+                explanation=(
+                    "Only structurally validated CFB shortcut streams or bounded Custom Destinations byte ranges were copied. "
+                    "Each immutable child re-enters the common LNK and flag-search pipeline; no shortcut target was resolved or executed."
+                ),
+                source="builtin_jumplist_extractor",
+                supporting_evidence=evidence[:256],
+            ))
         return result
 
     def extract_zip(self, artifact: Artifact) -> ExtractionResult:
@@ -315,6 +396,130 @@ class ExtractionManager:
             )
         return result
 
+    @staticmethod
+    def _cpio_hard_link_identity(
+        record: dict[str, object],
+    ) -> tuple[object, ...] | None:
+        archive_index = record.get("archive_index")
+        inode = record.get("inode")
+        if (
+            not isinstance(archive_index, int) or isinstance(archive_index, bool)
+            or not isinstance(inode, int) or isinstance(inode, bool)
+        ):
+            return None
+        legacy_device = record.get("legacy_device")
+        if isinstance(legacy_device, int) and not isinstance(legacy_device, bool):
+            return (archive_index, "legacy", legacy_device, inode)
+        major = record.get("device_major")
+        minor = record.get("device_minor")
+        if (
+            not isinstance(major, int) or isinstance(major, bool)
+            or not isinstance(minor, int) or isinstance(minor, bool)
+        ):
+            return None
+        return (archive_index, "major_minor", major, minor, inode)
+
+    def _revalidate_cpio_hard_link_group(
+        self,
+        source_stream: BinaryIO,
+        records: list[object],
+        canonical: dict[str, object],
+    ) -> None:
+        identity = self._cpio_hard_link_identity(canonical)
+        if identity is None:
+            raise RuntimeError("hard-link identity no longer validates")
+        members = [
+            record for record in records
+            if isinstance(record, dict)
+            and record.get("file_type") == "regular"
+            and self._cpio_hard_link_identity(record) == identity
+        ]
+        link_counts = {
+            int(record["link_count"])
+            for record in members
+            if isinstance(record.get("link_count"), int)
+            and not isinstance(record.get("link_count"), bool)
+        }
+        metadata_identities = {
+            (
+                record.get("format"), record.get("mode"), record.get("uid"),
+                record.get("gid"), record.get("mtime_unix"),
+                record.get("legacy_rdevice"), record.get("rdevice_major"),
+                record.get("rdevice_minor"),
+            )
+            for record in members
+        }
+        payload_members = [
+            record for record in members
+            if isinstance(record.get("data_length"), int)
+            and not isinstance(record.get("data_length"), bool)
+            and int(record["data_length"]) > 0
+        ]
+        group_id = ":".join(str(part) for part in identity)
+        declared_link_count = next(iter(link_counts), 0)
+        complete = len(members) == declared_link_count
+        if (
+            len(link_counts) != 1
+            or declared_link_count <= 1
+            or len(members) > declared_link_count
+            or len(metadata_identities) != 1
+            or len(payload_members) != 1
+            or payload_members[0].get("header_offset")
+            != canonical.get("header_offset")
+            or canonical.get("cpio_hard_link_role") != "canonical"
+            or canonical.get("cpio_hard_link_reconciled") is not True
+            or canonical.get("cpio_hard_link_extraction_eligible") is not True
+            or canonical.get("cpio_hard_link_canonical_header_offset")
+            != canonical.get("header_offset")
+        ):
+            raise RuntimeError("hard-link group no longer matches triage provenance")
+        for member in members:
+            expected_role = "canonical" if member is canonical else "alias"
+            if (
+                member.get("cpio_hard_link_group_id") != group_id
+                or member.get("cpio_hard_link_role") != expected_role
+                or member.get("cpio_hard_link_reconciled") is not True
+                or member.get("cpio_hard_link_complete") is not complete
+                or member.get("cpio_hard_link_canonical_header_offset")
+                != canonical.get("header_offset")
+                or member.get("cpio_hard_link_canonical_name")
+                != canonical.get("name")
+                or member.get("cpio_hard_link_extraction_eligible")
+                is not (member is canonical)
+            ):
+                raise RuntimeError(
+                    "hard-link member roles no longer match triage provenance"
+                )
+            header_offset = member.get("header_offset")
+            header_length = member.get("header_length")
+            raw_header_hex = member.get("header_raw_hex")
+            expected_header_length = {
+                "bin": 26,
+                "odc": 76,
+                "newc": 110,
+                "crc": 110,
+            }.get(member.get("format"))
+            if (
+                not isinstance(header_offset, int)
+                or isinstance(header_offset, bool)
+                or not isinstance(header_length, int)
+                or isinstance(header_length, bool)
+                or not isinstance(raw_header_hex, str)
+                or header_offset < 0
+                or header_length != expected_header_length
+                or len(raw_header_hex) != header_length * 2
+            ):
+                raise RuntimeError("hard-link member header range is invalid")
+            source_stream.seek(header_offset)
+            raw_header = source_stream.read(header_length)
+            if (
+                len(raw_header) != header_length
+                or raw_header.hex() != raw_header_hex
+            ):
+                raise RuntimeError(
+                    "hard-link member header no longer matches triage provenance"
+                )
+
     def extract_cpio(self, artifact: Artifact) -> ExtractionResult:
         """Copy bounded regular-file ranges from native CPIO observations."""
         result = ExtractionResult()
@@ -342,6 +547,19 @@ class ExtractionManager:
             for record_index, record in enumerate(records):
                 if not isinstance(record, dict) or record.get("file_type") != "regular":
                     continue
+                if record.get("cpio_hard_link_group_id") is not None:
+                    if record.get("cpio_hard_link_role") == "alias":
+                        continue
+                    try:
+                        self._revalidate_cpio_hard_link_group(
+                            source_stream, records, record,
+                        )
+                    except (OSError, RuntimeError) as exc:
+                        result.errors.append(
+                            "skipped CPIO hard-link member "
+                            f"{record.get('name')!r}: {exc}"
+                        )
+                        continue
                 name = record.get("name")
                 header_offset = record.get("header_offset")
                 header_length = record.get("header_length")
@@ -350,7 +568,9 @@ class ExtractionManager:
                 name_size = record.get("name_size_including_nul")
                 data_offset = record.get("data_offset")
                 data_length = record.get("data_length")
+                format_name = record.get("format")
                 magic = record.get("magic")
+                binary_byte_order = record.get("binary_byte_order")
                 stored_checksum = record.get("stored_checksum")
                 if not isinstance(name, str) or not name or self._unsafe_name(name):
                     result.errors.append(f"skipped CPIO member {name!r}: unsafe path")
@@ -364,22 +584,41 @@ class ExtractionManager:
                     or isinstance(data_offset, bool) or not isinstance(data_offset, int)
                     or isinstance(data_length, bool) or not isinstance(data_length, int)
                     or header_offset < 0 or name_offset != header_offset + header_length
-                    or magic not in {"070701", "070702", "070707"}
-                    or (magic == "070707" and (header_length != 76 or alignment != 2))
-                    or (magic in {"070701", "070702"} and (header_length != 110 or alignment != 4))
+                    or format_name not in {"bin", "odc", "newc", "crc"}
+                    or (
+                        format_name == "bin"
+                        and (
+                            magic != "71c7"
+                            or header_length != 26
+                            or alignment != 2
+                            or binary_byte_order not in {"little", "big"}
+                        )
+                    )
+                    or (
+                        format_name == "odc"
+                        and (magic != "070707" or header_length != 76 or alignment != 2)
+                    )
+                    or (
+                        format_name in {"newc", "crc"}
+                        and (
+                            magic != ("070701" if format_name == "newc" else "070702")
+                            or header_length != 110
+                            or alignment != 4
+                        )
+                    )
                     or not 1 <= name_size <= 4_096
                     or data_offset != (
                         name_offset + name_size + (-(name_offset + name_size)) % alignment
                     )
                     or data_length < 0 or data_offset + data_length > artifact.size
                     or (
-                        magic in {"070701", "070702"}
+                        format_name in {"newc", "crc"}
                         and (
                             isinstance(stored_checksum, bool)
                             or not isinstance(stored_checksum, int)
                         )
                     )
-                    or (magic == "070707" and stored_checksum is not None)
+                    or (format_name in {"bin", "odc"} and stored_checksum is not None)
                 ):
                     result.errors.append(f"skipped CPIO member {name!r}: invalid observed byte range")
                     continue
@@ -390,11 +629,44 @@ class ExtractionManager:
                 try:
                     source_stream.seek(header_offset)
                     raw_header = source_stream.read(header_length)
-                    if len(raw_header) != header_length or raw_header[:6].decode(
-                        "ascii", errors="replace"
-                    ) != magic:
+                    if (
+                        len(raw_header) != header_length
+                        or raw_header.hex() != record.get("header_raw_hex")
+                    ):
                         raise RuntimeError("header no longer matches triage provenance")
-                    if magic == "070707":
+                    if format_name == "bin":
+                        assert isinstance(binary_byte_order, str)
+                        words = [
+                            int.from_bytes(
+                                raw_header[index:index + 2], binary_byte_order
+                            )
+                            for index in range(0, 26, 2)
+                        ]
+                        if words[0] != 0o70707:
+                            raise RuntimeError("binary header magic no longer validates")
+                        raw_mode = words[3]
+                        raw_name_size = words[10]
+                        raw_data_length = (words[11] << 16) | words[12]
+                        raw_stored_checksum = None
+                        binary_expected = {
+                            "legacy_device": words[1],
+                            "inode": words[2],
+                            "uid": words[4],
+                            "gid": words[5],
+                            "link_count": words[6],
+                            "legacy_rdevice": words[7],
+                            "mtime_unix": (words[8] << 16) | words[9],
+                        }
+                        if any(
+                            record.get(key) != value
+                            for key, value in binary_expected.items()
+                        ):
+                            raise RuntimeError(
+                                "binary header metadata no longer matches triage provenance"
+                            )
+                    elif format_name == "odc":
+                        if raw_header[:6] != b"070707":
+                            raise RuntimeError("odc header magic no longer validates")
                         if any(byte not in b"01234567" for byte in raw_header[6:]):
                             raise RuntimeError("odc header has a non-octal field")
                         raw_mode = int(raw_header[18:24], 8)
@@ -402,6 +674,9 @@ class ExtractionManager:
                         raw_data_length = int(raw_header[65:76], 8)
                         raw_stored_checksum = None
                     else:
+                        expected_magic = b"070701" if format_name == "newc" else b"070702"
+                        if raw_header[:6] != expected_magic:
+                            raise RuntimeError("newc header magic no longer validates")
                         if any(
                             byte not in b"0123456789abcdefABCDEF"
                             for byte in raw_header[6:]
@@ -449,7 +724,7 @@ class ExtractionManager:
                             ) & 0xFFFFFFFF
                     if written != data_length:
                         raise RuntimeError("member data length mismatch")
-                except (OSError, RuntimeError) as exc:
+                except (OSError, RuntimeError, ValueError) as exc:
                     output.unlink(missing_ok=True)
                     result.errors.append(f"failed CPIO member {name!r}: {exc}")
                     continue
@@ -460,7 +735,7 @@ class ExtractionManager:
                     )
                     continue
                 checksum_valid = (
-                    calculated_checksum == stored_checksum if magic == "070702" else None
+                    calculated_checksum == stored_checksum if format_name == "crc" else None
                 )
                 result.artifacts.append(child)
                 result.extracted_bytes += child.size
@@ -468,9 +743,12 @@ class ExtractionManager:
                     f"child:{child.id};source_observation_id:{entry_observation.id};"
                     f"source_observation_key:{entry_observation.key};"
                     f"format:{record.get('format')};header_offset:{header_offset};"
+                    f"archive_index:{record.get('archive_index')};"
+                    f"hard_link_group:{record.get('cpio_hard_link_group_id')};"
+                    f"hard_link_role:{record.get('cpio_hard_link_role')};"
                     f"name_offset:{name_offset};data_offset:{data_offset};"
                     f"data_length:{data_length};stored_checksum:{stored_checksum};"
-                    f"calculated_checksum:{calculated_checksum if magic == '070702' else None};"
+                    f"calculated_checksum:{calculated_checksum if format_name == 'crc' else None};"
                     f"checksum_valid:{checksum_valid};entry_record:{record}"
                 )
         if result.artifacts:
@@ -489,6 +767,265 @@ class ExtractionManager:
                 supporting_evidence=evidence[:128],
             ))
         return result
+
+    @staticmethod
+    def _iso9660_long_time_valid(raw: bytes) -> bool:
+        if raw == b"0" * 16 + b"\x00":
+            return True
+        if len(raw) != 17 or not raw[:16].isdigit():
+            return False
+        offset_units = raw[16] - 256 if raw[16] >= 128 else raw[16]
+        if not -48 <= offset_units <= 52:
+            return False
+        text = raw[:16].decode("ascii")
+        try:
+            from datetime import datetime
+
+            datetime(
+                int(text[0:4]), int(text[4:6]), int(text[6:8]),
+                int(text[8:10]), int(text[10:12]), int(text[12:14]),
+                int(text[14:16]) * 10_000,
+            )
+        except ValueError:
+            return False
+        return True
+
+    def _revalidate_iso9660_extended_attribute(
+        self,
+        source_stream: BinaryIO,
+        record: dict[str, object],
+        *,
+        artifact_size: int,
+        declared_volume_bytes: int,
+    ) -> dict[str, object] | None:
+        """Revalidate a bounded XAR that gates regular-file copying."""
+        block_count = record.get("extended_attribute_blocks")
+        if block_count in {0, None}:
+            return None
+        observation = record.get("iso9660_extended_attribute")
+        extent_block = record.get("extent_block")
+        block_size = record.get("logical_block_size")
+        data_offset = record.get("data_offset")
+        if (
+            not isinstance(block_count, int) or isinstance(block_count, bool)
+            or not isinstance(extent_block, int) or isinstance(extent_block, bool)
+            or not isinstance(block_size, int) or isinstance(block_size, bool)
+            or not isinstance(data_offset, int) or isinstance(data_offset, bool)
+            or block_count <= 0 or extent_block < 0 or block_size <= 0
+            or not isinstance(observation, dict)
+            or observation.get("valid") is not True
+            or observation.get("extraction_eligible") is not True
+            or observation.get("failed_checks") != []
+            or record.get("iso9660_extended_attribute_valid") is not True
+            or record.get(
+                "iso9660_extended_attribute_extraction_eligible"
+            ) is not True
+        ):
+            raise RuntimeError(
+                "ISO extended-attribute triage eligibility no longer validates"
+            )
+        xar_offset = extent_block * block_size
+        xar_length = block_count * block_size
+        xar_end = xar_offset + xar_length
+        if (
+            xar_length < 250
+            or xar_end > artifact_size
+            or xar_end > declared_volume_bytes
+            or data_offset != xar_end
+        ):
+            raise RuntimeError("ISO extended-attribute range no longer validates")
+        source_stream.seek(xar_offset)
+        raw = source_stream.read(xar_length)
+        if len(raw) != xar_length:
+            raise RuntimeError("ISO extended-attribute read ended early")
+
+        owner_le = int.from_bytes(raw[0:2], "little")
+        owner_be = int.from_bytes(raw[2:4], "big")
+        group_le = int.from_bytes(raw[4:6], "little")
+        group_be = int.from_bytes(raw[6:8], "big")
+        permissions = int.from_bytes(raw[8:10], "little")
+        timestamps_valid = all(
+            self._iso9660_long_time_valid(raw[start:start + 17])
+            for start in (10, 27, 44, 61)
+        )
+        record_format = raw[78]
+        record_attributes = raw[79]
+        record_length_le = int.from_bytes(raw[80:82], "little")
+        record_length_be = int.from_bytes(raw[82:84], "big")
+        version = raw[180]
+        escape_length = raw[181]
+        application_length_le = int.from_bytes(raw[246:248], "little")
+        application_length_be = int.from_bytes(raw[248:250], "big")
+        meaningful_length = 250 + application_length_le + escape_length
+        protection_flag = record.get("protection") is True
+        if (
+            owner_le != owner_be
+            or group_le != group_be
+            or (owner_le == 0) != (group_le == 0)
+            or permissions & 0xAAAA != 0xAAAA
+            or not timestamps_valid
+            or (record_format not in {0, 1, 2, 3} and record_format < 128)
+            or (record_format != 0 and record_attributes > 2)
+            or record_length_le != record_length_be
+            or (record_format == 0 and record_length_le != 0)
+            or (record_format == 1 and record_length_le == 0)
+            or (
+                record_format in {2, 3}
+                and not 1 <= record_length_le <= 32_767
+            )
+            or version != 1
+            or any(raw[182:246])
+            or application_length_le != application_length_be
+            or meaningful_length > xar_length
+            or any(raw[meaningful_length:])
+            or (record.get("record_format") is True) != (record_format != 0)
+            or (
+                protection_flag
+                and (
+                    owner_le == 0
+                    or group_le == 0
+                    or not (permissions & 0x5555)
+                )
+            )
+            or (
+                not protection_flag
+                and (owner_le != 0 or group_le != 0 or permissions & 0x5555)
+            )
+        ):
+            raise RuntimeError(
+                "ISO extended-attribute structure no longer validates"
+            )
+        raw_sha256 = hashlib.sha256(raw).hexdigest()
+        expected_values = {
+            "directory_record_offset": record.get("record_offset"),
+            "archive_path": record.get("archive_path"),
+            "file_type": record.get("file_type"),
+            "extent_block": extent_block,
+            "logical_block_size": block_size,
+            "extended_attribute_blocks": block_count,
+            "offset": xar_offset,
+            "length": xar_length,
+            "end_offset": xar_end,
+            "data_offset": data_offset,
+            "data_starts_after_record": True,
+            "raw_sha256": raw_sha256,
+            "owner_id": owner_le,
+            "owner_id_big_endian": owner_be,
+            "group_id": group_le,
+            "group_id_big_endian": group_be,
+            "permissions_raw_hex": raw[8:10].hex(),
+            "permissions": f"0x{permissions:04x}",
+            "record_format": record_format,
+            "record_attributes": record_attributes,
+            "record_length": record_length_le,
+            "record_length_big_endian": record_length_be,
+            "system_identifier_raw_hex": raw[84:116].hex(),
+            "system_use_raw_hex": raw[116:180].hex(),
+            "version": version,
+            "escape_sequence_length": escape_length,
+            "application_use_length": application_length_le,
+            "application_use_length_big_endian": application_length_be,
+            "meaningful_length": meaningful_length,
+            "padding_length": xar_length - meaningful_length,
+            "padding_all_zero": True,
+        }
+        for key, expected_value in expected_values.items():
+            if observation.get(key) != expected_value:
+                raise RuntimeError(
+                    f"ISO extended-attribute {key} no longer matches triage provenance"
+                )
+        return {
+            "offset": xar_offset,
+            "length": xar_length,
+            "raw_sha256": raw_sha256,
+            "owner_id": owner_le,
+            "group_id": group_le,
+            "permissions": f"0x{permissions:04x}",
+            "record_format": record_format,
+            "record_attributes": record_attributes,
+            "record_length": record_length_le,
+            "application_use_length": application_length_le,
+            "application_use_sha256": hashlib.sha256(
+                raw[250:250 + application_length_le]
+            ).hexdigest(),
+            "escape_sequence_length": escape_length,
+        }
+
+    @staticmethod
+    def _revalidate_iso9660_multi_extent_xar_consistency(
+        segment_records: list[dict[str, object]],
+        revalidations: list[dict[str, object] | None],
+        observed: object,
+    ) -> dict[str, object]:
+        """Independently recheck file-section XAR consistency before assembly."""
+        if (
+            not isinstance(observed, dict)
+            or observed.get("valid") is not True
+            or observed.get("extraction_eligible") is not True
+            or observed.get("failed_checks") != []
+            or len(segment_records) != len(revalidations)
+            or len(segment_records) < 2
+        ):
+            raise RuntimeError(
+                "ISO multi-extent extended-attribute consistency provenance "
+                "no longer validates"
+            )
+        present_indices = [
+            index for index, item in enumerate(revalidations)
+            if item is not None
+        ]
+        record_formats = [
+            int(item["record_format"])
+            for item in revalidations
+            if isinstance(item, dict)
+        ]
+        record_attributes = [
+            int(item["record_attributes"])
+            for item in revalidations
+            if isinstance(item, dict)
+        ]
+        fixed_record_lengths = [
+            int(item["record_length"])
+            for item in revalidations
+            if isinstance(item, dict) and item.get("record_format") == 1
+        ]
+        record_metadata_required = bool(
+            any(segment.get("record_format") is True for segment in segment_records)
+            or any(value != 0 for value in record_formats)
+        )
+        if (
+            (record_metadata_required and len(present_indices) != len(segment_records))
+            or len(set(record_formats)) > 1
+            or len(set(record_attributes)) > 1
+            or len(set(fixed_record_lengths)) > 1
+        ):
+            raise RuntimeError(
+                "ISO multi-extent extended-attribute fields are inconsistent"
+            )
+        expected_values = {
+            "segment_count": len(segment_records),
+            "present_segment_indices": present_indices,
+            "valid_segment_indices": present_indices,
+            "record_metadata_required_for_all_sections": (
+                record_metadata_required
+            ),
+            "record_format_values": sorted(set(record_formats)),
+            "record_attribute_values": sorted(set(record_attributes)),
+            "fixed_record_length_values": sorted(set(fixed_record_lengths)),
+        }
+        for key, expected_value in expected_values.items():
+            if observed.get(key) != expected_value:
+                raise RuntimeError(
+                    "ISO multi-extent extended-attribute consistency "
+                    f"{key} no longer matches triage provenance"
+                )
+        return {
+            **expected_values,
+            "raw_sha256_by_segment": [
+                item.get("raw_sha256") if isinstance(item, dict) else None
+                for item in revalidations
+            ],
+        }
 
     def _copy_iso9660_zisofs(
         self,
@@ -895,6 +1432,24 @@ class ExtractionManager:
                         result.errors.append(
                             f"skipped ISO member {name!r}: Rock Ridge symbolic link is metadata-only"
                         )
+                    elif (
+                        record.get("extended_attribute_blocks") not in {0, None}
+                        or (
+                            record.get("multi_extent") is True
+                            and isinstance(
+                                record.get(
+                                    "multi_extent_extended_attribute_consistency"
+                                ), dict,
+                            )
+                            and record[
+                                "multi_extent_extended_attribute_consistency"
+                            ].get("valid") is not True
+                        )
+                    ):
+                        result.errors.append(
+                            f"skipped ISO member {name!r}: extended-attribute "
+                            "record did not validate"
+                        )
                     elif record.get("rock_ridge_non_regular") is True:
                         result.errors.append(
                             f"skipped ISO member {name!r}: Rock Ridge special file is metadata-only"
@@ -916,11 +1471,19 @@ class ExtractionManager:
                 if multi_extent:
                     raw_segments = record.get("multi_extent_segments")
                     chain = record.get("multi_extent_chain")
+                    xar_consistency = record.get(
+                        "multi_extent_extended_attribute_consistency"
+                    )
                     if (
                         record.get("multi_extent_assembled") is not True
                         or not isinstance(chain, dict)
                         or chain.get("complete") is not True
                         or chain.get("extraction_eligible") is not True
+                        or not isinstance(xar_consistency, dict)
+                        or xar_consistency.get("valid") is not True
+                        or xar_consistency.get("extraction_eligible") is not True
+                        or chain.get("extended_attribute_consistency")
+                        != xar_consistency
                         or not isinstance(raw_segments, list)
                         or not 2 <= len(raw_segments) <= 128
                     ):
@@ -964,9 +1527,19 @@ class ExtractionManager:
                     result.errors.append(f"skipped ISO member {name!r}: {reason}")
                     continue
                 validated_segments: list[dict[str, int]] = []
+                extended_attribute_revalidation: dict[str, object] | None = None
+                extended_attribute_revalidations: list[
+                    dict[str, object] | None
+                ] = []
+                extended_attribute_present = any(
+                    isinstance(segment, dict)
+                    and segment.get("extended_attribute_blocks") not in {0, None}
+                    for segment in segment_records
+                )
                 try:
                     expected_identifier = record.get("identifier_raw_hex")
                     previous_record_end: int | None = None
+                    consistent_file_flags: int | None = None
                     for segment_index, segment in enumerate(segment_records):
                         if not isinstance(segment, dict):
                             raise RuntimeError("invalid multi-extent segment provenance")
@@ -1047,6 +1620,13 @@ class ExtractionManager:
                             )
                         ):
                             raise RuntimeError("directory record no longer matches triage provenance")
+                        file_flags = raw_record[25] & 0x0F
+                        if consistent_file_flags is None:
+                            consistent_file_flags = file_flags
+                        elif file_flags != consistent_file_flags:
+                            raise RuntimeError(
+                                "multi-extent directory file flags are inconsistent"
+                            )
                         continuation_areas = segment.get("susp_continuation_areas", [])
                         if not isinstance(continuation_areas, list):
                             raise RuntimeError("invalid SUSP continuation provenance")
@@ -1075,6 +1655,14 @@ class ExtractionManager:
                                 raise RuntimeError(
                                     "SUSP continuation area no longer matches triage provenance"
                                 )
+                        extended_attribute_revalidations.append(
+                            self._revalidate_iso9660_extended_attribute(
+                                source_stream,
+                                segment,
+                                artifact_size=artifact.size,
+                                declared_volume_bytes=pvd_declared_volume_bytes,
+                            )
+                        )
                         validated_segments.append({
                             "record_offset": record_offset,
                             "record_length": record_length,
@@ -1084,8 +1672,53 @@ class ExtractionManager:
                         })
                     if sum(segment["data_length"] for segment in validated_segments) != data_length:
                         raise RuntimeError("assembled extent length no longer matches triage provenance")
+                    if multi_extent:
+                        extended_attribute_revalidation = {
+                            "segments": extended_attribute_revalidations,
+                            "consistency": (
+                                self._revalidate_iso9660_multi_extent_xar_consistency(
+                                    segment_records,
+                                    extended_attribute_revalidations,
+                                    record.get(
+                                        "multi_extent_extended_attribute_consistency"
+                                    ),
+                                )
+                            ),
+                        }
+                    else:
+                        extended_attribute_revalidation = (
+                            extended_attribute_revalidations[0]
+                            if extended_attribute_revalidations else None
+                        )
                 except (OSError, RuntimeError) as exc:
                     result.errors.append(f"skipped ISO member {name!r}: {exc}")
+                    if extended_attribute_present:
+                        result.findings.append(Finding(
+                            artifact_id=artifact.id,
+                            title=(
+                                "ISO extended-attribute extraction provenance "
+                                "failed revalidation"
+                            ),
+                            category=(
+                                "iso9660_extended_attribute_extraction_anomaly"
+                            ),
+                            severity="medium",
+                            confidence=0.99,
+                            explanation=(
+                                "One or more bounded extended-attribute records passed triage "
+                                "but an immutable byte range, derived structure, or required "
+                                "cross-section field no longer matched the extraction "
+                                "observation. No child was copied."
+                            ),
+                            source="builtin_iso9660_extractor",
+                            supporting_evidence=[
+                                f"archive_path:{name};error:{exc};"
+                                f"record_offset:{record.get('record_offset')};"
+                                "extended_attribute_consistency:"
+                                f"{record.get('multi_extent_extended_attribute_consistency')};"
+                                f"segments:{segment_records}"
+                            ],
+                        ))
                     continue
                 target_root.mkdir(parents=True, exist_ok=True)
                 output = target_root / f"{record_index:05d}_{safe_name(name)}"
@@ -1168,6 +1801,8 @@ class ExtractionManager:
                     f"stored_data_length:{data_length};"
                     f"output_data_length:{output_data_length};zisofs:{zisofs};"
                     f"zisofs_revalidation:{zisofs_revalidation};"
+                    f"extended_attribute_revalidation:"
+                    f"{extended_attribute_revalidation};"
                     f"multi_extent:{multi_extent};segments:{validated_segments};"
                     f"archive_path:{name};"
                     f"containing_directory_identity:{record.get('containing_directory_identity')};"
@@ -1335,6 +1970,869 @@ class ExtractionManager:
                 ),
                 source="builtin_el_torito_extractor",
                 supporting_evidence=evidence[:16],
+            ))
+        return result
+
+    @staticmethod
+    def _udf_metadata_ranges(
+        values: dict[str, object],
+        file_set: dict[str, object],
+    ) -> list[dict[str, int | str]]:
+        ranges: list[dict[str, int | str]] = []
+
+        def add(label: str, offset: object, length: object) -> None:
+            if (
+                isinstance(offset, int) and not isinstance(offset, bool)
+                and isinstance(length, int) and not isinstance(length, bool)
+                and offset >= 0 and length > 0
+            ):
+                ranges.append({
+                    "label": label,
+                    "offset": offset,
+                    "length": length,
+                    "end_offset": offset + length,
+                })
+
+        vrs = values.get("archive.udf.volume_recognition_sequence")
+        if isinstance(vrs, dict):
+            descriptor_size = vrs.get("descriptor_size")
+            for record in vrs.get("records", []):
+                if isinstance(record, dict):
+                    add("volume_recognition", record.get("offset"), descriptor_size)
+        anchor = values.get("archive.udf.active_anchor")
+        if isinstance(anchor, dict):
+            add("anchor", anchor.get("offset"), anchor.get("block_size"))
+        anchor_candidates = values.get("archive.udf.anchor_candidates")
+        if isinstance(anchor_candidates, list):
+            for candidate in anchor_candidates:
+                if isinstance(candidate, dict):
+                    add(
+                        "anchor_candidate",
+                        candidate.get("offset"),
+                        candidate.get("block_size"),
+                    )
+        for key, label in (
+            ("archive.udf.main_volume_descriptor_sequence", "main_vds"),
+            ("archive.udf.reserve_volume_descriptor_sequence", "reserve_vds"),
+        ):
+            sequence = values.get(key)
+            if not isinstance(sequence, dict):
+                continue
+            sequence_extent = sequence.get("extent")
+            if isinstance(sequence_extent, dict):
+                add(
+                    f"{label}_extent",
+                    sequence_extent.get("offset"),
+                    sequence_extent.get("length"),
+                )
+            block_size = sequence.get("block_size")
+            for descriptor in sequence.get("descriptors", []):
+                if (
+                    isinstance(descriptor, dict)
+                    and isinstance(block_size, int)
+                    and not isinstance(block_size, bool)
+                    and isinstance(descriptor.get("logical_sector"), int)
+                ):
+                    add(
+                        label,
+                        int(descriptor["logical_sector"]) * block_size,
+                        block_size,
+                    )
+            for logical_volume in sequence.get("logical_volumes", []):
+                if not isinstance(logical_volume, dict):
+                    continue
+                integrity = logical_volume.get("integrity_sequence_extent")
+                if isinstance(integrity, dict):
+                    add(
+                        "integrity_sequence",
+                        integrity.get("offset"),
+                        integrity.get("length"),
+                    )
+        add("file_set", file_set.get("offset"), file_set.get("length"))
+        root_icb = file_set.get("root_icb")
+        if isinstance(root_icb, dict):
+            add("root_icb", root_icb.get("offset"), root_icb.get("length"))
+        root_directory = file_set.get("root_directory")
+        directories = []
+        if isinstance(root_directory, dict):
+            directories = [
+                root_directory,
+                *[
+                    item for item in root_directory.get("subdirectories", [])
+                    if isinstance(item, dict)
+                ],
+            ]
+        for directory in directories:
+            for extent in directory.get("extents", []):
+                if isinstance(extent, dict):
+                    add(
+                        "directory_data",
+                        extent.get("offset"),
+                        extent.get("length"),
+                    )
+            for extent in directory.get("allocation_extents", []):
+                if isinstance(extent, dict):
+                    add(
+                        "directory_allocation_extent",
+                        extent.get("offset"),
+                        extent.get("length"),
+                    )
+            inventory = directory.get("child_icbs")
+            if not isinstance(inventory, dict):
+                continue
+            for child in inventory.get("children", []):
+                if isinstance(child, dict):
+                    add("child_icb", child.get("offset"), child.get("length"))
+                    icb = child.get("icb")
+                    allocation = (
+                        icb.get("allocation_descriptor_metadata")
+                        if isinstance(icb, dict) else None
+                    )
+                    if isinstance(allocation, dict):
+                        for extent in allocation.get("allocation_extents", []):
+                            if isinstance(extent, dict):
+                                add(
+                                    "file_allocation_extent",
+                                    extent.get("offset"),
+                                    extent.get("length"),
+                                )
+        unique: dict[tuple[int, int, str], dict[str, int | str]] = {}
+        for item in ranges:
+            key = (int(item["offset"]), int(item["length"]), str(item["label"]))
+            unique[key] = item
+        return list(unique.values())
+
+    def _udf_regular_file_candidates(
+        self,
+        file_set: dict[str, object],
+        metadata_ranges: list[dict[str, int | str]],
+        artifact_size: int,
+    ) -> list[dict[str, object]]:
+        root_directory = file_set.get("root_directory")
+        if not isinstance(root_directory, dict):
+            return []
+        directories = [
+            root_directory,
+            *[
+                item for item in root_directory.get("subdirectories", [])
+                if isinstance(item, dict)
+            ],
+        ]
+        candidates: list[dict[str, object]] = []
+        for directory in directories:
+            entries = directory.get("entries", [])
+            entry_by_index = {
+                item.get("index"): item for item in entries
+                if isinstance(item, dict)
+            } if isinstance(entries, list) else {}
+            inventory = directory.get("child_icbs")
+            if not isinstance(inventory, dict):
+                continue
+            for child in inventory.get("children", []):
+                if not isinstance(child, dict):
+                    continue
+                icb = child.get("icb")
+                if not isinstance(icb, dict) or icb.get("file_type") != 5:
+                    continue
+                relationships = child.get("relationships", [])
+                if not isinstance(relationships, list):
+                    relationships = []
+                for relationship in relationships:
+                    if not isinstance(relationship, dict):
+                        continue
+                    entry = entry_by_index.get(relationship.get("fid_index"))
+                    failed_checks: list[str] = []
+                    if child.get("valid") is not True:
+                        failed_checks.append("child_icb_validation")
+                    if relationship.get("valid") is not True:
+                        failed_checks.append("fid_icb_relationship")
+                    if (
+                        not isinstance(entry, dict)
+                        or entry.get("valid") is not True
+                        or entry.get("deleted") is True
+                        or entry.get("parent") is True
+                    ):
+                        failed_checks.append("active_file_identifier")
+                    name = relationship.get("name")
+                    components = directory.get("path_components", [])
+                    logical_components = (
+                        [*components, name]
+                        if isinstance(components, list)
+                        and all(isinstance(item, str) for item in components)
+                        and isinstance(name, str)
+                        else []
+                    )
+                    logical_name = "/".join(logical_components)
+                    if (
+                        not logical_name
+                        or self._unsafe_name(logical_name)
+                        or any(item in {"", ".", ".."} for item in logical_components)
+                    ):
+                        failed_checks.append("safe_logical_name")
+                    if isinstance(entry, dict) and entry.get("metadata") is True:
+                        failed_checks.append("metadata_file_identifier")
+                    if int(icb.get("allocation_flags", 0)) & 0x3800:
+                        failed_checks.append("transformed_multiversion_or_stream_icb")
+                    if icb.get("record_format") != 0 or icb.get("record_length") != 0:
+                        failed_checks.append("record_oriented_file")
+                    information_length = icb.get("information_length")
+                    if (
+                        not isinstance(information_length, int)
+                        or isinstance(information_length, bool)
+                        or information_length < 0
+                        or information_length > artifact_size
+                    ):
+                        failed_checks.append("information_length")
+                        information_length = 0
+                    allocation = icb.get("allocation_descriptor_metadata")
+                    if not isinstance(allocation, dict) or allocation.get("valid") is not True:
+                        failed_checks.append("allocation_descriptor_metadata")
+                        descriptors: list[object] = []
+                        allocation_kind = "unsupported"
+                    else:
+                        descriptors = allocation.get("descriptors", [])
+                        if not isinstance(descriptors, list):
+                            descriptors = []
+                        allocation_kind = str(allocation.get("kind"))
+                        if allocation_kind not in {
+                            "short_ad", "long_ad", "extended_ad",
+                            "embedded_data",
+                        }:
+                            failed_checks.append("unsupported_allocation_descriptor_kind")
+                    remaining = information_length
+                    data_ranges: list[dict[str, int]] = []
+                    data_segments: list[dict[str, object]] = []
+                    allocated_ranges: list[tuple[int, int]] = []
+                    embedded_raw_hex: str | None = None
+                    if allocation_kind == "embedded_data":
+                        embedded_raw_hex = icb.get("allocation_descriptor_raw_hex")
+                        try:
+                            embedded = bytes.fromhex(
+                                embedded_raw_hex
+                                if isinstance(embedded_raw_hex, str) else ""
+                            )
+                        except ValueError:
+                            embedded = b""
+                            failed_checks.append("embedded_data_encoding")
+                        if len(embedded) != information_length:
+                            failed_checks.append("embedded_data_length")
+                        else:
+                            data_segments.append({
+                                "kind": "embedded",
+                                "length": len(embedded),
+                                "sha256": hashlib.sha256(embedded).hexdigest(),
+                            })
+                            remaining = 0
+                    else:
+                        for descriptor in descriptors:
+                            if not isinstance(descriptor, dict):
+                                failed_checks.append("allocation_descriptor")
+                                continue
+                            address = descriptor.get("address")
+                            resolved = descriptor.get("resolved")
+                            if (
+                                descriptor.get("valid") is not True
+                                or not isinstance(address, dict)
+                            ):
+                                failed_checks.append("allocation_descriptor")
+                                continue
+                            extent_type = address.get("extent_type")
+                            extent_length = address.get("length")
+                            logical_extent_length = (
+                                address.get("information_length")
+                                if allocation_kind == "extended_ad"
+                                else extent_length
+                            )
+                            recorded_length = (
+                                address.get("recorded_length")
+                                if allocation_kind == "extended_ad"
+                                else extent_length if extent_type == 0 else 0
+                            )
+                            if (
+                                not isinstance(extent_type, int)
+                                or isinstance(extent_type, bool)
+                                or extent_type not in {0, 1, 2}
+                                or not isinstance(extent_length, int)
+                                or isinstance(extent_length, bool)
+                                or extent_length <= 0
+                                or not isinstance(logical_extent_length, int)
+                                or isinstance(logical_extent_length, bool)
+                                or logical_extent_length <= 0
+                                or not isinstance(recorded_length, int)
+                                or isinstance(recorded_length, bool)
+                                or recorded_length < 0
+                            ):
+                                failed_checks.append("supported_extent_type_and_length")
+                                continue
+                            if (
+                                allocation_kind == "extended_ad"
+                                and (
+                                    (extent_type == 0 and recorded_length
+                                     != logical_extent_length)
+                                    or (extent_type in {1, 2} and recorded_length != 0)
+                                )
+                            ):
+                                failed_checks.append(
+                                    "extended_recorded_information_length"
+                                )
+                            take = min(logical_extent_length, remaining)
+                            if take <= 0:
+                                failed_checks.append("unused_allocation_extent")
+                                continue
+                            descriptor_index = int(descriptor.get("index", 0))
+                            if extent_type in {0, 1}:
+                                if (
+                                    not isinstance(resolved, dict)
+                                    or resolved.get("valid") is not True
+                                ):
+                                    failed_checks.append("allocated_extent_resolution")
+                                    continue
+                                offset = resolved.get("offset")
+                                end_offset = resolved.get("end_offset")
+                                if (
+                                    not isinstance(offset, int)
+                                    or isinstance(offset, bool)
+                                    or not isinstance(end_offset, int)
+                                    or isinstance(end_offset, bool)
+                                    or offset < 0
+                                    or end_offset != offset + extent_length
+                                    or end_offset > artifact_size
+                                ):
+                                    failed_checks.append("extent_range")
+                                    continue
+                                allocated_ranges.append((offset, end_offset))
+                            if extent_type == 0:
+                                data_range = {
+                                    "descriptor_index": descriptor_index,
+                                    "offset": offset,
+                                    "length": take,
+                                    "end_offset": offset + take,
+                                    "allocated_length": extent_length,
+                                    "allocated_end_offset": end_offset,
+                                    "recorded_length": recorded_length,
+                                    "logical_extent_length": logical_extent_length,
+                                }
+                                data_ranges.append(data_range)
+                                data_segments.append({
+                                    "kind": "recorded",
+                                    **data_range,
+                                })
+                            else:
+                                data_segments.append({
+                                    "kind": "zero",
+                                    "descriptor_index": descriptor_index,
+                                    "extent_type": extent_type,
+                                    "length": take,
+                                    "logical_extent_length": logical_extent_length,
+                                    "recorded_length": recorded_length,
+                                    "allocated_offset": (
+                                        resolved.get("offset")
+                                        if isinstance(resolved, dict) else None
+                                    ),
+                                    "allocated_length": (
+                                        extent_length if extent_type == 1 else 0
+                                    ),
+                                })
+                            remaining -= take
+                    if remaining:
+                        failed_checks.append("incomplete_information_ranges")
+                    for start, end in allocated_ranges:
+                        if any(
+                            max(start, int(item["offset"]))
+                            < min(end, int(item["end_offset"]))
+                            for item in metadata_ranges
+                        ):
+                            failed_checks.append("extent_overlaps_udf_metadata")
+                    candidate = {
+                        "index": len(candidates),
+                        "directory_index": directory.get("directory_index"),
+                        "directory_path_components": list(components)
+                        if isinstance(components, list) else [],
+                        "logical_name": logical_name,
+                        "fid": entry,
+                        "relationship": relationship,
+                        "child_icb": child,
+                        "icb_address": child.get("address"),
+                        "information_length": information_length,
+                        "allocation_kind": allocation_kind,
+                        "data_ranges": data_ranges,
+                        "data_segments": data_segments,
+                        "embedded_raw_hex": embedded_raw_hex,
+                        "allocated_ranges": [
+                            {"offset": start, "end_offset": end}
+                            for start, end in allocated_ranges
+                        ],
+                        "failed_checks": failed_checks,
+                    }
+                    candidates.append(candidate)
+
+        icb_groups: dict[tuple[object, object, object], list[dict[str, object]]] = {}
+        for candidate in candidates:
+            address = candidate.get("icb_address")
+            if isinstance(address, dict):
+                key = (
+                    address.get("partition_reference_number"),
+                    address.get("logical_block_number"),
+                    address.get("length"),
+                )
+                icb_groups.setdefault(key, []).append(candidate)
+        for group in icb_groups.values():
+            if len(group) > 1:
+                for candidate in group:
+                    candidate["failed_checks"].append("icb_alias")
+        for left_index, left in enumerate(candidates):
+            for right in candidates[left_index + 1:]:
+                overlap = any(
+                    max(int(left_range["offset"]), int(right_range["offset"]))
+                    < min(
+                        int(left_range["end_offset"]),
+                        int(right_range["end_offset"]),
+                    )
+                    for left_range in left.get("allocated_ranges", [])
+                    for right_range in right.get("allocated_ranges", [])
+                )
+                if overlap:
+                    left["failed_checks"].append("cross_file_extent_overlap")
+                    right["failed_checks"].append("cross_file_extent_overlap")
+        for candidate in candidates:
+            candidate["failed_checks"] = list(dict.fromkeys(
+                candidate["failed_checks"]
+            ))
+            candidate["extraction_eligible"] = not candidate["failed_checks"]
+        return candidates
+
+    @staticmethod
+    def _revalidate_udf_candidate(
+        source_stream: BinaryIO,
+        candidate: dict[str, object],
+    ) -> None:
+        fid = candidate.get("fid")
+        child = candidate.get("child_icb")
+        if not isinstance(fid, dict) or not isinstance(child, dict):
+            raise RuntimeError("candidate provenance is incomplete")
+        fid_raw = bytearray()
+        for segment in fid.get("source_segments", []):
+            if not isinstance(segment, dict):
+                raise RuntimeError("FID source segment is invalid")
+            offset = segment.get("offset")
+            length = segment.get("length")
+            if (
+                not isinstance(offset, int) or isinstance(offset, bool)
+                or not isinstance(length, int) or isinstance(length, bool)
+                or offset < 0 or length <= 0
+            ):
+                raise RuntimeError("FID source range is invalid")
+            source_stream.seek(offset)
+            raw = source_stream.read(length)
+            if len(raw) != length:
+                raise RuntimeError("FID source range became truncated")
+            fid_raw.extend(raw)
+        if (
+            len(fid_raw) != fid.get("record_length")
+            or hashlib.sha256(fid_raw).hexdigest() != fid.get("raw_sha256")
+        ):
+            raise RuntimeError("FID no longer matches triage provenance")
+        icb = child.get("icb")
+        offset = child.get("offset")
+        length = child.get("length")
+        if (
+            not isinstance(icb, dict)
+            or not isinstance(offset, int) or isinstance(offset, bool)
+            or not isinstance(length, int) or isinstance(length, bool)
+            or length <= 0
+        ):
+            raise RuntimeError("ICB provenance is invalid")
+        source_stream.seek(offset)
+        raw_icb = source_stream.read(length)
+        if (
+            len(raw_icb) != length
+            or hashlib.sha256(raw_icb).hexdigest() != icb.get("raw_sha256")
+        ):
+            raise RuntimeError("ICB no longer matches triage provenance")
+        fixed_length = 176 if icb.get("descriptor_kind") == "file_entry" else 216
+        extended_length = icb.get("extended_attribute_length")
+        allocation_length = icb.get("allocation_descriptor_length")
+        if (
+            not isinstance(extended_length, int)
+            or isinstance(extended_length, bool)
+            or not isinstance(allocation_length, int)
+            or isinstance(allocation_length, bool)
+        ):
+            raise RuntimeError("ICB variable-length provenance is invalid")
+        allocation_start = fixed_length + extended_length
+        allocation_end = allocation_start + allocation_length
+        if (
+            allocation_end > len(raw_icb)
+            or raw_icb[allocation_start:allocation_end].hex()
+            != icb.get("allocation_descriptor_raw_hex")
+        ):
+            raise RuntimeError("allocation descriptors no longer match provenance")
+        allocation = icb.get("allocation_descriptor_metadata")
+        if not isinstance(allocation, dict):
+            raise RuntimeError("allocation chain provenance is missing")
+        allocation_extents = allocation.get("allocation_extents")
+        continuations = allocation.get("continuation_descriptors")
+        if allocation.get("kind") == "embedded_data":
+            if (
+                allocation.get("valid") is not True
+                or allocation.get("descriptor_count") != 0
+            ):
+                raise RuntimeError("embedded allocation provenance is invalid")
+            return
+        if (
+            allocation.get("valid") is not True
+            or allocation.get("chain_complete") is not True
+            or not isinstance(allocation_extents, list)
+            or not isinstance(continuations, list)
+            or len(allocation_extents) != len(continuations)
+            or allocation.get("allocation_extent_count") != len(allocation_extents)
+            or len(allocation_extents) > 32
+        ):
+            raise RuntimeError("allocation extent chain is incomplete or invalid")
+        seen_locations: set[tuple[int, int]] = set()
+        seen_ranges: list[tuple[int, int]] = []
+        expected_previous = 0
+        descriptor_size = allocation.get("descriptor_size")
+        if (
+            not isinstance(descriptor_size, int)
+            or isinstance(descriptor_size, bool)
+            or descriptor_size not in {8, 16, 20}
+        ):
+            raise RuntimeError("allocation descriptor size provenance is invalid")
+        continuation_source = raw_icb[allocation_start:allocation_end]
+        for index, extent in enumerate(allocation_extents):
+            if not isinstance(extent, dict) or extent.get("index") != index:
+                raise RuntimeError("allocation extent chain order is invalid")
+            partition_reference = extent.get("partition_reference_number")
+            logical_block_number = extent.get("logical_block_number")
+            extent_offset = extent.get("offset")
+            extent_length = extent.get("length")
+            extent_end = extent.get("end_offset")
+            allocation_descriptor_length = extent.get(
+                "allocation_descriptor_length"
+            )
+            if (
+                not isinstance(partition_reference, int)
+                or isinstance(partition_reference, bool)
+                or not isinstance(logical_block_number, int)
+                or isinstance(logical_block_number, bool)
+                or not isinstance(extent_offset, int)
+                or isinstance(extent_offset, bool)
+                or not isinstance(extent_length, int)
+                or isinstance(extent_length, bool)
+                or not isinstance(extent_end, int)
+                or isinstance(extent_end, bool)
+                or not isinstance(allocation_descriptor_length, int)
+                or isinstance(allocation_descriptor_length, bool)
+                or extent_offset < 0
+                or extent_length < 24
+                or extent_end != extent_offset + extent_length
+                or allocation_descriptor_length < 0
+                or 24 + allocation_descriptor_length > extent_length
+            ):
+                raise RuntimeError("allocation extent range provenance is invalid")
+            location_key = (partition_reference, logical_block_number)
+            current_range = (extent_offset, extent_end)
+            if location_key in seen_locations or any(
+                max(extent_offset, start) < min(extent_end, end)
+                for start, end in seen_ranges
+            ):
+                raise RuntimeError("allocation extent chain cycle or overlap detected")
+            seen_locations.add(location_key)
+            seen_ranges.append(current_range)
+            source_stream.seek(extent_offset)
+            raw_extent = source_stream.read(extent_length)
+            if (
+                len(raw_extent) != extent_length
+                or hashlib.sha256(raw_extent).hexdigest()
+                != extent.get("raw_sha256")
+            ):
+                raise RuntimeError(
+                    "allocation extent no longer matches triage provenance"
+                )
+            allocation_raw = raw_extent[
+                24:24 + allocation_descriptor_length
+            ]
+            if (
+                allocation_raw.hex()
+                != extent.get("allocation_descriptor_raw_hex")
+                or hashlib.sha256(allocation_raw).hexdigest()
+                != extent.get("allocation_descriptor_raw_sha256")
+                or int.from_bytes(raw_extent[16:20], "little")
+                != expected_previous
+                or int.from_bytes(raw_extent[20:24], "little")
+                != allocation_descriptor_length
+            ):
+                raise RuntimeError(
+                    "allocation extent body no longer matches chain provenance"
+                )
+            fresh_tag = UdfObservationEngine._descriptor_tag(
+                raw_extent, logical_block_number,
+            )
+            if (
+                fresh_tag.get("valid") is not True
+                or fresh_tag.get("identifier") != 0x0102
+                or fresh_tag.get("crc_length")
+                != 8 + allocation_descriptor_length
+                or fresh_tag != extent.get("tag")
+            ):
+                raise RuntimeError(
+                    "allocation extent tag no longer matches chain provenance"
+                )
+            continuation = continuations[index]
+            continuation_address = (
+                continuation.get("address")
+                if isinstance(continuation, dict) else None
+            )
+            continuation_resolved = (
+                continuation.get("resolved")
+                if isinstance(continuation, dict) else None
+            )
+            continuation_raw_offset = (
+                continuation.get("raw_offset")
+                if isinstance(continuation, dict) else None
+            )
+            continuation_raw_hex = (
+                continuation_address.get("raw_hex")
+                if isinstance(continuation_address, dict) else None
+            )
+            expected_source_kind = "icb" if index == 0 else "allocation_extent"
+            expected_source_index = None if index == 0 else index - 1
+            if (
+                not isinstance(continuation_address, dict)
+                or not isinstance(continuation_resolved, dict)
+                or not isinstance(continuation_raw_offset, int)
+                or isinstance(continuation_raw_offset, bool)
+                or not isinstance(continuation_raw_hex, str)
+                or continuation.get("source_kind") != expected_source_kind
+                or continuation.get("source_extent_index")
+                != expected_source_index
+                or continuation_raw_offset < 0
+                or continuation_raw_offset + descriptor_size
+                != len(continuation_source)
+                or continuation_source[
+                    continuation_raw_offset:
+                    continuation_raw_offset + descriptor_size
+                ].hex() != continuation_raw_hex
+                or continuation_address.get("extent_type") != 3
+                or continuation_address.get("partition_reference_number")
+                != partition_reference
+                or continuation_address.get("logical_block_number")
+                != logical_block_number
+                or continuation_address.get("length") != extent_length
+                or continuation_resolved.get("offset") != extent_offset
+                or continuation_resolved.get("end_offset") != extent_end
+            ):
+                raise RuntimeError("allocation extent link provenance is invalid")
+            expected_previous = logical_block_number
+            continuation_source = allocation_raw
+
+    def extract_udf(self, artifact: Artifact) -> ExtractionResult:
+        """Copy immutable complete Type-1 UDF files and logical zero ranges."""
+        result = ExtractionResult()
+        observations = self.workspace.database.observations(artifact.id)
+        container_kind = next(
+            (
+                item.value for item in observations
+                if item.key == "archive.container_kind"
+                and isinstance(item.value, str)
+            ),
+            None,
+        )
+        if container_kind != "udf":
+            return result
+        valid = any(
+            item.key == "archive.udf.valid" and item.value is True
+            for item in observations
+        )
+        if not valid:
+            return result
+        file_set_observation = next(
+            (
+                item for item in observations
+                if item.key == "archive.udf.file_set"
+                and isinstance(item.value, dict)
+                and item.value.get("valid") is True
+            ),
+            None,
+        )
+        if file_set_observation is None:
+            result.errors.append("UDF valid observation has no validated file set")
+            return result
+        source = self.workspace.resolve_stored_path(artifact.path)
+        try:
+            actual_size = source.stat().st_size
+        except OSError as exc:
+            result.errors.append(f"UDF source stat failed for {artifact.logical_name}: {exc}")
+            return result
+        if actual_size != artifact.size:
+            result.errors.append("UDF source size no longer matches artifact provenance")
+            return result
+        digest = hashlib.sha256()
+        try:
+            with source.open("rb") as hash_stream:
+                while chunk := hash_stream.read(1024 * 1024):
+                    digest.update(chunk)
+        except OSError as exc:
+            result.errors.append(f"UDF source hash failed for {artifact.logical_name}: {exc}")
+            return result
+        if digest.hexdigest() != artifact.sha256:
+            result.errors.append("UDF source hash no longer matches artifact provenance")
+            return result
+        fresh_observations = UdfObservationEngine(
+            max_bytes=self.limits.signature_scan_bytes,
+            max_descriptors=min(self.limits.max_artifact_count, 256),
+            max_directory_entries=min(
+                self.limits.max_artifact_count + 64, 4_096,
+            ),
+        ).analyze(artifact, source, actual_size)
+        fresh_values = {item.key: item.value for item in fresh_observations}
+        fresh_file_set = fresh_values.get("archive.udf.file_set")
+        if (
+            fresh_values.get("archive.udf.valid") is not True
+            or not isinstance(fresh_file_set, dict)
+            or fresh_file_set != file_set_observation.value
+        ):
+            result.errors.append(
+                "UDF metadata no longer exactly matches stored triage provenance"
+            )
+            return result
+        metadata_ranges = self._udf_metadata_ranges(fresh_values, fresh_file_set)
+        candidates = self._udf_regular_file_candidates(
+            fresh_file_set, metadata_ranges, actual_size,
+        )
+        for candidate in candidates:
+            if candidate.get("extraction_eligible") is not True:
+                result.errors.append(
+                    f"skipped UDF file {candidate.get('logical_name')!r}: "
+                    + ", ".join(candidate.get("failed_checks", []))
+                )
+        eligible = [
+            item for item in candidates
+            if item.get("extraction_eligible") is True
+        ]
+        if not eligible:
+            return result
+        try:
+            source_stream = source.open("rb")
+        except OSError as exc:
+            result.errors.append(f"UDF source open failed for {artifact.logical_name}: {exc}")
+            return result
+        target_root = self.workspace.path(
+            "extracted", artifact.id, "builtin_udf",
+        )
+        evidence: list[str] = []
+        with source_stream:
+            for candidate in eligible:
+                logical_name = str(candidate["logical_name"])
+                information_length = int(candidate["information_length"])
+                reason = self.can_register(artifact, information_length)
+                if reason:
+                    result.errors.append(f"skipped UDF file {logical_name!r}: {reason}")
+                    continue
+                try:
+                    self._revalidate_udf_candidate(source_stream, candidate)
+                except (OSError, RuntimeError) as exc:
+                    result.errors.append(f"skipped UDF file {logical_name!r}: {exc}")
+                    continue
+                target_root.mkdir(parents=True, exist_ok=True)
+                output = target_root / (
+                    f"{int(candidate['index']):05d}_"
+                    f"{safe_name(PurePosixPath(logical_name).name)}"
+                )
+                written = 0
+                try:
+                    with output.open("xb") as writer:
+                        for data_segment in candidate.get("data_segments", []):
+                            kind = data_segment.get("kind")
+                            length = int(data_segment["length"])
+                            if kind == "recorded":
+                                source_stream.seek(int(data_segment["offset"]))
+                                remaining = length
+                                while remaining:
+                                    chunk = source_stream.read(
+                                        min(1024 * 1024, remaining)
+                                    )
+                                    if not chunk:
+                                        raise RuntimeError(
+                                            "file data ended before validated range"
+                                        )
+                                    writer.write(chunk)
+                                    written += len(chunk)
+                                    remaining -= len(chunk)
+                            elif kind == "zero":
+                                self._write_zeros(writer, length)
+                                written += length
+                            elif kind == "embedded":
+                                embedded_raw_hex = candidate.get(
+                                    "embedded_raw_hex"
+                                )
+                                if not isinstance(embedded_raw_hex, str):
+                                    raise RuntimeError(
+                                        "embedded data provenance is invalid"
+                                    )
+                                embedded = bytes.fromhex(embedded_raw_hex)
+                                if (
+                                    len(embedded) != length
+                                    or hashlib.sha256(embedded).hexdigest()
+                                    != data_segment.get("sha256")
+                                ):
+                                    raise RuntimeError(
+                                        "embedded data no longer matches provenance"
+                                    )
+                                writer.write(embedded)
+                                written += len(embedded)
+                            else:
+                                raise RuntimeError(
+                                    "unsupported UDF extraction segment"
+                                )
+                    if written != information_length:
+                        raise RuntimeError("copied UDF information length mismatch")
+                except (OSError, RuntimeError, ValueError) as exc:
+                    output.unlink(missing_ok=True)
+                    result.errors.append(f"failed UDF file {logical_name!r}: {exc}")
+                    continue
+                child = self.register_file(output, artifact, logical_name)
+                if child is None:
+                    result.errors.append(
+                        f"skipped UDF file {logical_name!r}: duplicate or extraction limit"
+                    )
+                    continue
+                result.artifacts.append(child)
+                result.extracted_bytes += child.size
+                icb = candidate["child_icb"]["icb"]
+                allocation = icb.get("allocation_descriptor_metadata", {})
+                evidence.append(
+                    f"child:{child.id};source_observation_id:{file_set_observation.id};"
+                    f"source_observation_key:{file_set_observation.key};"
+                    f"logical_name:{logical_name};directory_index:"
+                    f"{candidate.get('directory_index')};fid_tree_index:"
+                    f"{candidate['fid'].get('tree_index')};fid_source_segments:"
+                    f"{candidate['fid'].get('source_segments')};icb_offset:"
+                    f"{candidate['child_icb'].get('offset')};icb_sha256:"
+                    f"{icb.get('raw_sha256')};allocation_descriptor_sha256:"
+                    f"{icb.get('allocation_descriptor_raw_sha256')};data_segments:"
+                    f"{candidate.get('data_segments')};allocation_extents:"
+                    f"{allocation.get('allocation_extents') if isinstance(allocation, dict) else None}"
+                )
+        if result.artifacts:
+            result.findings.append(Finding(
+                artifact_id=artifact.id,
+                title=f"Extracted {len(result.artifacts)} validated UDF regular file(s)",
+                category="archive_udf_extraction",
+                severity="info",
+                confidence=0.99,
+                explanation=(
+                    "Only unique active regular files with safe validated FID lineage, "
+                    "exactly reread FE/EFE and short/long allocation descriptors, and "
+                    "complete Type-1 ranges were copied. Recorded extents preserve bytes, "
+                    "unrecorded sparse extents become bounded logical zeros, and embedded "
+                    "payloads come from the revalidated ICB. Every followed Allocation Extent "
+                    "Descriptor is reread as one exact tag/CRC/location/previous-pointer chain. "
+                    "Transformed, aliased, and malformed or incomplete layouts remain metadata-only."
+                ),
+                source="builtin_udf_extractor",
+                supporting_evidence=evidence[:128],
             ))
         return result
 
@@ -3779,6 +5277,10 @@ class ExtractionManager:
             remaining -= take
 
     def extract_supported(self, artifact: Artifact) -> ExtractionResult:
+        if artifact.artifact_type == "windows":
+            jump_list_result = self.extract_jumplist_links(artifact)
+            if jump_list_result.artifacts or jump_list_result.errors:
+                return jump_list_result
         ntfs_result = self.extract_ntfs_resident_data(artifact)
         ntfs_nonresident = self.extract_ntfs_nonresident_data(artifact)
         ntfs_result.artifacts.extend(ntfs_nonresident.artifacts)
@@ -3836,6 +5338,9 @@ class ExtractionManager:
         cpio_result = self.extract_cpio(artifact)
         if cpio_result.artifacts or cpio_result.errors:
             return cpio_result
+        udf_result = self.extract_udf(artifact)
+        if udf_result.artifacts or udf_result.errors:
+            return udf_result
         iso_result = self.extract_iso9660(artifact)
         el_torito_result = self.extract_iso9660_boot_images(artifact)
         if (

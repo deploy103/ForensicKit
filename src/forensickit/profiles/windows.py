@@ -223,7 +223,7 @@ class WindowsProfile(BaseProfile):
     def match_reasons(self, context: ProfileContext) -> list[str]:
         if context.classified_as("evtx", "registry", "windows"):
             return ["Windows artifact signature classification is present"]
-        if context.truthy("windows.evtx_signature", "windows.registry_signature", "windows.lnk_signature", "windows.prefetch_signature"):
+        if context.truthy("windows.evtx_signature", "windows.registry_signature", "windows.lnk_signature", "windows.prefetch_signature", "windows.jumplist_signature"):
             return ["Windows artifact structure marker is present"]
         if context.truthy("ntfs.usn_journal_detected"):
             return ["Explicitly named NTFS `$UsnJrnl:$J` stream was parsed"]
@@ -231,6 +231,36 @@ class WindowsProfile(BaseProfile):
 
     def analyze(self, context: ProfileContext) -> ProfileResult:
         result = ProfileResult(profile=self.name, matched=True)
+        jump_list_kind = next(
+            (value for value in context.values("jumplist.kind") if isinstance(value, str)), None
+        )
+        jump_list_destinations = next(
+            (value for value in context.values("jumplist.destinations") if isinstance(value, list)), []
+        )
+        jump_list_streams = next(
+            (value for value in context.values("jumplist.link_streams") if isinstance(value, list)), []
+        )
+        if context.truthy("jumplist.valid") and jump_list_kind:
+            application_id = next(
+                (value for value in context.values("jumplist.application_id") if isinstance(value, str)), None
+            )
+            evidence = [f"kind={jump_list_kind}"]
+            if application_id:
+                evidence.append(f"application_id={application_id}")
+            evidence.extend(str(item)[:2_000] for item in jump_list_destinations[:100])
+            evidence.extend(str(item)[:2_000] for item in jump_list_streams[:100])
+            result.findings.append(self.finding(
+                context,
+                title="Windows Jump List records recovered",
+                category="windows_jumplist",
+                confidence=0.92,
+                explanation=(
+                    "A structurally validated Automatic Destinations CFB/DestList or Custom Destinations shortcut sequence was parsed. "
+                    "Paths and access times are application-maintained usage leads, not proof that a target was executed. Embedded shortcuts can be extracted for ordinary LNK analysis."
+                ),
+                evidence=evidence,
+                severity="info",
+            ))
         usn_records = next(
             (value for value in context.values("ntfs.usn.records") if isinstance(value, list)), []
         )
@@ -478,6 +508,60 @@ class WindowsProfile(BaseProfile):
                     ),
                     evidence=command_evidence,
                     severity="medium",
+                ))
+            amcache_records = next(
+                (value for value in context.values("registry.amcache.records") if isinstance(value, list)), []
+            )
+            if amcache_records:
+                kinds: dict[str, int] = {}
+                for record in amcache_records:
+                    if isinstance(record, dict):
+                        kind = str(record.get("record_kind") or "unknown")
+                        kinds[kind] = kinds.get(kind, 0) + 1
+                result.findings.append(self.finding(
+                    context,
+                    title=f"{len(amcache_records)} bounded Amcache record(s) recovered",
+                    category="windows_amcache_inventory",
+                    confidence=0.9,
+                    explanation=(
+                        "Fixed, structurally resolved Amcache key paths supplied application/file inventory values, Registry cell offsets, and raw key last-write FILETIMEs. "
+                        "Amcache presence can support that Windows inventoried a program or file, but does not by itself prove execution; a key last-write time is not treated as an execution time."
+                    ),
+                    evidence=[f"record_kinds={kinds}", *[str(item)[:2_000] for item in amcache_records[:100]]],
+                    severity="info",
+                ))
+            shimcache_records = next(
+                (value for value in context.values("registry.shimcache.records") if isinstance(value, list)), []
+            )
+            shimcache_detected = context.truthy("registry.shimcache.detected")
+            if shimcache_records:
+                result.findings.append(self.finding(
+                    context,
+                    title=f"{len(shimcache_records)} bounded Shimcache record(s) recovered",
+                    category="windows_shimcache_inventory",
+                    confidence=0.88,
+                    explanation=(
+                        "A fixed SYSTEM\\ControlSet*\\Control\\Session Manager\\AppCompatCache path and an allocated REG_BINARY value contained bounded 00ts/10ts entries. "
+                        "The cached path and file last-modified FILETIME are retained with byte offsets. Entry presence, order, and timestamps do not alone prove execution or provide an execution time."
+                    ),
+                    evidence=[str(item)[:2_000] for item in shimcache_records[:100]],
+                    severity="info",
+                ))
+            elif shimcache_detected:
+                activity_errors = next(
+                    (value for value in context.values("registry.activity_errors") if isinstance(value, list)), []
+                )
+                result.findings.append(self.finding(
+                    context,
+                    title="AppCompatCache value requires another Shimcache format parser",
+                    category="windows_shimcache_unsupported_layout",
+                    confidence=0.86,
+                    explanation=(
+                        "The fixed AppCompatCache Registry path and value were present, but the native bounded reader did not recognize a supported 00ts/10ts layout. "
+                        "Use a compatible offline Registry/Registry Explorer or validated Shimcache parser and preserve the transaction-log state."
+                    ),
+                    evidence=[str(item)[:2_000] for item in activity_errors[:30]],
+                    severity="low",
                 ))
         recycle_bin_valid = next(
             (value for value in context.values("windows.recycle_bin_valid") if isinstance(value, bool)), None

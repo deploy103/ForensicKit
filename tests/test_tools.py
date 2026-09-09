@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from threading import Event, Timer
 import time
 
 import pytest
@@ -38,6 +39,10 @@ if '--spawn-child' in sys.argv:
     time.sleep(30)
 if '--large' in sys.argv:
     sys.stdout.write('X' * 8192)
+elif '--huge-file' in sys.argv:
+    output_dir = pathlib.Path(sys.argv[2])
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / 'too-large.bin').write_bytes(b'Y' * (1024 * 1024))
 else:
     print(json.dumps(sys.argv[1:]))
 if len(sys.argv) >= 3:
@@ -203,6 +208,38 @@ def test_runner_clamps_tool_timeout_to_case_limit(tmp_path: Path, case_artifact)
 
     assert result.status is ToolRunStatus.TIMED_OUT
     assert result.run.timeout == 0.1
+
+
+def test_runner_cancels_live_process_group(tmp_path: Path, case_artifact) -> None:
+    workspace, artifact = case_artifact
+    executable = _fake_executable(tmp_path / "cancel-fake")
+    canceled = Event()
+    timer = Timer(0.3, canceled.set)
+    timer.start()
+    started = time.monotonic()
+    try:
+        result = ToolRunner(
+            workspace, _registry(executable), cancel_event=canceled,
+        ).run("fake", artifact, timeout=10, extra_args=("--sleep",))
+    finally:
+        timer.cancel()
+    assert time.monotonic() - started < 3
+    assert result.status is ToolRunStatus.CANCELED
+    assert result.run.error == "tool canceled by analyst"
+    assert "started" in workspace.resolve_stored_path(result.run.stdout_path or "").read_text()
+
+
+def test_runner_caps_generated_file_size_on_linux(tmp_path: Path, case_artifact) -> None:
+    workspace, artifact = case_artifact
+    executable = _fake_executable(tmp_path / "bounded-fake")
+    result = ToolRunner(
+        workspace, _registry(executable), max_output_file_bytes=64 * 1024,
+    ).run("fake", artifact, extra_args=("--huge-file",))
+    if result.status is ToolRunStatus.COMPLETED:  # Non-Linux fallback has no RLIMIT_FSIZE.
+        return
+    generated = workspace.resolve_stored_path(result.generated_directory or "") / "too-large.bin"
+    assert result.status is ToolRunStatus.FAILED
+    assert not generated.exists() or generated.stat().st_size <= 64 * 1024
 
 
 def test_missing_tool_is_skipped_and_persisted(case_artifact) -> None:
@@ -538,3 +575,55 @@ def test_volatility_json_and_jsonl_tables_are_normalized() -> None:
         {"PID": "12", "PPID": "1", "COMM": "python"},
         {"PID": "13", "PPID": "12", "COMM": "worker"},
     ]
+
+
+def test_volatility_windows_info_json_is_normalized_as_kernel_metadata() -> None:
+    parsed = parse_output(
+        "volatility3", artifact_id="a", tool="volatility3_windows_info",
+        stdout=(
+            '[{"Variable": "Kernel Base", "Value": "0xf80000000000"}, '
+            '{"Variable": "NtSystemRoot", "Value": "C:\\\\Windows"}, '
+            '{"Variable": "NtMajorVersion", "Value": 10}]'
+        ),
+    )
+
+    kernel_info = next(
+        item.value for item in parsed.observations
+        if item.key == "memory.volatility.kernel_info"
+    )
+    assert kernel_info == {
+        "Kernel Base": "0xf80000000000",
+        "NtSystemRoot": "C:\\Windows",
+        "NtMajorVersion": "10",
+    }
+
+
+def test_volatility_failures_distinguish_symbols_layer_and_arguments() -> None:
+    symbols = parse_output(
+        "volatility3", artifact_id="a", tool="volatility3_windows_pslist",
+        stdout="", stderr="Unsatisfied requirement plugins.PsList.kernel.symbol_table_name",
+        exit_code=1,
+    )
+    assert next(
+        item.value["category"] for item in symbols.observations
+        if item.key == "memory.volatility.failure"
+    ) == "symbols_missing"
+
+    layer = parse_output(
+        "volatility3", artifact_id="a", tool="volatility3_windows_pslist",
+        stdout="", stderr="Unable to validate the plugin requirements: translation layer requirement",
+        exit_code=1,
+    )
+    assert next(
+        item.value["category"] for item in layer.observations
+        if item.key == "memory.volatility.failure"
+    ) == "image_or_layer_mismatch"
+
+    arguments = parse_output(
+        "volatility3", artifact_id="a", tool="volatility3_windows_memmap",
+        stdout="", stderr="error: unrecognized arguments: --dump", exit_code=2,
+    )
+    assert next(
+        item.value["category"] for item in arguments.observations
+        if item.key == "memory.volatility.failure"
+    ) == "plugin_or_argument_unsupported"
