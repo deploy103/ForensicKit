@@ -3148,10 +3148,10 @@
 
 ### Verification
 
-- The complete standard pytest suite passed **435/435** on Python 3.12 with Textual installed; the active headless TUI pilot completed real nonblocking analysis and populated artifact, observation, and flag views.
-- The independent pytest-free direct synthetic runner passed **435/435** across every `tests/test_*.py` module.
+- The complete standard pytest suite passed after the final safety/release additions on Python 3.12 with Textual installed; the active headless TUI pilot completed real nonblocking analysis and populated artifact, observation, and flag views.
+- The independent pytest-free direct synthetic runner passed **461/461** across every `tests/test_*.py` module.
 - `python -m compileall -q src tests scripts`, `git diff --check`, and `bash -n install_forensics.sh scripts/*.sh` passed.
-- Built and installed a clean v2 release-candidate bundle from commit `e8ed4e1cbe58`; its manifest records `SOURCE_DIRTY=0`. The candidate v1.2.0 wheel SHA-256 is `3a3c593cfbeeb9bd5fdad60e7163cd067e7f05ad644a89073c71156b6cfbc0a4`. A fresh local prefix passed both staged and final-path self-tests, reported every required Doctor check OK, and passed the seven-test installed Textual headless pilot. The final bundle must be rebuilt from the later checksum/log commit so its source provenance names that exact clean commit.
+- Built a clean v2 checksum-candidate bundle from implementation commit `0d77182f7a1e`; its manifest records `SOURCE_DIRTY=0`, locks one wheel per resolved distribution, and produces the reproducible v1.2.0 project-wheel SHA-256 `fce0f43c291fd7a61688093659bed37547691329db9b36e483179599d94117b9`. The final bundle is rebuilt from the later checksum/log commit so its source provenance names that exact clean commit.
 
 ### External pre-event gates
 
