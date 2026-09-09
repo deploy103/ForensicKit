@@ -3272,7 +3272,7 @@ def test_hayabusa_timeline_record_is_correlated_to_native_evtx_offset(tmp_path: 
     assert "service_install" in report
     assert "windows.event_activity_clusters" in report
     assert '"timeline": [' in report
-    assert "## Timeline" in markdown
+    assert "## 타임라인" in markdown
 
 
 def test_prefetch_declared_size_mismatch_is_persisted_and_reported(tmp_path: Path) -> None:
@@ -4720,7 +4720,7 @@ def test_nonfatal_analysis_errors_are_persisted_in_case_report(tmp_path: Path) -
     assert result.errors
     assert "Android backup extraction failed" in report
     assert "extraction_manager" in report
-    assert "## Recommended next steps" in markdown
+    assert "## 권장 후속 작업" in markdown
 
 
 def test_tool_stdout_is_hunted_as_flag_evidence(tmp_path: Path) -> None:

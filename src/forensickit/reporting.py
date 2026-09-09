@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import html
 import json
+import re
 from dataclasses import asdict
 from datetime import UTC, datetime
 from enum import Enum
@@ -11,6 +12,113 @@ from typing import Any
 
 from .workspace import CaseWorkspace
 from .graph import ArtifactGraph
+
+
+_KO_NARRATIVE = {
+    "Archive has an extreme declared expansion ratio": "압축 파일에 비정상적으로 높은 선언상 압축 해제 비율이 있습니다",
+    "ZIP local headers declare a large uncompressed payload relative to compressed bytes. Built-in extraction limits remain active.": "ZIP 로컬 헤더가 압축된 크기에 비해 매우 큰 압축 해제 크기를 선언합니다. 내장 추출기의 안전 제한은 계속 적용됩니다.",
+    "Data exists after image end marker": "이미지 종료 마커 뒤에 데이터가 존재합니다",
+    "Trailing bytes can contain an appended archive or hidden payload.": "파일 끝의 추가 바이트에는 덧붙인 압축 파일이나 숨겨진 payload가 들어 있을 수 있습니다.",
+    "Possible ZIP payload embedded in image": "이미지 내부에 ZIP payload가 삽입되었을 가능성이 있습니다",
+    "A ZIP signature inside an image strongly supports an embedded or appended archive hypothesis.": "이미지 내부의 ZIP signature는 압축 파일이 삽입되었거나 뒤에 덧붙었다는 가설을 강하게 뒷받침합니다.",
+    "Data exists after PNG IEND": "PNG IEND 뒤에 데이터가 존재합니다",
+    "Possible ZIP payload embedded/appended to PNG": "PNG에 ZIP payload가 삽입되었거나 덧붙었을 가능성이 있습니다",
+    "Executable has high sampled entropy": "실행 파일에서 높은 표본 entropy가 확인되었습니다",
+    "High entropy can result from packing, encryption, or compressed resources; correlate it with section layout and strings.": "높은 entropy는 packing, 암호화 또는 압축된 resource 때문에 나타날 수 있습니다. section 구조 및 문자열과 함께 분석해야 합니다.",
+    "Filesystem listing is deferred until a partition offset is confirmed": "partition offset을 확인할 때까지 filesystem 목록 조회를 보류합니다",
+    "The image contains a partition table. Running fls at offset zero would inspect partition metadata instead of a filesystem, so mmls is selected first and its sector offset must drive follow-up listing.": "이미지에 partition table이 있습니다. offset 0에서 fls를 실행하면 filesystem이 아니라 partition metadata를 검사하게 되므로, 먼저 mmls로 sector offset을 확인한 뒤 그 값을 후속 목록 조회에 사용해야 합니다.",
+    "QCOW virtual disk header is structurally inconsistent": "QCOW 가상 디스크 헤더의 구조가 일관되지 않습니다",
+    "QCOW magic was present but fixed header fields or bounds failed validation.": "QCOW magic은 존재하지만 고정 헤더 필드 또는 범위 검증에 실패했습니다.",
+    "A structurally valid ZIP container was opened with the bounded built-in extractor.": "구조적으로 유효한 ZIP 컨테이너를 안전 범위가 제한된 내장 추출기로 열었습니다.",
+    "Supporting evidence is recorded, but no independent verification action has been performed.": "뒷받침하는 증거는 기록되었지만 독립적인 검증 작업은 수행되지 않았습니다.",
+    "PNG classification warrants chunk and CRC validation": "PNG로 분류되었으므로 chunk와 CRC 검증이 필요합니다",
+    "deep mode permits bounded bit-plane checks for png": "deep 모드에서는 PNG에 대해 범위가 제한된 bit-plane 검사를 수행할 수 있습니다",
+    "list and validate archive structure before extraction": "추출 전에 압축 파일 구조를 조회하고 검증합니다",
+    "deep carving is justified by embedded signatures or an unclassified binary": "삽입된 signature 또는 분류되지 않은 binary가 있으므로 deep carving을 수행할 근거가 있습니다",
+    "deep signature carving provides an independent bounded recovery path": "deep signature carving은 독립적이며 범위가 제한된 복구 경로를 제공합니다",
+    "artifact remains an unknown binary": "artifact가 알 수 없는 binary로 남아 있습니다",
+    "classified artifact type commonly carries useful metadata": "분류된 artifact 유형에는 유용한 metadata가 포함되는 경우가 많습니다",
+    "image metadata can expose editing history, comments, and embedded previews": "이미지 metadata에서 편집 이력, 주석 및 삽입된 미리보기를 확인할 수 있습니다",
+    "confirm signature-derived type with libmagic output": "signature로 판별한 유형을 libmagic 출력으로 확인합니다",
+    "enumerate partition layout before filesystem-level operations": "filesystem 수준 작업 전에 partition 구조를 조회합니다",
+    "validated native partition metadata identifies filesystem candidate at sector offset 40": "검증된 기본 partition metadata에서 sector offset 40의 filesystem 후보를 확인했습니다",
+    "validate whether trailing data is an archive": "파일 끝에 덧붙은 데이터가 압축 파일인지 검증합니다",
+    "an embedded PK/ZIP signature was observed in the image": "이미지에서 삽입된 PK/ZIP signature가 관찰되었습니다",
+    "No rationale recorded.": "기록된 판단 근거가 없습니다.",
+}
+
+_KO_STATUS = {
+    "candidate": "후보",
+    "available": "사용 가능",
+    "missing": "미설치",
+    "completed": "완료",
+    "failed": "실패",
+    "canceled": "취소됨",
+    "unverified": "미검증",
+    "supported": "지지됨",
+    "refuted": "기각됨",
+    "incomplete": "불완전",
+    "not_performed": "수행 안 함",
+}
+
+_KO_SEVERITY = {
+    "info": "정보",
+    "low": "낮음",
+    "medium": "중간",
+    "high": "높음",
+    "critical": "심각",
+}
+
+
+def _ko_status(value: object) -> str:
+    text = str(value if value is not None else "")
+    return _KO_STATUS.get(text, text)
+
+
+def _ko_severity(value: object) -> str:
+    text = str(value if value is not None else "")
+    return _KO_SEVERITY.get(text, text)
+
+
+def _ko_narrative(value: object) -> str:
+    """한국어 보고서용 설명을 반환하되 증거 원문과 JSON은 변경하지 않는다."""
+    text = str(value if value is not None else "")
+    if not text or re.search(r"[가-힣]", text):
+        return text
+    known = _KO_NARRATIVE.get(text)
+    if known is not None:
+        return known
+    if " | " in text:
+        return " | ".join(_ko_narrative(part) for part in text.split(" | "))
+    extracted = re.fullmatch(r"Extracted (\d+) ZIP member\(s\)", text)
+    if extracted:
+        return f"ZIP 구성원 {extracted.group(1)}개를 추출했습니다"
+    entropy = re.fullmatch(r"entropy is high \(([^)]+)\)", text)
+    if entropy:
+        return f"entropy가 높습니다 ({entropy.group(1)})"
+    if text.startswith("artifact remains an unknown binary; entropy is high ("):
+        return text.replace(
+            "artifact remains an unknown binary; entropy is high",
+            "artifact가 알 수 없는 binary로 남아 있으며 entropy가 높습니다",
+            1,
+        )
+    if text.startswith("embedded signature/data observation exists; entropy is high ("):
+        match = re.fullmatch(
+            r"embedded signature/data observation exists; entropy is high \(([^)]+)\)", text,
+        )
+        if match:
+            return f"삽입된 signature/data 관찰값이 있으며 entropy가 높습니다 ({match.group(1)})"
+    trailing = re.fullmatch(r"(\d+) trailing byte\(s\) exist after the image end marker", text)
+    if trailing:
+        return f"이미지 종료 마커 뒤에 추가 바이트 {trailing.group(1)}개가 존재합니다"
+    rule = re.fullmatch(r"(?:Rule|rule) ([^:]+) fired because: (.+)", text)
+    if rule:
+        return f"규칙 `{rule.group(1)}`이 다음 조건 때문에 탐지되었습니다: `{rule.group(2)}`"
+    rule_reason = re.fullmatch(r"rule ([^:]+): (.+)", text)
+    if rule_reason:
+        return f"규칙 `{rule_reason.group(1)}`의 조건이 충족되었습니다: `{rule_reason.group(2)}`"
+    # 알 수 없는 확장 모듈의 문구도 영어 본문처럼 보이지 않도록 출처 데이터로 명확히 구분한다.
+    return f"분석 모듈이 기록한 원문: `{text}`"
 
 
 def _json_value(value: Any) -> Any:
@@ -473,13 +581,13 @@ class ReportGenerator:
     def _markdown(report: dict[str, Any]) -> str:
         case = report["case"]
         lines = [
-            f"# ForensicKit Report: {case['name']}",
+            f"# ForensicKit 분석 보고서: {case['name']}",
             "",
-            f"- Case ID: `{case['id']}`",
-            f"- Created: `{case['created_at']}`",
-            f"- Workspace: `{case['workspace']}`",
+            f"- 사건 ID: `{case['id']}`",
+            f"- 생성 시각: `{case['created_at']}`",
+            f"- 작업 공간: `{case['workspace']}`",
             "",
-            "## Flag candidates",
+            "## Flag 후보",
             "",
         ]
         flags = report["flag_candidates"]
@@ -489,46 +597,50 @@ class ReportGenerator:
                 value = str(flag["value"]).replace("`", "\\`")
                 locations = flag.get("locations") or [flag]
                 lines.append(
-                    f"- **`{value}`** — status `candidate`, {chain}; "
-                    f"{len(locations)} preserved location(s). This is not an automatic answer verdict."
+                    f"- **`{value}`** — 상태 `후보`, 변환 과정 `{chain}`; "
+                    f"발견 위치 {len(locations)}곳을 보존했습니다. 자동으로 정답 판정을 내린 값은 아닙니다."
                 )
                 for location in locations[:50]:
                     lines.append(
                         "  - "
-                        f"`{location.get('source_kind', 'unknown')}` · "
-                        f"origin `{location.get('origin_path') or 'unknown'}` · "
-                        f"found in `{location.get('discovered_path') or 'unknown'}` · "
-                        f"{location.get('location') or 'location unknown'} · "
-                        f"encoding `{location.get('encoding') or 'unknown'}` · "
-                        f"chain `{' → '.join(location.get('transform_chain') or [])}` · "
-                        f"context `{str(location.get('context') or '').replace('`', '\\`')}`"
+                        f"종류 `{location.get('source_kind', '알 수 없음')}` · "
+                        f"원본 `{location.get('origin_path') or '알 수 없음'}` · "
+                        f"발견 파일 `{location.get('discovered_path') or '알 수 없음'}` · "
+                        f"{location.get('location') or '위치 알 수 없음'} · "
+                        f"인코딩 `{location.get('encoding') or '알 수 없음'}` · "
+                        f"변환 과정 `{' → '.join(location.get('transform_chain') or [])}` · "
+                        f"주변 문맥 `{str(location.get('context') or '').replace('`', '\\`')}`"
                     )
         else:
-            lines.append("No flag candidates detected.")
-        lines.extend(["", "## Search hits", ""])
+            lines.append("탐지된 Flag 후보가 없습니다.")
+        lines.extend(["", "## 검색 결과", ""])
         if report.get("search_hits"):
             for hit in report["search_hits"]:
                 locations = hit.get("locations") or [hit]
                 lines.append(
-                    f"- `{hit.get('match_type')}` query `{str(hit.get('query') or '').replace('`', '\\`')}` "
-                    f"matched `{str(hit.get('value') or '').replace('`', '\\`')}` at {len(locations)} location(s)."
+                    f"- `{hit.get('match_type')}` 방식의 검색어 "
+                    f"`{str(hit.get('query') or '').replace('`', '\\`')}`와 일치하는 값 "
+                    f"`{str(hit.get('value') or '').replace('`', '\\`')}`을 {len(locations)}곳에서 찾았습니다."
                 )
                 for location in locations[:50]:
                     lines.append(
-                        f"  - `{location.get('source_kind', 'unknown')}` · "
-                        f"`{location.get('discovered_path') or 'unknown'}` · "
-                        f"{location.get('location') or 'location unknown'} · "
-                        f"context `{str(location.get('context') or '').replace('`', '\\`')}`"
+                        f"  - `{location.get('source_kind', '알 수 없음')}` · "
+                        f"`{location.get('discovered_path') or '알 수 없음'}` · "
+                        f"{location.get('location') or '위치 알 수 없음'} · "
+                        f"주변 문맥 `{str(location.get('context') or '').replace('`', '\\`')}`"
                     )
         else:
-            lines.append("No exact-string, keyword, or explicit-regex hits requested/detected.")
-        lines.extend(["", "## Analysis errors", ""])
+            lines.append("요청되었거나 탐지된 exact-string, keyword 또는 명시적 regex 검색 결과가 없습니다.")
+        lines.extend(["", "## 분석 오류", ""])
         if report["errors"]:
             for error in report["errors"]:
-                target = error.get("artifact_id") or "case"
-                lines.append(f"- `{error['source']}` for `{target}`: {error['message']}")
+                target = error.get("artifact_id") or "사건 전체"
+                lines.append(
+                    f"- 대상 `{target}`, 출처 `{error['source']}`의 비치명적 오류: "
+                    f"`{error['message']}`"
+                )
         else:
-            lines.append("No non-fatal analysis errors recorded.")
+            lines.append("기록된 비치명적 분석 오류가 없습니다.")
         plans = [
             observation["value"]
             for observation in report["observations"]
@@ -540,42 +652,42 @@ class ReportGenerator:
             item for item in report.get("verifications", [])
             if item.get("status") == "unverified"
         ]
-        lines.extend(["", "## Recommended next steps", ""])
+        lines.extend(["", "## 권장 후속 작업", ""])
         if report["flag_candidates"]:
-            lines.append("- Validate prominent flag candidates against their recorded artifact, source location, and transform chain.")
+            lines.append("- 주요 Flag 후보를 기록된 artifact, 원본 위치 및 변환 과정과 대조하여 검증하세요.")
         if available_plans:
             tool_names = ", ".join(sorted({str(plan.get("tool")) for plan in available_plans}))
-            lines.append(f"- Review or execute the available evidence-backed plans: `{tool_names}`.")
+            lines.append(f"- 증거에 근거한 다음 사용 가능 계획을 검토하거나 실행하세요: `{tool_names}`.")
         if missing_plans:
             tool_names = ", ".join(sorted({str(plan.get("tool")) for plan in missing_plans}))
-            lines.append(f"- If time permits, stage missing optional tools offline and rerun the relevant plans: `{tool_names}`.")
+            lines.append(f"- 필요하면 다음 미설치 선택 도구를 offline으로 준비한 뒤 관련 계획을 다시 실행하세요: `{tool_names}`.")
         if report["errors"]:
-            lines.append("- Review the recorded non-fatal analysis errors before relying on incomplete extraction or parser output.")
+            lines.append("- 불완전한 추출 또는 parser 출력에 의존하기 전에 기록된 비치명적 분석 오류를 검토하세요.")
         if unverified:
             lines.append(
-                f"- Independently verify the {len(unverified)} unverified finding hypothesis/hypotheses; "
-                "recorded supporting strings alone are not a completed verification."
+                f"- 미검증 finding 가설 {len(unverified)}개를 독립적으로 검증하세요. "
+                "기록된 보조 문자열만으로는 검증이 완료된 것이 아닙니다."
             )
         if not report["flag_candidates"] and not available_plans and not missing_plans and not report["errors"] and not unverified:
-            lines.append("- No follow-up is currently evidence-backed; inspect raw observations and preserved output before broadening scope.")
-        lines.extend(["", "## Findings", ""])
+            lines.append("- 현재 증거가 뒷받침하는 후속 작업이 없습니다. 범위를 넓히기 전에 원시 관찰값과 보존된 출력을 확인하세요.")
+        lines.extend(["", "## 주요 분석 결과", ""])
         if report["findings"]:
             for finding in report["findings"]:
                 lines.extend(
                     [
-                        f"### {finding['title']}",
+                        f"### {_ko_narrative(finding['title'])}",
                         "",
-                        f"- Category: `{finding['category']}`",
-                        f"- Severity/confidence: `{finding['severity']}` / `{finding['confidence']:.2f}`",
-                        f"- Source: `{finding['source']}`",
+                        f"- 분류: `{finding['category']}`",
+                        f"- 심각도/신뢰도: `{_ko_severity(finding['severity'])}` / `{finding['confidence']:.2f}`",
+                        f"- 출처: `{finding['source']}`",
                         "",
-                        finding["explanation"],
+                        _ko_narrative(finding["explanation"]),
                         "",
                     ]
                 )
         else:
-            lines.extend(["No findings recorded.", ""])
-        lines.extend(["## Investigation chain", ""])
+            lines.extend(["기록된 주요 분석 결과가 없습니다.", ""])
+        lines.extend(["## 조사 및 검증 과정", ""])
         hypotheses_by_finding = {
             item.get("finding_id"): item for item in report.get("hypotheses", [])
         }
@@ -589,47 +701,49 @@ class ReportGenerator:
                 verification = verifications_by_finding.get(finding_id)
                 if not hypothesis or not verification:
                     lines.extend([
-                        f"### {finding.get('title')}", "",
+                        f"### {_ko_narrative(finding.get('title'))}", "",
                         f"- Finding ID: `{finding_id}`",
-                        "- Chain status: `incomplete` (legacy or damaged case data)", "",
+                        "- 검증 과정 상태: `불완전` (이전 버전 또는 손상된 사건 데이터)", "",
                     ])
                     continue
                 lines.extend([
-                    f"### {hypothesis.get('statement')}", "",
+                    f"### {_ko_narrative(hypothesis.get('statement'))}", "",
                     f"- Finding ID: `{finding_id}`",
                     f"- Artifact ID: `{hypothesis.get('artifact_id')}`",
-                    f"- Hypothesis source/confidence: `{hypothesis.get('source')}` / "
+                    f"- 가설 출처/신뢰도: `{hypothesis.get('source')}` / "
                     f"`{float(hypothesis.get('confidence', 0.0)):.2f}`",
-                    f"- Verification: `{verification.get('status')}`",
-                    f"- Verification method: `{verification.get('method')}`",
-                    f"- Verification source: `{verification.get('source')}`",
+                    f"- 검증 상태: `{_ko_status(verification.get('status'))}`",
+                    f"- 검증 방법: `{_ko_status(verification.get('method'))}`",
+                    f"- 검증 출처: `{verification.get('source')}`",
                     "",
-                    str(hypothesis.get("rationale") or "No rationale recorded."),
+                    _ko_narrative(hypothesis.get("rationale") or "No rationale recorded."),
                     "",
-                    f"Verification conclusion: {verification.get('conclusion')}",
+                    f"검증 결론: {_ko_narrative(verification.get('conclusion'))}",
                     "",
-                    "Evidence attached to this verification record:",
+                    "이 검증 기록에 첨부된 증거:",
                 ])
                 evidence = verification.get("evidence") or []
                 if evidence:
                     lines.extend(f"- {item}" for item in evidence)
                 else:
-                    lines.append("- No verification evidence recorded; this remains explicitly unverified.")
+                    lines.append("- 기록된 검증 증거가 없으므로 명시적인 미검증 상태로 유지됩니다.")
                 lines.append("")
         else:
-            lines.extend(["No hypothesis or verification records available.", ""])
-        lines.extend(["## Artifacts", ""])
+            lines.extend(["사용 가능한 가설 또는 검증 기록이 없습니다.", ""])
+        lines.extend(["## Artifact 목록", ""])
         for artifact in report["artifacts"]:
-            parent = artifact["parent_id"] or "root evidence"
+            parent = artifact["parent_id"] or "최상위 증거"
             lines.append(
                 f"- `{artifact['logical_name']}` — `{artifact['artifact_type']}`, "
-                f"SHA256 `{artifact['sha256']}`, parent `{parent}`"
+                f"SHA-256 `{artifact['sha256']}`, 상위 artifact `{parent}`"
             )
-        lines.extend(["", "## Artifact lineage", ""])
+        lines.extend(["", "## Artifact 계보", ""])
         graph_mapping = report.get("artifact_graph", {})
         # JSON object keys stringify the root None key; report readers still
         # receive the canonical mapping while the human report remains clear.
-        root_ids = graph_mapping.get(None, graph_mapping.get("null", []))
+        root_ids = graph_mapping.get(
+            None, graph_mapping.get("null", graph_mapping.get("None", [])),
+        )
         if root_ids:
             by_id = {artifact["id"]: artifact for artifact in report["artifacts"]}
             def render(node_id: str, prefix: str = "") -> None:
@@ -642,48 +756,51 @@ class ReportGenerator:
             for root_id in root_ids:
                 render(root_id)
         else:
-            lines.append("No artifact lineage recorded.")
-        lines.extend(["", "## Tool runs", ""])
+            lines.append("기록된 artifact 계보가 없습니다.")
+        lines.extend(["", "## 도구 실행 기록", ""])
         for run in report["tool_runs"]:
             command = " ".join(run["command_argv"])
             lines.append(
-                f"- `{run['tool']}` [{run['status']}] exit={run['exit_code']}: `{command}` "
-                f"(stdout: `{run['stdout_path']}`)"
+                f"- `{run['tool']}` [상태: {_ko_status(run['status'])}] 종료 코드={run['exit_code']}: "
+                f"`{command}` (표준 출력: `{run['stdout_path']}`)"
             )
         if not report["tool_runs"]:
-            lines.append("No external tools executed.")
-        lines.extend(["", "## Timeline", ""])
+            lines.append("실행된 외부 도구가 없습니다.")
+        lines.extend(["", "## 타임라인", ""])
         timeline = report.get("timeline", [])
         if timeline:
             for event in timeline[:200]:
-                timestamp = event.get("timestamp_utc") or event.get("timestamp") or "time unknown"
+                timestamp = event.get("timestamp_utc") or event.get("timestamp") or "시각 알 수 없음"
                 if str(event.get("event_id", "")).startswith("USN_RECORD_V"):
                     identity = (
-                        f"USN {event.get('usn')} / file ID {event.get('file_record_number') or event.get('file_id_128')} "
+                        f"USN {event.get('usn')} / 파일 ID {event.get('file_record_number') or event.get('file_id_128')} "
                         f"`{event.get('file_name') or ''}` / {event.get('reason_names') or event.get('reason')}"
                     )
                 else:
-                    identity = f"Event {event.get('event_id') or '?'} / record {event.get('event_record_id') or '?'}"
+                    identity = f"이벤트 {event.get('event_id') or '?'} / 레코드 {event.get('event_record_id') or '?'}"
                 offset = event.get("record_offset")
-                offset_text = f" at byte `{offset}`" if offset is not None else ""
+                offset_text = f", byte offset `{offset}`" if offset is not None else ""
                 cluster = (
-                    f"; cluster score `{event.get('cluster_score')}` ({event.get('cluster_level')})"
+                    f"; cluster 점수 `{event.get('cluster_score')}` ({event.get('cluster_level')})"
                     if event.get("cluster_score") is not None else ""
                 )
                 mft_context = (
-                    f"; exact MFT `{event.get('mft_artifact_name') or event.get('mft_artifact_id')}` "
-                    f"names `{event.get('sample_file_names')}` deleted=`{event.get('sample_deleted')}`"
+                    f"; 정확한 MFT `{event.get('mft_artifact_name') or event.get('mft_artifact_id')}` "
+                    f"이름 `{event.get('sample_file_names')}` 삭제 여부=`{event.get('sample_deleted')}`"
                     if event.get("mft_artifact_id") else ""
                 )
                 lines.append(
-                    f"- `{timestamp}` — {identity} `{event.get('category') or 'other'}`{offset_text}{cluster}; "
+                    f"- `{timestamp}` — {identity} `{event.get('category') or '기타'}`{offset_text}{cluster}; "
                     f"artifact `{event.get('artifact_name') or event.get('artifact_id')}`{mft_context}"
                 )
             if len(timeline) > 200:
-                lines.append(f"- Timeline display truncated: {len(timeline) - 200} additional row(s) remain in `timeline.csv` and `report.json`.")
+                lines.append(
+                    f"- 타임라인 표시를 줄였습니다. 추가 항목 {len(timeline) - 200}개는 "
+                    "`timeline.csv`와 `report.json`에 남아 있습니다."
+                )
         else:
-            lines.append("No normalized timeline events recorded.")
-        lines.extend(["", "## Recommended / planned tools", ""])
+            lines.append("기록된 정규화 타임라인 이벤트가 없습니다.")
+        lines.extend(["", "## 권장 또는 계획된 도구", ""])
         if plans:
             seen: set[tuple[str, str, str, tuple[tuple[str, str], ...]]] = set()
             for plan in plans:
@@ -700,40 +817,40 @@ class ReportGenerator:
                 if key in seen:
                     continue
                 seen.add(key)
-                availability = "available" if plan.get("available") else "missing"
-                reasons = "; ".join(str(reason) for reason in plan.get("reasons", []))
+                availability = "사용 가능" if plan.get("available") else "미설치"
+                reasons = "; ".join(_ko_narrative(reason) for reason in plan.get("reasons", []))
                 parameter_text = ", ".join(f"{name}={value}" for name, value in parameter_items)
-                suffix = f"; parameters: `{parameter_text}`" if parameter_text else ""
+                suffix = f"; parameter: `{parameter_text}`" if parameter_text else ""
                 lines.append(
-                    f"- `{key[0]}` ({availability}, analysis mode `{key[1]}`, command mode `{key[2]}`){suffix}: {reasons}"
+                    f"- `{key[0]}` ({availability}, 분석 모드 `{key[1]}`, 명령 모드 `{key[2]}`){suffix}: {reasons}"
                 )
         else:
-            lines.append("No tool plans recorded.")
+            lines.append("기록된 도구 계획이 없습니다.")
         return "\n".join(lines) + "\n"
 
     @staticmethod
     def _html(report: dict[str, Any]) -> str:
-        """Render a dependency-free report with every evidence value escaped."""
+        """모든 증거 값을 escape한 독립 실행형 한국어 보고서를 생성한다."""
         esc = lambda value: html.escape(str(value if value is not None else ""), quote=True)
         flag_rows: list[str] = []
         for flag in report.get("flag_candidates", []):
             locations = flag.get("locations") or [flag]
             detail = "".join(
                 "<li>"
-                f"source={esc(item.get('source_kind'))}; "
-                f"origin={esc(item.get('origin_path'))}; "
-                f"found in={esc(item.get('discovered_path'))}; "
-                f"location={esc(item.get('location'))}; "
-                f"encoding={esc(item.get('encoding'))}; "
-                f"chain={esc(' → '.join(item.get('transform_chain') or []))}; "
-                f"context=<code>{esc(item.get('context'))}</code>"
+                f"종류={esc(item.get('source_kind'))}; "
+                f"원본={esc(item.get('origin_path'))}; "
+                f"발견 파일={esc(item.get('discovered_path'))}; "
+                f"위치={esc(item.get('location'))}; "
+                f"인코딩={esc(item.get('encoding'))}; "
+                f"변환 과정={esc(' → '.join(item.get('transform_chain') or []))}; "
+                f"주변 문맥=<code>{esc(item.get('context'))}</code>"
                 "</li>"
                 for item in locations[:50]
             )
             flag_rows.append(
                 "<tr>"
                 f"<td><code>{esc(flag.get('value'))}</code></td>"
-                "<td>candidate (not automatically confirmed)</td>"
+                "<td>후보 (자동 확인된 정답이 아님)</td>"
                 f"<td><ul>{detail}</ul></td>"
                 "</tr>"
             )
@@ -743,7 +860,7 @@ class ReportGenerator:
             detail = "".join(
                 "<li>"
                 f"{esc(item.get('source_kind'))}; {esc(item.get('discovered_path'))}; "
-                f"{esc(item.get('location'))}; context=<code>{esc(item.get('context'))}</code>"
+                f"{esc(item.get('location'))}; 주변 문맥=<code>{esc(item.get('context'))}</code>"
                 "</li>"
                 for item in locations[:50]
             )
@@ -770,17 +887,17 @@ class ReportGenerator:
             evidence = verification.get("evidence") or []
             evidence_items = "".join(
                 f"<li><code>{esc(item)}</code></li>" for item in evidence
-            ) or "<li>No verification evidence recorded; analyst verification is required.</li>"
+            ) or "<li>기록된 검증 증거가 없습니다. 분석가의 검증이 필요합니다.</li>"
             chain_rows.append(
                 "<tr>"
-                f"<td><code>{esc(finding_id)}</code><br>{esc(finding.get('title'))}</td>"
-                f"<td>{esc(hypothesis.get('statement'))}<br>"
-                f"<small>{esc(hypothesis.get('rationale'))}</small><br>"
-                f"source=<code>{esc(hypothesis.get('source'))}</code></td>"
-                f"<td><strong>{esc(verification.get('status') or 'missing')}</strong><br>"
-                f"method=<code>{esc(verification.get('method'))}</code><br>"
-                f"source=<code>{esc(verification.get('source'))}</code><br>"
-                f"{esc(verification.get('conclusion'))}</td>"
+                f"<td><code>{esc(finding_id)}</code><br>{esc(_ko_narrative(finding.get('title')))}</td>"
+                f"<td>{esc(_ko_narrative(hypothesis.get('statement')))}<br>"
+                f"<small>{esc(_ko_narrative(hypothesis.get('rationale')))}</small><br>"
+                f"출처=<code>{esc(hypothesis.get('source'))}</code></td>"
+                f"<td><strong>{esc(_ko_status(verification.get('status') or 'missing'))}</strong><br>"
+                f"방법=<code>{esc(_ko_status(verification.get('method')))}</code><br>"
+                f"출처=<code>{esc(verification.get('source'))}</code><br>"
+                f"{esc(_ko_narrative(verification.get('conclusion')))}</td>"
                 f"<td><ul>{evidence_items}</ul></td>"
                 "</tr>"
             )
@@ -794,18 +911,18 @@ class ReportGenerator:
             for item in report.get("artifacts", [])
         )
         return """<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>ForensicKit report</title>
+<html lang="ko"><head><meta charset="utf-8"><title>ForensicKit 분석 보고서</title>
 <style>body{font:14px system-ui,sans-serif;margin:2rem;line-height:1.4}table{border-collapse:collapse;width:100%;margin-bottom:2rem}th,td{border:1px solid #bbb;padding:.45rem;vertical-align:top;text-align:left}code{white-space:pre-wrap;overflow-wrap:anywhere}ul{margin:.2rem;padding-left:1.2rem}.notice{padding:.7rem;background:#fff4cc}</style></head><body>""" + (
-            f"<h1>ForensicKit report: {esc(report.get('case', {}).get('name'))}</h1>"
-            "<p class=\"notice\">Flag strings are candidates for analyst validation, not automatically confirmed answers. "
-            "Program logs and evidence-derived output are labelled separately.</p>"
-            "<h2>Flag candidates</h2><table><thead><tr><th>Value</th><th>Status</th><th>Locations and provenance</th></tr></thead><tbody>"
-            + ("".join(flag_rows) or "<tr><td colspan=\"3\">None detected</td></tr>")
-            + "</tbody></table><h2>Search hits</h2><table><thead><tr><th>Type</th><th>Query</th><th>Value</th><th>Locations</th></tr></thead><tbody>"
-            + ("".join(hit_rows) or "<tr><td colspan=\"4\">None detected</td></tr>")
-            + "</tbody></table><h2>Investigation chain</h2><table><thead><tr><th>Finding</th><th>Hypothesis</th><th>Verification</th><th>Evidence</th></tr></thead><tbody>"
-            + ("".join(chain_rows) or "<tr><td colspan=\"4\">No hypothesis or verification records</td></tr>")
-            + "</tbody></table><h2>Artifacts</h2><table><thead><tr><th>Name</th><th>Type</th><th>SHA-256</th><th>Original path</th></tr></thead><tbody>"
+            f"<h1>ForensicKit 분석 보고서: {esc(report.get('case', {}).get('name'))}</h1>"
+            "<p class=\"notice\">Flag 문자열은 분석가가 검증해야 할 후보이며 자동으로 확인된 정답이 아닙니다. "
+            "프로그램 로그와 증거에서 유래한 출력은 별도로 구분합니다.</p>"
+            "<h2>Flag 후보</h2><table><thead><tr><th>값</th><th>상태</th><th>위치와 출처</th></tr></thead><tbody>"
+            + ("".join(flag_rows) or "<tr><td colspan=\"3\">탐지된 항목 없음</td></tr>")
+            + "</tbody></table><h2>검색 결과</h2><table><thead><tr><th>유형</th><th>검색어</th><th>값</th><th>위치</th></tr></thead><tbody>"
+            + ("".join(hit_rows) or "<tr><td colspan=\"4\">탐지된 항목 없음</td></tr>")
+            + "</tbody></table><h2>조사 및 검증 과정</h2><table><thead><tr><th>분석 결과</th><th>가설</th><th>검증</th><th>증거</th></tr></thead><tbody>"
+            + ("".join(chain_rows) or "<tr><td colspan=\"4\">가설 또는 검증 기록 없음</td></tr>")
+            + "</tbody></table><h2>Artifact 목록</h2><table><thead><tr><th>이름</th><th>유형</th><th>SHA-256</th><th>원본 경로</th></tr></thead><tbody>"
             + artifact_rows
             + "</tbody></table></body></html>\n"
         )

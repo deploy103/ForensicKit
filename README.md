@@ -377,7 +377,7 @@ case/
 └── case.db
 ```
 
-`report.html`은 별도 프런트엔드 의존성이 없고 증거 문자열을 HTML escape합니다. `timeline.csv`는 artifact, EventRecordID 또는 원시 byte offset, 활동 클러스터 점수, parser observation, tool run, stdout provenance를 포함할 수 있습니다. 스프레드시트 수식처럼 보이는 증거 값은 CSV에서만 escape하고 JSON과 데이터베이스의 원본 값은 바꾸지 않습니다. `search_results.csv`는 보존된 플래그/검색 위치마다 한 행을 기록합니다.
+사람이 읽는 `report.md`와 `report.html`은 제목, 설명, 판정 및 권장 작업을 기본 한국어로 표시합니다. 도구명과 forensic 전문용어, 정확한 명령, 증거에서 가져온 문자열은 검증 가능성을 위해 원문을 유지하며, 자동화용 `report.json`의 schema key와 저장 값도 바꾸지 않습니다. `report.html`은 별도 프런트엔드 의존성이 없고 증거 문자열을 HTML escape합니다. `timeline.csv`는 artifact, EventRecordID 또는 원시 byte offset, 활동 클러스터 점수, parser observation, tool run, stdout provenance를 포함할 수 있습니다. 스프레드시트 수식처럼 보이는 증거 값은 CSV에서만 escape하고 JSON과 데이터베이스의 원본 값은 바꾸지 않습니다. `search_results.csv`는 보존된 플래그/검색 위치마다 한 행을 기록합니다.
 
 완료되었거나 취소된 사건을 headless로 검토할 수 있습니다.
 
