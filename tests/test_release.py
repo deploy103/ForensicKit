@@ -13,9 +13,10 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_release_version_is_consistent() -> None:
     metadata = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    assert metadata["project"]["version"] == "1.1.0"
-    assert forensickit.__version__ == "1.1.0"
-    assert "ForensicKit v1.1.0" in (ROOT / "README.md").read_text(encoding="utf-8")
+    assert metadata["project"]["version"] == "1.2.0"
+    assert forensickit.__version__ == "1.2.0"
+    assert "ForensicKit v1.2.0" in (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "textual>=0.58" in metadata["project"]["dependencies"]
 
 
 def test_packaged_default_resources_exist() -> None:

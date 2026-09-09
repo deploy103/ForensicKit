@@ -10,6 +10,7 @@ import tarfile
 import zlib
 from io import BytesIO
 from pathlib import Path
+from threading import Event
 from zipfile import ZipFile
 
 from forensickit.engine import AnalysisEngine
@@ -20,6 +21,29 @@ from forensickit.models import AnalysisMode, AnalysisResult, Artifact, Observati
 from forensickit.tools import ToolDefinition, ToolRegistry
 from forensickit.triage import GenericTriageEngine
 from forensickit.workspace import CaseWorkspace
+
+
+def test_engine_progress_callback_can_cancel_after_current_triage(tmp_path: Path) -> None:
+    evidence = tmp_path / "cancel.txt"
+    evidence.write_text("ordinary evidence", encoding="utf-8")
+    canceled = Event()
+    events: list[dict[str, object]] = []
+
+    def progress(event: dict[str, object]) -> None:
+        events.append(event)
+        if event["event"] == "artifact_started":
+            canceled.set()
+
+    result = AnalysisEngine(progress=progress, cancel_event=canceled).analyze(
+        evidence, tmp_path / "cases", mode=AnalysisMode.TRIAGE, execute=False,
+    )
+
+    assert [event["event"] for event in events] == [
+        "case_created", "artifact_started", "artifact_planned",
+        "artifact_finished", "case_finished",
+    ]
+    assert events[-1]["status"] == "canceled"
+    assert Path(result.case.workspace, "reports", "report.json").is_file()
 
 
 def _cpio_crc_member(
@@ -66,17 +90,46 @@ def _cpio_odc_member(
     return bytes(result)
 
 
+def _cpio_binary_member(
+    name: str,
+    data: bytes = b"",
+    *,
+    mode: int = 0o100644,
+    inode: int = 1,
+    link_count: int = 1,
+    byte_order: str = "little",
+) -> bytes:
+    raw_name = name.encode("utf-8") + b"\x00"
+    mtime = 1_700_000_000
+    words = (
+        0o70707, 1, inode, mode, 1000, 1000, link_count, 0,
+        mtime >> 16, mtime & 0xFFFF, len(raw_name),
+        len(data) >> 16, len(data) & 0xFFFF,
+    )
+    result = bytearray(
+        b"".join(value.to_bytes(2, byte_order) for value in words)
+    )
+    assert len(result) == 26
+    result.extend(raw_name)
+    result.extend(b"\x00" * ((-len(result)) % 2))
+    result.extend(data)
+    result.extend(b"\x00" * ((-len(result)) % 2))
+    return bytes(result)
+
+
 def _iso_directory_record(
     identifier: bytes,
     extent_block: int,
     data_length: int,
     *,
     flags: int = 0,
+    extended_attribute_blocks: int = 0,
     system_use: bytes = b"",
 ) -> bytes:
     padding = 1 if len(identifier) % 2 == 0 else 0
     record = bytearray(33 + len(identifier) + padding + len(system_use))
     record[0] = len(record)
+    record[1] = extended_attribute_blocks
     record[2:6] = extent_block.to_bytes(4, "little")
     record[6:10] = extent_block.to_bytes(4, "big")
     record[10:14] = data_length.to_bytes(4, "little")
@@ -94,8 +147,9 @@ def _iso_directory_record(
 
 def _iso_path_table_entry(
     identifier: bytes, extent_block: int, parent_number: int, *, byte_order: str,
+    extended_attribute_blocks: int = 0,
 ) -> bytes:
-    result = bytearray((len(identifier), 0))
+    result = bytearray((len(identifier), extended_attribute_blocks))
     result.extend(extent_block.to_bytes(4, byte_order))
     result.extend(parent_number.to_bytes(2, byte_order))
     result.extend(identifier)
@@ -106,6 +160,28 @@ def _iso_path_table_entry(
 
 def _susp_entry(signature: bytes, data: bytes = b"") -> bytes:
     return signature + bytes((4 + len(data), 1)) + data
+
+
+def _iso_extended_attribute_record(
+    *, record_format: int = 0, record_attributes: int = 0,
+    record_length: int = 0, application_use: bytes = b"PIPELINE-XAR",
+) -> bytes:
+    record = bytearray(2_048)
+    record[8:10] = (0xAAAA).to_bytes(2, "little")
+    record[10:27] = b"2026090714190000\x00"
+    record[27:44] = b"0" * 16 + b"\x00"
+    record[44:61] = b"0" * 16 + b"\x00"
+    record[61:78] = b"0" * 16 + b"\x00"
+    record[84:116] = b"FORENSICKIT".ljust(32, b" ")
+    record[78] = record_format
+    record[79] = record_attributes
+    record[80:82] = record_length.to_bytes(2, "little")
+    record[82:84] = record_length.to_bytes(2, "big")
+    record[180] = 1
+    record[246:248] = len(application_use).to_bytes(2, "little")
+    record[248:250] = len(application_use).to_bytes(2, "big")
+    record[250:250 + len(application_use)] = application_use
+    return bytes(record)
 
 
 def _rrip_px(mode: int, *, links: int = 1, serial: int = 1) -> bytes:
@@ -185,17 +261,20 @@ def _zisofs_stream(
     )
 
 
-def _iso9660_with_root_file(name: bytes, payload: bytes) -> bytes:
+def _iso9660_with_root_file(
+    name: bytes, payload: bytes, *, extended_attribute: bool = False,
+) -> bytes:
     block_size = 2_048
-    image = bytearray(23 * block_size)
+    volume_blocks = 24 if extended_attribute else 23
+    image = bytearray(volume_blocks * block_size)
     pvd_offset = 16 * block_size
     image[pvd_offset] = 1
     image[pvd_offset + 1:pvd_offset + 6] = b"CD001"
     image[pvd_offset + 6] = 1
     image[pvd_offset + 8:pvd_offset + 40] = b"FORENSICKIT".ljust(32, b" ")
     image[pvd_offset + 40:pvd_offset + 72] = b"RECURSIVE_ISO".ljust(32, b" ")
-    image[pvd_offset + 80:pvd_offset + 84] = (23).to_bytes(4, "little")
-    image[pvd_offset + 84:pvd_offset + 88] = (23).to_bytes(4, "big")
+    image[pvd_offset + 80:pvd_offset + 84] = volume_blocks.to_bytes(4, "little")
+    image[pvd_offset + 84:pvd_offset + 88] = volume_blocks.to_bytes(4, "big")
     image[pvd_offset + 120:pvd_offset + 122] = (1).to_bytes(2, "little")
     image[pvd_offset + 122:pvd_offset + 124] = (1).to_bytes(2, "big")
     image[pvd_offset + 124:pvd_offset + 126] = (1).to_bytes(2, "little")
@@ -211,29 +290,38 @@ def _iso9660_with_root_file(name: bytes, payload: bytes) -> bytes:
     root = (
         root_record
         + _iso_directory_record(b"\x01", 20, block_size, flags=0x02)
-        + _iso_directory_record(name, 21, len(payload))
+        + _iso_directory_record(
+            name, 21, len(payload),
+            extended_attribute_blocks=1 if extended_attribute else 0,
+        )
     )
     image[20 * block_size:20 * block_size + len(root)] = root
-    image[21 * block_size:21 * block_size + len(payload)] = payload
+    if extended_attribute:
+        image[21 * block_size:22 * block_size] = _iso_extended_attribute_record()
+        data_block = 22
+    else:
+        data_block = 21
+    image[data_block * block_size:data_block * block_size + len(payload)] = payload
     return bytes(image)
 
 
 def _iso9660_with_multi_extent_file(
     name: bytes, final_payload: bytes, *, final_identifier: bytes | None = None,
-    final_multi_extent: bool = False,
+    final_multi_extent: bool = False, extended_attributes: bool = False,
 ) -> tuple[bytes, bytes]:
     block_size = 2_048
     first_payload = b"A" * block_size
     assembled = first_payload + final_payload
-    image = bytearray(24 * block_size)
+    volume_blocks = 26 if extended_attributes else 24
+    image = bytearray(volume_blocks * block_size)
     pvd_offset = 16 * block_size
     image[pvd_offset] = 1
     image[pvd_offset + 1:pvd_offset + 6] = b"CD001"
     image[pvd_offset + 6] = 1
     image[pvd_offset + 8:pvd_offset + 40] = b"FORENSICKIT".ljust(32, b" ")
     image[pvd_offset + 40:pvd_offset + 72] = b"MULTI_EXTENT".ljust(32, b" ")
-    image[pvd_offset + 80:pvd_offset + 84] = (24).to_bytes(4, "little")
-    image[pvd_offset + 84:pvd_offset + 88] = (24).to_bytes(4, "big")
+    image[pvd_offset + 80:pvd_offset + 84] = volume_blocks.to_bytes(4, "little")
+    image[pvd_offset + 84:pvd_offset + 88] = volume_blocks.to_bytes(4, "big")
     image[pvd_offset + 120:pvd_offset + 122] = (1).to_bytes(2, "little")
     image[pvd_offset + 122:pvd_offset + 124] = (1).to_bytes(2, "big")
     image[pvd_offset + 124:pvd_offset + 126] = (1).to_bytes(2, "little")
@@ -246,39 +334,59 @@ def _iso9660_with_multi_extent_file(
     image[terminator] = 255
     image[terminator + 1:terminator + 6] = b"CD001"
     image[terminator + 6] = 1
+    final_extent = 23 if extended_attributes else 22
+    record_flag = 0x08 if extended_attributes else 0
     root = (
         root_record
         + _iso_directory_record(b"\x01", 20, block_size, flags=0x02)
-        + _iso_directory_record(name, 21, len(first_payload), flags=0x80)
         + _iso_directory_record(
-            final_identifier or name, 22, len(final_payload),
-            flags=0x80 if final_multi_extent else 0,
+            name, 21, len(first_payload), flags=0x80 | record_flag,
+            extended_attribute_blocks=1 if extended_attributes else 0,
+        )
+        + _iso_directory_record(
+            final_identifier or name, final_extent, len(final_payload),
+            flags=(0x80 if final_multi_extent else 0) | record_flag,
+            extended_attribute_blocks=1 if extended_attributes else 0,
         )
     )
     image[20 * block_size:20 * block_size + len(root)] = root
-    image[21 * block_size:21 * block_size + len(first_payload)] = first_payload
-    image[22 * block_size:22 * block_size + len(final_payload)] = final_payload
+    if extended_attributes:
+        image[21 * block_size:22 * block_size] = _iso_extended_attribute_record(
+            record_format=1, record_length=16,
+            application_use=b"PIPELINE-FIRST",
+        )
+        image[22 * block_size:23 * block_size] = first_payload
+        image[23 * block_size:24 * block_size] = _iso_extended_attribute_record(
+            record_format=1, record_length=16,
+            application_use=b"PIPELINE-FINAL",
+        )
+        image[24 * block_size:24 * block_size + len(final_payload)] = final_payload
+    else:
+        image[21 * block_size:21 * block_size + len(first_payload)] = first_payload
+        image[22 * block_size:22 * block_size + len(final_payload)] = final_payload
     return bytes(image), assembled
 
 
 def _iso9660_with_nested_file(
     name: bytes, payload: bytes, *, rock_ridge: bool = False,
-    path_tables: bool = False, rock_ridge_continuation: bool = False,
+    path_tables: bool = False, path_table_xar: bool = False,
+    rock_ridge_continuation: bool = False,
     rock_ridge_relocation: bool = False, hard_links: bool = False,
     hard_link_extent_mismatch: bool = False, zisofs: bool = False,
     corrupt_zisofs_data: bool = False,
     oversized_zisofs_block: bool = False,
 ) -> bytes:
     block_size = 2_048
-    image = bytearray(25 * block_size)
+    volume_blocks = 26 if path_table_xar else 25
+    image = bytearray(volume_blocks * block_size)
     pvd_offset = 16 * block_size
     image[pvd_offset] = 1
     image[pvd_offset + 1:pvd_offset + 6] = b"CD001"
     image[pvd_offset + 6] = 1
     image[pvd_offset + 8:pvd_offset + 40] = b"FORENSICKIT".ljust(32, b" ")
     image[pvd_offset + 40:pvd_offset + 72] = b"NESTED_ISO".ljust(32, b" ")
-    image[pvd_offset + 80:pvd_offset + 84] = (25).to_bytes(4, "little")
-    image[pvd_offset + 84:pvd_offset + 88] = (25).to_bytes(4, "big")
+    image[pvd_offset + 80:pvd_offset + 84] = volume_blocks.to_bytes(4, "little")
+    image[pvd_offset + 84:pvd_offset + 88] = volume_blocks.to_bytes(4, "big")
     image[pvd_offset + 120:pvd_offset + 122] = (1).to_bytes(2, "little")
     image[pvd_offset + 122:pvd_offset + 124] = (1).to_bytes(2, "big")
     image[pvd_offset + 124:pvd_offset + 126] = (1).to_bytes(2, "little")
@@ -288,11 +396,17 @@ def _iso9660_with_nested_file(
     if path_tables:
         little_table = (
             _iso_path_table_entry(b"\x00", 20, 1, byte_order="little")
-            + _iso_path_table_entry(b"SUBDIR", 22, 1, byte_order="little")
+            + _iso_path_table_entry(
+                b"SUBDIR", 22, 1, byte_order="little",
+                extended_attribute_blocks=1 if path_table_xar else 0,
+            )
         )
         big_table = (
             _iso_path_table_entry(b"\x00", 20, 1, byte_order="big")
-            + _iso_path_table_entry(b"SUBDIR", 22, 1, byte_order="big")
+            + _iso_path_table_entry(
+                b"SUBDIR", 22, 1, byte_order="big",
+                extended_attribute_blocks=1 if path_table_xar else 0,
+            )
         )
         image[pvd_offset + 132:pvd_offset + 136] = len(little_table).to_bytes(4, "little")
         image[pvd_offset + 136:pvd_offset + 140] = len(big_table).to_bytes(4, "big")
@@ -350,9 +464,13 @@ def _iso9660_with_nested_file(
                 ),
             )
     else:
+        assert not path_table_xar or path_tables
         root_self = root_record
         parent = _iso_directory_record(b"\x01", 20, block_size, flags=0x02)
-        directory = _iso_directory_record(b"SUBDIR", 22, block_size, flags=0x02)
+        directory = _iso_directory_record(
+            b"SUBDIR", 22, block_size, flags=0x02,
+            extended_attribute_blocks=1 if path_table_xar else 0,
+        )
     root = root_self + parent + directory
     image[20 * block_size:20 * block_size + len(root)] = root
     if rock_ridge:
@@ -435,13 +553,28 @@ def _iso9660_with_nested_file(
             ] = continuation_area
     else:
         stored_payload = payload
+        subdirectory_data_block = 23 if path_table_xar else 22
+        payload_block = 24 if path_table_xar else 23
         subdirectory = (
-            _iso_directory_record(b"\x00", 22, block_size, flags=0x02)
+            _iso_directory_record(
+                b"\x00", 22, block_size, flags=0x02,
+                extended_attribute_blocks=1 if path_table_xar else 0,
+            )
             + _iso_directory_record(b"\x01", 20, block_size, flags=0x02)
-            + _iso_directory_record(name, 23, len(payload))
+            + _iso_directory_record(name, payload_block, len(payload))
         )
-    image[22 * block_size:22 * block_size + len(subdirectory)] = subdirectory
-    image[23 * block_size:23 * block_size + len(stored_payload)] = stored_payload
+    if rock_ridge:
+        subdirectory_data_block = 22
+        payload_block = 23
+    elif path_table_xar:
+        image[22 * block_size:23 * block_size] = _iso_extended_attribute_record()
+    image[
+        subdirectory_data_block * block_size:
+        subdirectory_data_block * block_size + len(subdirectory)
+    ] = subdirectory
+    image[
+        payload_block * block_size:payload_block * block_size + len(stored_payload)
+    ] = stored_payload
     if hard_links and hard_link_extent_mismatch:
         mismatch_payload = b"different-hard-link-payload"
         image[24 * block_size:24 * block_size + len(mismatch_payload)] = mismatch_payload
@@ -787,6 +920,315 @@ def test_cpio_odc_regular_file_recurses_with_octal_header_provenance(tmp_path: P
     assert "checksum_valid:None" in recovery.supporting_evidence[0]
 
 
+def test_binary_cpio_regular_file_recurses_with_endian_word_provenance(
+    tmp_path: Path,
+) -> None:
+    payload = b"CTF{binary_cpio_recursive}"
+    evidence = tmp_path / "binary.cpio"
+    evidence.write_bytes(
+        _cpio_binary_member("etc", mode=0o040755, inode=1)
+        + _cpio_binary_member("etc/flag.bin", payload, inode=2)
+        + _cpio_binary_member(
+            "etc/current", b"flag.bin", mode=0o120777, inode=3,
+        )
+        + _cpio_binary_member("../escape", b"blocked", inode=4)
+        + _cpio_binary_member("TRAILER!!!", mode=0, inode=5)
+    )
+
+    result = AnalysisEngine().analyze(
+        evidence, tmp_path / "binary-cpio-cases",
+        mode=AnalysisMode.AUTO, execute=False,
+    )
+
+    assert [item.logical_name for item in result.artifacts] == [
+        "binary.cpio", "etc/flag.bin",
+    ]
+    child = result.artifacts[1]
+    assert child.sha256 == hashlib.sha256(payload).hexdigest()
+    assert any(
+        item.value == "CTF{binary_cpio_recursive}"
+        and item.artifact_id == child.id
+        for item in result.flags
+    )
+    entries = next(
+        item.value for item in result.observations
+        if item.artifact_id == result.artifacts[0].id
+        and item.key == "archive.cpio.entries"
+    )
+    regular = next(item for item in entries if item["name"] == "etc/flag.bin")
+    symlink = next(item for item in entries if item["name"] == "etc/current")
+    assert regular["format"] == "bin"
+    assert regular["binary_byte_order"] == "little"
+    assert regular["binary_long_word_order"] == "high_then_low"
+    assert symlink["symlink_target"] == "flag.bin"
+    assert symlink["symlink_target_safe"] is True
+    assert symlink["symlink_target_validation"] == "valid"
+    assert symlink["symlink_target_raw_sha256"] == hashlib.sha256(
+        b"flag.bin"
+    ).hexdigest()
+    assert any(
+        item.category == "archive_symlink_metadata"
+        for item in result.findings
+    )
+    recovery = next(
+        item for item in result.findings
+        if item.source == "builtin_cpio_extractor"
+    )
+    evidence_line = recovery.supporting_evidence[0]
+    assert "format:bin" in evidence_line
+    assert "binary_byte_order': 'little'" in evidence_line
+    assert f"data_offset:{regular['data_offset']}" in evidence_line
+    assert any("unsafe path" in error for error in result.errors)
+    report = next(
+        (tmp_path / "binary-cpio-cases").glob("*/reports/report.json")
+    ).read_text(encoding="utf-8")
+    assert "binary_16_bit_words" in report
+    assert "archive.cpio.symlinks" in report
+    assert "archive_symlink_metadata" in report
+    assert "CTF{binary_cpio_recursive}" in report
+
+
+def test_binary_cpio_extractor_rejects_changed_header_provenance(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "binary-provenance.cpio"
+    source.write_bytes(
+        _cpio_binary_member("flag.bin", b"content", inode=2)
+        + _cpio_binary_member("TRAILER!!!", mode=0, inode=3)
+    )
+    config = ForensicKitConfig()
+    with CaseWorkspace.create(
+        tmp_path / "binary-provenance-cases",
+        "binary-provenance", config,
+    ) as workspace:
+        root = EvidenceManager(workspace).ingest(source)
+        stored = workspace.resolve_stored_path(root.path)
+        observations = GenericTriageEngine(config.limits).analyze(root, stored)
+        entries = next(
+            item.value for item in observations
+            if item.key == "archive.cpio.entries"
+        )
+        entries[0]["header_raw_hex"] = "00" * 26
+        workspace.database.add_observations(observations)
+
+        extraction = ExtractionManager(
+            workspace, config.limits,
+        ).extract_cpio(root)
+
+        assert extraction.artifacts == []
+        assert any(
+            "header no longer matches triage provenance" in error
+            for error in extraction.errors
+        )
+
+
+def test_concatenated_binary_cpio_archives_recurse_with_archive_lineage(
+    tmp_path: Path,
+) -> None:
+    first = (
+        _cpio_binary_member("first.flag", b"CTF{cpio_concat_first}")
+        + _cpio_binary_member("TRAILER!!!", mode=0, inode=2)
+    )
+    padding_length = 512 - len(first) % 512
+    second = (
+        _cpio_binary_member(
+            "second.flag", b"CTF{cpio_concat_second}",
+            inode=3, byte_order="big",
+        )
+        + _cpio_binary_member(
+            "TRAILER!!!", mode=0, inode=4, byte_order="big",
+        )
+    )
+    evidence = tmp_path / "concatenated-binary.cpio"
+    evidence.write_bytes(first + b"\x00" * padding_length + second)
+
+    result = AnalysisEngine().analyze(
+        evidence, tmp_path / "concatenated-cpio-cases",
+        mode=AnalysisMode.AUTO, execute=False,
+    )
+
+    assert [item.logical_name for item in result.artifacts] == [
+        "concatenated-binary.cpio", "first.flag", "second.flag",
+    ]
+    assert {
+        item.value for item in result.flags
+        if item.artifact_id in {
+            result.artifacts[1].id, result.artifacts[2].id,
+        }
+    } == {"CTF{cpio_concat_first}", "CTF{cpio_concat_second}"}
+    entries = next(
+        item.value for item in result.observations
+        if item.artifact_id == result.artifacts[0].id
+        and item.key == "archive.cpio.entries"
+    )
+    assert [item["archive_index"] for item in entries] == [0, 1]
+    assert [item["binary_byte_order"] for item in entries] == [
+        "little", "big",
+    ]
+    recovery = next(
+        item for item in result.findings
+        if item.source == "builtin_cpio_extractor"
+    )
+    assert "archive_index': 0" in recovery.supporting_evidence[0]
+    assert "archive_index': 1" in recovery.supporting_evidence[1]
+    report = next(
+        (tmp_path / "concatenated-cpio-cases").glob("*/reports/report.json")
+    ).read_text(encoding="utf-8")
+    assert '"archive.cpio.archive_count"' in report
+    assert '"value": 2' in report
+    assert "CTF{cpio_concat_first}" in report
+    assert "CTF{cpio_concat_second}" in report
+
+
+def test_cpio_hard_link_aliases_materialize_only_the_canonical_payload(
+    tmp_path: Path,
+) -> None:
+    payload = b"CTF{cpio_hard_link_canonical}"
+    evidence = tmp_path / "hard-links.cpio"
+    evidence.write_bytes(
+        _cpio_binary_member(
+            "alias.flag", inode=77, link_count=2,
+        )
+        + _cpio_binary_member(
+            "canonical.flag", payload, inode=77, link_count=2,
+        )
+        + _cpio_binary_member("TRAILER!!!", mode=0, inode=3)
+    )
+
+    result = AnalysisEngine().analyze(
+        evidence, tmp_path / "hard-link-cpio-cases",
+        mode=AnalysisMode.AUTO, execute=False,
+    )
+
+    assert [item.logical_name for item in result.artifacts] == [
+        "hard-links.cpio", "canonical.flag",
+    ]
+    assert result.artifacts[1].sha256 == hashlib.sha256(payload).hexdigest()
+    assert any(
+        item.value == "CTF{cpio_hard_link_canonical}"
+        and item.artifact_id == result.artifacts[1].id
+        for item in result.flags
+    )
+    group = next(
+        item.value[0] for item in result.observations
+        if item.artifact_id == result.artifacts[0].id
+        and item.key == "archive.cpio.hard_link_groups"
+    )
+    assert group["complete"] is True
+    assert group["canonical_name"] == "canonical.flag"
+    assert [item["role"] for item in group["members"]] == [
+        "alias", "canonical",
+    ]
+    assert any(
+        item.category == "archive_hard_link_metadata"
+        and item.source == "profile:archive"
+        for item in result.findings
+    )
+    recovery = next(
+        item for item in result.findings
+        if item.source == "builtin_cpio_extractor"
+    )
+    assert "hard_link_role:canonical" in recovery.supporting_evidence[0]
+    assert "host_hard_link_created': False" in str(group)
+    report = next(
+        (tmp_path / "hard-link-cpio-cases").glob("*/reports/report.json")
+    ).read_text(encoding="utf-8")
+    assert "alias.flag" in report
+    assert "canonical.flag" in report
+    assert "CTF{cpio_hard_link_canonical}" in report
+
+    ambiguous = tmp_path / "ambiguous-hard-links.cpio"
+    ambiguous.write_bytes(
+        _cpio_binary_member(
+            "one.flag", b"one", inode=78, link_count=2,
+        )
+        + _cpio_binary_member(
+            "two.flag", b"two", inode=78, link_count=2,
+        )
+        + _cpio_binary_member("TRAILER!!!", mode=0, inode=4)
+    )
+    ambiguous_result = AnalysisEngine().analyze(
+        ambiguous, tmp_path / "ambiguous-hard-link-cpio-cases",
+        mode=AnalysisMode.AUTO, execute=False,
+    )
+    assert [item.logical_name for item in ambiguous_result.artifacts] == [
+        "ambiguous-hard-links.cpio",
+    ]
+    assert any(
+        item.category == "cpio_hard_link_anomaly"
+        for item in ambiguous_result.findings
+    )
+    assert any(
+        "hard-link group no longer matches triage provenance" in error
+        for error in ambiguous_result.errors
+    )
+
+    mixed = tmp_path / "mixed-count-hard-links.cpio"
+    mixed.write_bytes(
+        _cpio_binary_member(
+            "alias.flag", inode=79, link_count=2,
+        )
+        + _cpio_binary_member(
+            "payload.flag", b"must-not-be-extracted", inode=79, link_count=1,
+        )
+        + _cpio_binary_member("TRAILER!!!", mode=0, inode=5)
+    )
+    mixed_result = AnalysisEngine().analyze(
+        mixed, tmp_path / "mixed-count-hard-link-cpio-cases",
+        mode=AnalysisMode.AUTO, execute=False,
+    )
+    assert [item.logical_name for item in mixed_result.artifacts] == [
+        "mixed-count-hard-links.cpio",
+    ]
+    assert any(
+        item.category == "cpio_hard_link_anomaly"
+        for item in mixed_result.findings
+    )
+    assert any(
+        "payload.flag" in error
+        and "hard-link group no longer matches triage provenance" in error
+        for error in mixed_result.errors
+    )
+
+
+def test_cpio_hard_link_extractor_revalidates_alias_headers(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "hard-link-provenance.cpio"
+    source.write_bytes(
+        _cpio_binary_member("alias.bin", inode=80, link_count=2)
+        + _cpio_binary_member(
+            "canonical.bin", b"canonical", inode=80, link_count=2,
+        )
+        + _cpio_binary_member("TRAILER!!!", mode=0, inode=6)
+    )
+    config = ForensicKitConfig()
+    with CaseWorkspace.create(
+        tmp_path / "hard-link-provenance-cases",
+        "hard-link-provenance", config,
+    ) as workspace:
+        root = EvidenceManager(workspace).ingest(source)
+        stored = workspace.resolve_stored_path(root.path)
+        observations = GenericTriageEngine(config.limits).analyze(root, stored)
+        workspace.database.add_observations(observations)
+
+        changed = bytearray(stored.read_bytes())
+        changed[12:14] = (1).to_bytes(2, "little")
+        stored.chmod(0o600)
+        stored.write_bytes(changed)
+
+        extraction = ExtractionManager(
+            workspace, config.limits,
+        ).extract_cpio(root)
+
+        assert extraction.artifacts == []
+        assert any(
+            "hard-link member header no longer matches triage provenance"
+            in error
+            for error in extraction.errors
+        )
+
+
 def test_iso9660_root_file_recurses_with_descriptor_and_extent_lineage(tmp_path: Path) -> None:
     payload = b"CTF{iso9660_recursive_lineage}"
     evidence = tmp_path / "challenge.iso"
@@ -855,6 +1297,104 @@ def test_iso9660_root_file_recurses_with_descriptor_and_extent_lineage(tmp_path:
     assert "CTF{iso9660_recursive_lineage}" in report
 
 
+def test_iso9660_extended_attribute_is_revalidated_before_child_copy(
+    tmp_path: Path,
+) -> None:
+    payload = b"CTF{iso9660_xar_recursive_lineage}"
+    evidence = tmp_path / "extended-attribute.iso"
+    evidence.write_bytes(_iso9660_with_root_file(
+        b"XATTR.TXT;1", payload, extended_attribute=True,
+    ))
+
+    result = AnalysisEngine().analyze(
+        evidence, tmp_path / "extended-attribute-cases",
+        mode=AnalysisMode.AUTO, execute=False,
+    )
+
+    assert [item.logical_name for item in result.artifacts] == [
+        "extended-attribute.iso", "XATTR.TXT",
+    ]
+    child = result.artifacts[1]
+    assert child.size == len(payload)
+    assert child.sha256 == hashlib.sha256(payload).hexdigest()
+    assert any(
+        item.value == "CTF{iso9660_xar_recursive_lineage}"
+        and item.artifact_id == child.id
+        for item in result.flags
+    )
+    records = next(
+        item.value for item in result.observations
+        if item.artifact_id == result.artifacts[0].id
+        and item.key == "archive.iso9660.extended_attributes"
+    )
+    assert len(records) == 1
+    assert records[0]["valid"] is True
+    assert records[0]["offset"] == 21 * 2_048
+    assert records[0]["raw_sha256"] == hashlib.sha256(
+        _iso_extended_attribute_record()
+    ).hexdigest()
+    assert any(
+        item.category == "archive_extended_attribute_metadata"
+        and item.severity == "info"
+        for item in result.findings
+    )
+    recovery = next(
+        item for item in result.findings
+        if item.source == "builtin_iso9660_extractor"
+        and item.category == "archive_extraction"
+    )
+    evidence_line = recovery.supporting_evidence[0]
+    assert "extended_attribute_revalidation:" in evidence_line
+    assert "'offset': 43008" in evidence_line
+    assert hashlib.sha256(_iso_extended_attribute_record()).hexdigest() in evidence_line
+    assert f"data_offset:{22 * 2_048};data_length:{len(payload)}" in evidence_line
+    report = next(
+        (tmp_path / "extended-attribute-cases").glob("*/reports/report.json")
+    ).read_text(encoding="utf-8")
+    assert "archive.iso9660.extended_attributes" in report
+    assert "archive_extended_attribute_metadata" in report
+    assert "CTF{iso9660_xar_recursive_lineage}" in report
+
+
+def test_iso9660_extended_attribute_extractor_rejects_changed_triage_hash(
+    tmp_path: Path,
+) -> None:
+    payload = b"CTF{iso9660_xar_provenance_guard}"
+    source = tmp_path / "extended-attribute-provenance.iso"
+    source.write_bytes(_iso9660_with_root_file(
+        b"XATTR.TXT;1", payload, extended_attribute=True,
+    ))
+    config = ForensicKitConfig()
+    with CaseWorkspace.create(
+        tmp_path / "extended-attribute-provenance-cases",
+        "extended-attribute-provenance", config,
+    ) as workspace:
+        root = EvidenceManager(workspace).ingest(source)
+        stored = workspace.resolve_stored_path(root.path)
+        observations = GenericTriageEngine(config.limits).analyze(root, stored)
+        regular_files = next(
+            item.value for item in observations
+            if item.key == "archive.iso9660.regular_files"
+        )
+        regular_files[0]["iso9660_extended_attribute"]["raw_sha256"] = "0" * 64
+        workspace.database.add_observations(observations)
+
+        result = ExtractionManager(
+            workspace, config.limits,
+        ).extract_iso9660(root)
+
+        assert result.artifacts == []
+        assert any(
+            "extended-attribute raw_sha256 no longer matches triage provenance"
+            in error
+            for error in result.errors
+        )
+        assert any(
+            item.category == "iso9660_extended_attribute_extraction_anomaly"
+            for item in result.findings
+        )
+
+
 def test_iso9660_multi_extent_file_is_assembled_once_with_segment_lineage(
     tmp_path: Path,
 ) -> None:
@@ -914,6 +1454,100 @@ def test_iso9660_multi_extent_file_is_assembled_once_with_segment_lineage(
     ).read_text(encoding="utf-8")
     assert "archive.iso9660.multi_extent_chains" in report
     assert "CTF{iso9660_multi_extent_recursive}" in report
+
+
+def test_iso9660_multi_extent_xars_revalidate_every_section_before_assembly(
+    tmp_path: Path,
+) -> None:
+    final_payload = b"CTF{iso9660_multi_extent_xar_recursive}"
+    image, assembled = _iso9660_with_multi_extent_file(
+        b"XARSPLIT.BIN;1", final_payload, extended_attributes=True,
+    )
+    evidence = tmp_path / "multi-extent-xar.iso"
+    evidence.write_bytes(image)
+
+    result = AnalysisEngine().analyze(
+        evidence, tmp_path / "multi-extent-xar-cases",
+        mode=AnalysisMode.AUTO, execute=False,
+    )
+
+    assert [item.logical_name for item in result.artifacts] == [
+        "multi-extent-xar.iso", "XARSPLIT.BIN",
+    ]
+    child = result.artifacts[1]
+    assert child.size == len(assembled)
+    assert child.sha256 == hashlib.sha256(assembled).hexdigest()
+    assert any(
+        item.value == "CTF{iso9660_multi_extent_xar_recursive}"
+        and item.artifact_id == child.id
+        for item in result.flags
+    )
+    recovery = next(
+        item for item in result.findings
+        if item.source == "builtin_iso9660_extractor"
+        and item.category == "archive_extraction"
+    )
+    evidence_line = recovery.supporting_evidence[0]
+    first_xar_hash = hashlib.sha256(_iso_extended_attribute_record(
+        record_format=1, record_length=16,
+        application_use=b"PIPELINE-FIRST",
+    )).hexdigest()
+    final_xar_hash = hashlib.sha256(_iso_extended_attribute_record(
+        record_format=1, record_length=16,
+        application_use=b"PIPELINE-FINAL",
+    )).hexdigest()
+    assert "extended_attribute_revalidation:" in evidence_line
+    assert first_xar_hash in evidence_line
+    assert final_xar_hash in evidence_line
+    assert "'present_segment_indices': [0, 1]" in evidence_line
+    assert f"'data_offset': {22 * 2_048}" in evidence_line
+    assert f"'data_offset': {24 * 2_048}" in evidence_line
+    report = next(
+        (tmp_path / "multi-extent-xar-cases").glob("*/reports/report.json")
+    ).read_text(encoding="utf-8")
+    assert "multi_extent_extended_attribute_consistency" in report
+    assert first_xar_hash in report
+    assert final_xar_hash in report
+
+
+def test_iso9660_multi_extent_xar_tail_hash_tampering_blocks_assembly(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "multi-extent-xar-provenance.iso"
+    source.write_bytes(_iso9660_with_multi_extent_file(
+        b"XARSPLIT.BIN;1", b"tail", extended_attributes=True,
+    )[0])
+    config = ForensicKitConfig()
+    with CaseWorkspace.create(
+        tmp_path / "multi-extent-xar-provenance-cases",
+        "multi-extent-xar-provenance", config,
+    ) as workspace:
+        root = EvidenceManager(workspace).ingest(source)
+        stored = workspace.resolve_stored_path(root.path)
+        observations = GenericTriageEngine(config.limits).analyze(root, stored)
+        regular_files = next(
+            item.value for item in observations
+            if item.key == "archive.iso9660.regular_files"
+        )
+        regular_files[0]["multi_extent_segments"][1][
+            "iso9660_extended_attribute"
+        ]["raw_sha256"] = "0" * 64
+        workspace.database.add_observations(observations)
+
+        extraction = ExtractionManager(
+            workspace, config.limits,
+        ).extract_iso9660(root)
+
+        assert extraction.artifacts == []
+        assert any(
+            "extended-attribute raw_sha256 no longer matches triage provenance"
+            in error
+            for error in extraction.errors
+        )
+        assert any(
+            item.category == "iso9660_extended_attribute_extraction_anomaly"
+            for item in extraction.findings
+        )
 
 
 def test_iso9660_incomplete_multi_extent_chain_is_never_partially_extracted(
@@ -1014,6 +1648,46 @@ def test_iso9660_nested_file_recurses_with_directory_identity_lineage(tmp_path: 
     assert '"all_entries_reconciled": true' in report
     assert '"raw_sha256"' in report
     assert "CTF{iso9660_nested_recursive_lineage}" in report
+
+
+def test_iso9660_path_table_xar_reconciliation_persists_with_child_lineage(
+    tmp_path: Path,
+) -> None:
+    payload = b"CTF{iso9660_path_table_xar_lineage}"
+    evidence = tmp_path / "path-table-xar.iso"
+    evidence.write_bytes(_iso9660_with_nested_file(
+        b"DEEP.TXT;1", payload, path_tables=True, path_table_xar=True,
+    ))
+
+    result = AnalysisEngine().analyze(
+        evidence, tmp_path / "path-table-xar-cases",
+        mode=AnalysisMode.AUTO, execute=False,
+    )
+
+    assert [item.logical_name for item in result.artifacts] == [
+        "path-table-xar.iso", "SUBDIR/DEEP.TXT",
+    ]
+    assert any(
+        item.value == "CTF{iso9660_path_table_xar_lineage}"
+        and item.artifact_id == result.artifacts[1].id
+        for item in result.flags
+    )
+    reconciliation = next(
+        item.value for item in result.observations
+        if item.artifact_id == result.artifacts[0].id
+        and item.key == "archive.iso9660.path_table_reconciliation"
+    )
+    subdir = reconciliation[1]
+    assert subdir["reconciled"] is True
+    assert subdir["extended_attribute_length_match"] is True
+    assert subdir["directory_extended_attribute_valid"] is True
+    assert isinstance(subdir["directory_extended_attribute_raw_sha256"], str)
+    report = next(
+        (tmp_path / "path-table-xar-cases").glob("*/reports/report.json")
+    ).read_text(encoding="utf-8")
+    assert "directory_extended_attribute_raw_sha256" in report
+    assert subdir["directory_extended_attribute_raw_sha256"] in report
+    assert "CTF{iso9660_path_table_xar_lineage}" in report
 
 
 def test_iso9660_rock_ridge_name_recurses_while_symlink_stays_metadata_only(
@@ -1983,7 +2657,7 @@ def test_volatility_filescan_dumpfiles_generated_child_recurses_to_flag(tmp_path
     )
     executable.chmod(0o755)
     dump = bytearray(128)
-    dump[:4] = b"MDMP"
+    dump[:4] = b"PAGE"
     dump[8:12] = (1).to_bytes(4, "little")
     dump[12:16] = (32).to_bytes(4, "little")
     dump[32:44] = (7).to_bytes(4, "little") + (32).to_bytes(4, "little") + (48).to_bytes(4, "little")
@@ -2011,6 +2685,70 @@ def test_volatility_filescan_dumpfiles_generated_child_recurses_to_flag(tmp_path
     assert any(candidate.value == "CTF{volatility_dumpfiles}" for candidate in result.flags)
 
 
+def test_selected_memory_pid_memmap_dump_recurses_to_common_flag_search(tmp_path: Path) -> None:
+    executable = tmp_path / "vol"
+    executable.write_text(
+        "#!/bin/sh\n"
+        "case \"$*\" in\n"
+        "  *windows.memmap.Memmap*\"--pid 444\"*) printf 'Q1RGe3BpZF9tZW1vcnlfZHVtcH0=' > pid.444.dmp ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    evidence = tmp_path / "physical-memory.raw"
+    evidence.write_bytes(b"PAGE" + b"\x00" * 4092)
+    engine = AnalysisEngine(ForensicKitConfig(memory_pids=[444]))
+    engine.registry = ToolRegistry([
+        ToolDefinition(
+            "volatility3_windows_memmap", (str(executable),), parser="volatility3",
+            generates_files=True,
+            command_templates={
+                "pid_dump": (
+                    "{executable}", "-f", "{evidence}", "windows.memmap.Memmap",
+                    "--pid", "{pid}", "--dump",
+                ),
+            },
+        ),
+    ])
+
+    result = engine.analyze(evidence, tmp_path / "cases", mode=AnalysisMode.DEEP)
+
+    run = next(item for item in result.tool_runs if item.tool == "volatility3_windows_memmap")
+    assert run.command_argv[-3:] == ["--pid", "444", "--dump"]
+    child = next(item for item in result.artifacts if item.logical_name == "pid.444.dmp")
+    assert child.created_by_tool_run_id == run.id
+    candidate = next(item for item in result.flags if item.value == "CTF{pid_memory_dump}")
+    assert candidate.artifact_id == child.id
+    assert any("base64" in location["transform_chain"] for location in candidate.locations)
+
+
+def test_user_minidump_does_not_run_full_system_volatility_plugins(tmp_path: Path) -> None:
+    executable = tmp_path / "vol"
+    executable.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+    executable.chmod(0o755)
+    dump = bytearray(128)
+    dump[:4] = b"MDMP"
+    dump[8:12] = (1).to_bytes(4, "little")
+    dump[12:16] = (32).to_bytes(4, "little")
+    dump[32:44] = (7).to_bytes(4, "little") + (32).to_bytes(4, "little") + (48).to_bytes(4, "little")
+    dump[48:50] = (9).to_bytes(2, "little")
+    dump[68:72] = (2).to_bytes(4, "little")
+    evidence = tmp_path / "user-process.dmp"
+    evidence.write_bytes(dump)
+    engine = AnalysisEngine()
+    engine.registry = ToolRegistry([
+        ToolDefinition(
+            "volatility3_windows_pslist", (str(executable),), parser="volatility3",
+            command_templates={"default": ("{executable}", "-f", "{evidence}", "windows.pslist.PsList")},
+        ),
+    ])
+
+    result = engine.analyze(evidence, tmp_path / "cases", mode=AnalysisMode.DEEP)
+
+    assert not result.tool_runs
+    assert any(item.category == "memory_minidump_scope" for item in result.findings)
+
+
 def test_volatility_process_correlation_is_persisted_and_reported(tmp_path: Path) -> None:
     executable = tmp_path / "vol"
     executable.write_text(
@@ -2025,7 +2763,7 @@ def test_volatility_process_correlation_is_persisted_and_reported(tmp_path: Path
     )
     executable.chmod(0o755)
     dump = bytearray(128)
-    dump[:4] = b"MDMP"
+    dump[:4] = b"PAGE"
     dump[8:12] = (1).to_bytes(4, "little")
     dump[12:16] = (32).to_bytes(4, "little")
     dump[32:44] = (7).to_bytes(4, "little") + (32).to_bytes(4, "little") + (48).to_bytes(4, "little")
@@ -2074,7 +2812,7 @@ def test_evtx_and_memory_process_evidence_requires_pid_plus_path_or_ip(tmp_path:
     event_path.write_bytes(evtx)
 
     dump = bytearray(128)
-    dump[:4] = b"MDMP"
+    dump[:4] = b"PAGE"
     dump[8:12] = (1).to_bytes(4, "little")
     dump[12:16] = (32).to_bytes(4, "little")
     dump[32:44] = (7).to_bytes(4, "little") + (32).to_bytes(4, "little") + (48).to_bytes(4, "little")
@@ -2339,7 +3077,7 @@ def test_volatility_handle_and_dll_path_correlation_is_pid_scoped(tmp_path: Path
     )
     executable.chmod(0o755)
     dump = bytearray(128)
-    dump[:4] = b"MDMP"
+    dump[:4] = b"PAGE"
     dump[8:12] = (1).to_bytes(4, "little")
     dump[12:16] = (32).to_bytes(4, "little")
     dump[32:44] = (7).to_bytes(4, "little") + (32).to_bytes(4, "little") + (48).to_bytes(4, "little")

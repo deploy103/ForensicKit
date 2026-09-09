@@ -32,43 +32,95 @@ class MemoryProfile(BaseProfile):
 
     def analyze(self, context: ProfileContext) -> ProfileResult:
         result = ProfileResult(profile=self.name, matched=True)
-        result.recommendations.append(
-            self.recommendation(
-                "volatility3",
-                (AnalysisMode.AUTO, AnalysisMode.DEEP),
-                "memory classification/signature warrants OS identification and safe enumeration",
-                110,
-            )
+        is_minidump = any(
+            isinstance(value, bool) for value in context.values("memory.minidump_valid")
         )
+        if not is_minidump:
+            result.recommendations.append(
+                self.recommendation(
+                    "volatility3",
+                    (AnalysisMode.AUTO, AnalysisMode.DEEP),
+                    "full-system memory classification/signature warrants OS identification",
+                    110,
+                )
+            )
         parsed_banners = [str(value).lower() for value in context.values("memory.os_banner", "memory.linux_banner") if value]
         is_linux = context.truthy("memory.linux_banner") or any("linux" in value for value in parsed_banners)
-        minidump_system_hint = next(
-            (value for value in context.values("memory.minidump.system_info") if isinstance(value, dict)), {}
-        )
-        minidump_windows_hint = context.truthy("memory.minidump_valid") or (
-            isinstance(minidump_system_hint, dict) and minidump_system_hint.get("platform_id") == 2
-        )
+        is_linux = is_linux and not is_minidump
         is_windows = context.truthy(
             "memory.windows_crash_signature", "memory.hiberfil_signature"
-        ) or minidump_windows_hint or context.number("memory.kdbg_offset") is not None or any("windows" in value for value in parsed_banners)
+        ) or context.number("memory.kdbg_offset") is not None or any("windows" in value for value in parsed_banners)
+        is_windows = is_windows and not is_minidump
+        if is_minidump:
+            result.findings.append(self.finding(
+                context,
+                title="User-mode minidump scope identified",
+                category="memory_minidump_scope",
+                confidence=0.99,
+                explanation=(
+                    "MDMP is a selected user-process dump, not a full-system physical-memory image. "
+                    "Full-system PsList/PsScan/NetScan/FileScan plugins are therefore not run automatically; "
+                    "the bounded native stream parser reports only data actually present in this file."
+                ),
+                evidence=["memory.minidump_valid observation present"],
+                severity="info",
+            ))
         if is_linux:
             result.recommendations.extend([
-                self.recommendation("volatility3_linux_pslist", (AnalysisMode.DEEP,), "Linux banner supports process enumeration", 100),
-                self.recommendation("volatility3_linux_psaux", (AnalysisMode.DEEP,), "Linux banner supports command-line enumeration", 95),
-                self.recommendation("volatility3_linux_sockstat", (AnalysisMode.DEEP,), "Linux banner supports socket enumeration", 90),
+                self.recommendation("volatility3_linux_pslist", (AnalysisMode.AUTO, AnalysisMode.DEEP), "Linux banner supports process enumeration", 100),
+                self.recommendation("volatility3_linux_psaux", (AnalysisMode.AUTO, AnalysisMode.DEEP), "Linux banner supports command-line enumeration", 95),
+                self.recommendation("volatility3_linux_sockstat", (AnalysisMode.AUTO, AnalysisMode.DEEP), "Linux banner supports socket enumeration", 90),
             ])
         elif is_windows:
             result.recommendations.extend([
-                self.recommendation("volatility3_windows_pslist", (AnalysisMode.DEEP,), "Windows/KDBG evidence supports process enumeration", 100),
+                self.recommendation("volatility3_windows_info", (AnalysisMode.AUTO, AnalysisMode.DEEP), "Windows/KDBG evidence supports OS and kernel metadata recovery", 105),
+                self.recommendation("volatility3_windows_pslist", (AnalysisMode.AUTO, AnalysisMode.DEEP), "Windows/KDBG evidence supports process enumeration", 100),
                 self.recommendation("volatility3_windows_psscan", (AnalysisMode.DEEP,), "Windows/KDBG evidence supports scan/list hidden-process comparison", 98),
-                self.recommendation("volatility3_windows_pstree", (AnalysisMode.DEEP,), "Windows/KDBG evidence supports parent-child process reconstruction", 95),
-                self.recommendation("volatility3_windows_cmdline", (AnalysisMode.DEEP,), "Windows/KDBG evidence supports command-line recovery", 90),
-                self.recommendation("volatility3_windows_netscan", (AnalysisMode.DEEP,), "Windows/KDBG evidence supports network socket enumeration", 90),
-                self.recommendation("volatility3_windows_handles", (AnalysisMode.DEEP,), "Windows/KDBG evidence supports process handle inventory", 85),
+                self.recommendation("volatility3_windows_pstree", (AnalysisMode.AUTO, AnalysisMode.DEEP), "Windows/KDBG evidence supports parent-child process reconstruction", 95),
+                self.recommendation("volatility3_windows_cmdline", (AnalysisMode.AUTO, AnalysisMode.DEEP), "Windows/KDBG evidence supports command-line recovery", 90),
+                self.recommendation("volatility3_windows_netscan", (AnalysisMode.AUTO, AnalysisMode.DEEP), "Windows/KDBG evidence supports network socket enumeration", 90),
+                self.recommendation("volatility3_windows_handles", (AnalysisMode.AUTO, AnalysisMode.DEEP), "Windows/KDBG evidence supports process handle inventory", 85),
                 self.recommendation("volatility3_windows_filescan", (AnalysisMode.DEEP,), "Windows/KDBG evidence supports file-object scan inventory", 85),
-                self.recommendation("volatility3_windows_dlllist", (AnalysisMode.DEEP,), "Windows/KDBG evidence supports loaded-module inventory", 84),
+                self.recommendation("volatility3_windows_dlllist", (AnalysisMode.AUTO, AnalysisMode.DEEP), "Windows/KDBG evidence supports loaded-module inventory", 84),
                 self.recommendation("volatility3_windows_malfind", (AnalysisMode.DEEP,), "Windows/KDBG evidence supports suspicious executable-region triage", 80),
             ])
+            requested_pids = []
+            for value in context.values("memory.requested_pids"):
+                if not isinstance(value, list):
+                    continue
+                for pid in value[:16]:
+                    if isinstance(pid, int) and not isinstance(pid, bool) and 0 < pid <= 0xFFFFFFFF and pid not in requested_pids:
+                        requested_pids.append(pid)
+            for pid in requested_pids:
+                result.recommendations.extend([
+                    self.recommendation(
+                        "volatility3_windows_memmap", (AnalysisMode.DEEP,),
+                        f"analyst selected PID {pid} for bounded process-memory extraction",
+                        105, command_mode="pid_dump", parameters={"pid": str(pid)},
+                    ),
+                    self.recommendation(
+                        "volatility3_windows_dlllist", (AnalysisMode.DEEP,),
+                        f"analyst selected PID {pid} for module inventory and dump",
+                        101, command_mode="pid_dump", parameters={"pid": str(pid)},
+                    ),
+                ])
+        volatility_kernel_info = next(
+            (value for value in context.values("memory.volatility.kernel_info") if isinstance(value, dict) and value), None
+        )
+        if volatility_kernel_info:
+            result.findings.append(self.finding(
+                context,
+                title="Volatility recovered Windows OS and kernel metadata",
+                category="memory_kernel_info",
+                confidence=0.9,
+                explanation=(
+                    "The installed Volatility windows.info plugin reported bounded OS/kernel fields. "
+                    "These values depend on successful layer and symbol resolution; the preserved JSON "
+                    "tool output remains the reproducible source."
+                ),
+                evidence=[f"{key}={value}" for key, value in list(volatility_kernel_info.items())[:100]],
+                severity="info",
+            ))
         minidump_valid = next((value for value in context.values("memory.minidump_valid") if isinstance(value, bool)), None)
         if minidump_valid is False:
             result.findings.append(self.finding(
@@ -302,6 +354,90 @@ class MemoryProfile(BaseProfile):
                 confidence=0.78,
                 explanation="PsScan recovered process records whose PID is absent from PsList. This can indicate terminated, hidden, or inconsistent process metadata and requires time/context validation.",
                 evidence=[str(item)[:2_000] for item in scan_only[:50]], severity="low",
+            ))
+        process_by_pid: dict[str, dict[str, object]] = {}
+        for row in pslist_rows:
+            if not isinstance(row, dict):
+                continue
+            pid = self._volatility_value(row, "pid")
+            if pid:
+                process_by_pid[pid] = row
+        expected_parents = {
+            "smss.exe": {"system"},
+            "csrss.exe": {"smss.exe"},
+            "wininit.exe": {"smss.exe"},
+            "winlogon.exe": {"smss.exe"},
+            "services.exe": {"wininit.exe"},
+            "lsass.exe": {"wininit.exe"},
+            "svchost.exe": {"services.exe"},
+        }
+        parent_mismatches: list[dict[str, str]] = []
+        for pid, row in process_by_pid.items():
+            name = (
+                self._volatility_value(row, "name")
+                or self._volatility_value(row, "imagefilename")
+                or self._volatility_value(row, "process")
+            )
+            ppid = self._volatility_value(row, "ppid")
+            if not name or not ppid or name.casefold() not in expected_parents:
+                continue
+            parent = process_by_pid.get(ppid)
+            if parent is None:
+                continue
+            parent_name = (
+                self._volatility_value(parent, "name")
+                or self._volatility_value(parent, "imagefilename")
+                or self._volatility_value(parent, "process")
+            )
+            if parent_name and parent_name.casefold() not in expected_parents[name.casefold()]:
+                parent_mismatches.append({
+                    "pid": pid,
+                    "process": name,
+                    "ppid": ppid,
+                    "observed_parent": parent_name,
+                    "expected_parent_names": ",".join(sorted(expected_parents[name.casefold()])),
+                })
+        if parent_mismatches:
+            result.findings.append(self.finding(
+                context,
+                title="Windows process parent relationship differs from a narrow system-process rule",
+                category="memory_parent_relationship_lead",
+                confidence=0.78,
+                explanation=(
+                    "A PsList PID/PPID relationship for a well-known Windows system process does not "
+                    "match the displayed expected parent-name rule. PID reuse, acquisition timing, and "
+                    "OS-version differences must be checked; this is not a malware verdict."
+                ),
+                evidence=[str(item) for item in parent_mismatches[:50]],
+                severity="low",
+            ))
+        process_path_leads = [
+            row for row in pslist_rows
+            if isinstance(row, dict)
+            and any(
+                str(key).casefold().replace(" ", "") in {
+                    "path", "filepath", "imagepath", "auditimagefilename",
+                }
+                and re.search(
+                    r"(?:\\(?:users|temp|programdata)\\|/tmp/|\bdownloads\b)",
+                    str(value), re.I,
+                )
+                for key, value in row.items()
+            )
+        ]
+        if process_path_leads:
+            result.findings.append(self.finding(
+                context,
+                title="Memory process inventory includes a user-writable image path",
+                category="memory_process_path_lead",
+                confidence=0.76,
+                explanation=(
+                    "A normalized process row contains an image path under a commonly user-writable "
+                    "location. The exact row and plugin output are retained for validation; path alone "
+                    "does not establish malicious execution."
+                ),
+                evidence=[str(item)[:2_000] for item in process_path_leads[:50]],
+                severity="low",
             ))
         volatility_files = next(
             (value for value in context.values("memory.volatility.files") if isinstance(value, list)), []

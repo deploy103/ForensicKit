@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from forensickit.models import AnalysisMode, Artifact, Classification, Observation
+from forensickit.models import (
+    AnalysisMode, Artifact, Classification, Finding, Observation, ToolRun, ToolRunStatus,
+)
 from forensickit.profiles import ProfileEngine, ToolRecommendation, merge_recommendations
 from forensickit.rules import RuleEngine
 from forensickit.triage import GenericTriageEngine
@@ -122,6 +124,61 @@ def test_rule_operators_nested_any_artifact_type_and_profile() -> None:
     assert result.fired_rule_ids == ["operators"]
     assert len(result.fired_rules[0].reasons) == 9
     assert result.recommendations[0].tool == "file"
+
+
+def test_rule_conditions_use_prior_findings_and_tool_results_and_emit_actions() -> None:
+    engine = RuleEngine.from_data({"rules": [{
+        "id": "verify_then_extract",
+        "when": {"all": [
+            {"finding": {"category": "embedded_archive", "minimum_confidence": 0.8}, "exists": True},
+            {"tool_result": {"tool": "binwalk3", "status": "completed", "exit_code": 0}, "exists": True},
+        ]},
+        "emit": {
+            "observations": [{"key": "archive.verified", "value": True, "confidence": 0.95}],
+            "confidence_changes": [{
+                "target": "hypothesis:embedded_archive", "delta": 0.15,
+                "reason": "independent parser confirmation",
+            }],
+            "parser_actions": [{"parser": "sevenzip", "tool": "sevenzip", "priority": 93}],
+            "extractor_actions": [{
+                "extractor": "sevenzip", "tool": "sevenzip", "modes": ["deep"],
+                "command_mode": "extract", "priority": 88,
+            }],
+        },
+    }]})
+    target = artifact("archive")
+    prior_finding = Finding(
+        artifact_id=target.id, title="Embedded archive", category="embedded_archive",
+        severity="medium", confidence=0.9, explanation="signature", source="test",
+    )
+    prior_run = ToolRun(
+        artifact_id=target.id, tool="binwalk3", command_argv=["binwalk3"], timeout=10,
+        status=ToolRunStatus.COMPLETED, exit_code=0,
+    )
+
+    result = engine.evaluate(target, findings=[prior_finding], tool_runs=[prior_run])
+
+    assert not engine.validation_errors
+    assert result.fired_rule_ids == ["verify_then_extract"]
+    assert result.observations[0].key == "archive.verified"
+    assert result.observations[0].source == "rule:verify_then_extract"
+    assert result.confidence_changes[0].delta == 0.15
+    assert {action.kind for action in result.actions} == {"parser", "extractor"}
+    recommendations = {(item.tool, item.command_mode): item for item in result.recommendations}
+    assert recommendations[("sevenzip", "default")].allows(AnalysisMode.AUTO)
+    assert recommendations[("sevenzip", "extract")].allowed_modes == {AnalysisMode.DEEP}
+    assert "prior tool result matched" in recommendations[("sevenzip", "extract")].reason
+
+
+def test_rule_prior_state_exists_false_is_explainable() -> None:
+    engine = RuleEngine.from_data({"rules": [{
+        "id": "fallback",
+        "when": {"tool_result": "sevenzip", "exists": False},
+        "emit": {"recommend": {"deep": ["binwalk3"]}},
+    }]})
+    result = engine.evaluate(artifact())
+    assert result.fired_rule_ids == ["fallback"]
+    assert "is absent" in result.fired_rules[0].reasons[0]
 
 
 def test_malformed_rules_are_isolated_from_valid_rules() -> None:
@@ -698,7 +755,7 @@ def test_disk_profile_preserves_ntfs_usa_and_named_data_attribute_provenance() -
     assert "USA sequence mismatch at sector 2" in anomaly[0].supporting_evidence[0]
 
 
-def test_valid_minidump_metadata_selects_windows_memory_enumeration_plugins() -> None:
+def test_valid_minidump_metadata_does_not_select_full_system_plugins() -> None:
     result = ProfileEngine().evaluate(
         artifact("memory"), [
             observation("memory.minidump_valid", True),
@@ -706,7 +763,63 @@ def test_valid_minidump_metadata_selects_windows_memory_enumeration_plugins() ->
         ],
     )
     recommendations = {item.tool for item in result.recommendations}
-    assert {"volatility3", "volatility3_windows_pslist", "volatility3_windows_cmdline", "volatility3_windows_netscan"} <= recommendations
+    assert not recommendations & {
+        "volatility3", "volatility3_windows_pslist", "volatility3_windows_cmdline",
+        "volatility3_windows_netscan", "volatility3_windows_filescan",
+    }
+    assert any(item.category == "memory_minidump_scope" for item in result.findings)
+
+
+def test_full_windows_memory_has_fast_auto_plugins_and_pid_deep_extractors() -> None:
+    result = ProfileEngine().evaluate(
+        artifact("memory"), [
+            observation("memory.windows_crash_signature", True),
+            observation("memory.requested_pids", [444]),
+        ],
+    )
+    recommendations = {item.tool: item for item in result.recommendations}
+    assert recommendations["volatility3_windows_info"].allows(AnalysisMode.AUTO)
+    assert recommendations["volatility3_windows_pslist"].allows(AnalysisMode.AUTO)
+    assert recommendations["volatility3_windows_pstree"].allows(AnalysisMode.AUTO)
+    assert recommendations["volatility3_windows_cmdline"].allows(AnalysisMode.AUTO)
+    assert not recommendations["volatility3_windows_psscan"].allows(AnalysisMode.AUTO)
+    memmap = recommendations["volatility3_windows_memmap"]
+    assert memmap.command_mode == "pid_dump"
+    assert memmap.parameters == {"pid": "444"}
+
+
+def test_windows_memory_kernel_info_is_exposed_as_cautious_finding() -> None:
+    result = ProfileEngine().evaluate(
+        artifact("memory"), [
+            observation("memory.windows_crash_signature", True),
+            observation("memory.volatility.kernel_info", {
+                "Kernel Base": "0xf80000000000",
+                "NtMajorVersion": "10",
+            }),
+        ],
+    )
+
+    finding = next(item for item in result.findings if item.category == "memory_kernel_info")
+    assert "successful layer and symbol resolution" in finding.explanation
+    assert "NtMajorVersion=10" in finding.supporting_evidence
+
+
+def test_memory_parent_rule_reports_evidence_without_malware_verdict() -> None:
+    result = ProfileEngine().evaluate(
+        artifact("memory"), [
+            observation("memory.windows_crash_signature", True),
+            observation("memory.volatility.pslist", [
+                {"Name": "evilparent.exe", "PID": "333", "PPID": "4"},
+                {"Name": "svchost.exe", "PID": "444", "PPID": "333"},
+            ]),
+        ],
+    )
+    finding = next(
+        item for item in result.findings
+        if item.category == "memory_parent_relationship_lead"
+    )
+    assert "observed_parent" in finding.supporting_evidence[0]
+    assert "not a malware verdict" in finding.explanation
 
 
 def test_windows_profile_pairs_only_adjacent_exact_usn_rename_lineage() -> None:

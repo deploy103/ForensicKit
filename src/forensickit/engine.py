@@ -5,15 +5,20 @@ from concurrent.futures import ThreadPoolExecutor
 from email import policy
 from email.parser import BytesParser
 import ipaddress
+import json
 import ntpath
 import os
 from pathlib import Path
 import re
+import shutil
+from threading import Event
+from typing import Any, Callable
 
+from .browser import inspect_browser_database
 from .config import ForensicKitConfig
 from .evidence import EvidenceManager
 from .extraction import ExtractionManager
-from .flags import FlagHunter
+from .flags import FlagHunter, SearchScanResult
 from .identification import IdentificationEngine
 from .models import AnalysisError, AnalysisMode, AnalysisResult, Finding, Observation
 from .planner import ToolPlanner
@@ -29,8 +34,18 @@ from .workspace import CaseWorkspace
 class AnalysisEngine:
     """Evidence → observation → classification → rule/profile → tool → finding."""
 
-    def __init__(self, config: ForensicKitConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: ForensicKitConfig | None = None,
+        *,
+        progress: Callable[[dict[str, Any]], None] | None = None,
+        cancel_event: Event | None = None,
+    ) -> None:
         self.config = config or ForensicKitConfig()
+        self.progress = progress
+        self.cancel_event = cancel_event or Event()
+        # Validate all advanced regexes before creating a case workspace.
+        self.flag_hunter = self._create_hunter()
         self.registry = ToolRegistry.default(self.config.tool_catalog or default_tool_catalog())
         self.triage = GenericTriageEngine(self.config.limits)
         self.identification = IdentificationEngine()
@@ -74,6 +89,7 @@ class AnalysisEngine:
             execute = mode in {AnalysisMode.AUTO, AnalysisMode.DEEP}
         case_name = input_paths[0].name if len(input_paths) == 1 else "multi-evidence"
         workspace = CaseWorkspace.create(workspace_base, case_name, self.config)
+        self._emit("case_created", status="running", workspace=str(workspace.root))
         try:
             evidence_manager = EvidenceManager(workspace)
             roots = []
@@ -86,9 +102,26 @@ class AnalysisEngine:
             result = AnalysisResult(case=workspace.case, root_artifact=roots[0], artifacts=[*roots])
             extraction = ExtractionManager(workspace, self.config.limits)
             for root in roots:
+                if self.cancel_event.is_set():
+                    self._record_errors(
+                        workspace, result, root.id, ["analysis canceled by analyst"], "analysis_scheduler",
+                    )
+                    break
                 self._analyze_artifact(workspace, result, root, mode, execute, extraction)
-            self._correlate_case_roots(workspace, result)
+            if not self.cancel_event.is_set():
+                self._correlate_case_roots(workspace, result)
+            # Database upserts group equal values while retaining every
+            # provenance-bearing location across roots and extracted children.
+            result.flags = workspace.database.flags()
+            result.search_hits = workspace.database.search_hits()
             ReportGenerator().generate(workspace)
+            self._emit(
+                "case_finished",
+                status="canceled" if self.cancel_event.is_set() else "completed",
+                workspace=str(workspace.root),
+                artifacts=len(result.artifacts),
+                flags=len(result.flags),
+            )
             return result
         finally:
             workspace.close()
@@ -144,8 +177,23 @@ class AnalysisEngine:
         return sources
 
     def _analyze_artifact(self, workspace, result, artifact, mode, execute, extraction) -> None:
+        if self.cancel_event.is_set():
+            return
         path = workspace.resolve_stored_path(artifact.path)
+        self._emit(
+            "artifact_started", status="running", artifact_id=artifact.id,
+            logical_name=artifact.logical_name, depth=artifact.depth,
+        )
         observations = self.triage.analyze(artifact, path)
+        observations.extend(self._inspect_supplied_sqlite_wal(workspace, artifact, path, observations))
+        if self.config.memory_pids:
+            observations.append(Observation(
+                artifact_id=artifact.id,
+                key="memory.requested_pids",
+                value=self.config.memory_pids[:16],
+                source="user_request",
+                confidence=1.0,
+            ))
         workspace.database.add_observations(observations)
         result.observations.extend(observations)
         dns_flags = self._scan_dns_txt_reassembly_flags(artifact, observations)
@@ -161,11 +209,12 @@ class AnalysisEngine:
         workspace.database.add_observations(identified.observations)
         result.observations.extend(identified.observations)
         profile_result, rule_result = self._decide(
-            artifact, [*observations, *identified.observations]
+            workspace, artifact, [*observations, *identified.observations]
         )
-        if profile_result.observations:
-            workspace.database.add_observations(profile_result.observations)
-            result.observations.extend(profile_result.observations)
+        decision_observations = [*profile_result.observations, *rule_result.observations]
+        if decision_observations:
+            workspace.database.add_observations(decision_observations)
+            result.observations.extend(decision_observations)
         self._record_errors(workspace, result, artifact.id, profile_result.errors, "profile_engine")
         self._record_errors(
             workspace, result, artifact.id,
@@ -180,14 +229,27 @@ class AnalysisEngine:
         plans = self._plan_tools(workspace, artifact, recommendations, mode)
         result.plans.extend(plans)
         self._record_plans(workspace, result, artifact.id, plans)
-        if execute:
-            runner = ToolRunner(workspace, self.registry, max_timeout=self.config.limits.per_tool_timeout)
+        self._emit(
+            "artifact_planned", status="running", artifact_id=artifact.id,
+            plans=len(plans), findings=len(findings),
+        )
+        if execute and not self.cancel_event.is_set():
+            runner = ToolRunner(
+                workspace,
+                self.registry,
+                max_timeout=self.config.limits.per_tool_timeout,
+                cancel_event=self.cancel_event,
+                max_memory_bytes=self.config.limits.tool_max_memory_bytes,
+                max_output_file_bytes=self.config.limits.tool_max_output_file_bytes,
+            )
             considered: set[tuple[str, str, tuple[tuple[str, str], ...]]] = set()
             pending = plans
             # Parser observations are placed back into the decision engine. A
             # bounded second generation permits e.g. metadata/parser evidence
             # to recommend a new verifier without an unbounded tool cascade.
             for _generation in range(2):
+                if self.cancel_event.is_set():
+                    break
                 runnable = []
                 for plan in pending:
                     plan_key = (plan.tool, plan.command_mode, tuple(sorted(plan.parameters.items())))
@@ -202,6 +264,11 @@ class AnalysisEngine:
                 # lineage promotion, and child analysis retain stable plan
                 # order for reproducible reports across --jobs values.
                 for plan, execution in executions:
+                    self._emit(
+                        "tool_finished", status=execution.run.status.value,
+                        artifact_id=artifact.id, tool=execution.run.tool,
+                        run_id=execution.run.id, error=execution.run.error,
+                    )
                     result.tool_runs.append(execution.run)
                     result.observations.extend(execution.observations)
                     result.findings.extend(execution.findings)
@@ -211,10 +278,8 @@ class AnalysisEngine:
                             [execution.run.error], f"tool_runner:{execution.run.tool}",
                         )
                     finding_keys.update(self._finding_key(finding) for finding in execution.findings)
-                    output_flags = self._scan_tool_output_flags(workspace, artifact, execution.run)
-                    if output_flags:
-                        workspace.database.add_flags(output_flags)
-                        result.flags.extend(output_flags)
+                    output_matches = self._scan_tool_output_matches(workspace, artifact, execution.run)
+                    self._record_search_result(workspace, result, output_matches)
                     generated = extraction.register_tool_outputs(artifact, execution.run)
                     if generated.findings:
                         workspace.database.add_findings(generated.findings)
@@ -224,18 +289,22 @@ class AnalysisEngine:
                         self._record_errors(workspace, result, artifact.id, generated.errors, "tool_output_registrar")
                     for child in generated.artifacts:
                         result.artifacts.append(child)
-                        self._analyze_artifact(workspace, result, child, mode, execute, extraction)
+                        if not self.cancel_event.is_set():
+                            self._analyze_artifact(workspace, result, child, mode, execute, extraction)
+                if self.cancel_event.is_set():
+                    break
                 parsed_observations = workspace.database.observations(artifact.id)
                 refreshed = self.identification.identify(artifact, parsed_observations)
                 workspace.database.update_artifact_identification(artifact)
                 workspace.database.add_observations(refreshed.observations)
                 result.observations.extend(refreshed.observations)
                 parsed_observations.extend(refreshed.observations)
-                post_profiles, post_rules = self._decide(artifact, parsed_observations)
-                if post_profiles.observations:
-                    workspace.database.add_observations(post_profiles.observations)
-                    result.observations.extend(post_profiles.observations)
-                    parsed_observations.extend(post_profiles.observations)
+                post_profiles, post_rules = self._decide(workspace, artifact, parsed_observations)
+                post_observations = [*post_profiles.observations, *post_rules.observations]
+                if post_observations:
+                    workspace.database.add_observations(post_observations)
+                    result.observations.extend(post_observations)
+                    parsed_observations.extend(post_observations)
                 post_findings = [
                     finding
                     for finding in [*post_profiles.findings, *post_rules.findings]
@@ -258,6 +327,12 @@ class AnalysisEngine:
                 if not new_plans:
                     break
                 pending = new_plans
+        if self.cancel_event.is_set():
+            self._emit(
+                "artifact_finished", status="canceled", artifact_id=artifact.id,
+                logical_name=artifact.logical_name,
+            )
+            return
         metadata_flags = self._scan_jpeg_xmp_flags(artifact, observations)
         if metadata_flags:
             workspace.database.add_flags(metadata_flags)
@@ -266,9 +341,30 @@ class AnalysisEngine:
         if smtp_flags:
             workspace.database.add_flags(smtp_flags)
             result.flags.extend(smtp_flags)
-        flags = FlagHunter(self.config.flag_patterns, self.config.limits.max_string_scan_bytes).scan(path, artifact)
-        workspace.database.add_flags(flags)
-        result.flags.extend(flags)
+        file_matches = self._hunter().scan_all(path, artifact)
+        self._record_search_result(workspace, result, file_matches)
+        summary = Observation(
+            artifact_id=artifact.id,
+            key="search.scan_summary",
+            value={
+                "scanned_bytes": file_matches.scanned_bytes,
+                "truncated": file_matches.truncated,
+                "warnings": file_matches.warnings,
+                "max_scan_bytes": self.config.limits.flag_max_scan_bytes,
+                "chunk_bytes": self.config.limits.flag_scan_chunk_bytes,
+                "max_match_length": self.config.limits.flag_max_match_length,
+                "decode_depth": self.config.limits.flag_decode_depth,
+                "max_decode_artifacts": self.config.limits.flag_max_decode_artifacts,
+                "max_decoded_bytes": self.config.limits.flag_max_decoded_bytes,
+                "scan_timeout_seconds": self.config.limits.flag_scan_timeout,
+                "regex_timeout_seconds": self.config.limits.regex_match_timeout,
+            },
+            source="unified_search",
+        )
+        workspace.database.add_observations([summary])
+        result.observations.append(summary)
+        record_matches = self._scan_parsed_records(workspace, artifact)
+        self._record_search_result(workspace, result, record_matches)
         if self.config.extract and self.config.recursive and mode in {AnalysisMode.AUTO, AnalysisMode.DEEP}:
             extracted = extraction.extract_supported(artifact)
             if extracted.errors:
@@ -282,14 +378,142 @@ class AnalysisEngine:
             if extracted.artifacts:
                 result.artifacts.extend(extracted.artifacts)
                 for child in extracted.artifacts:
-                    self._analyze_artifact(workspace, result, child, mode, execute, extraction)
+                    if not self.cancel_event.is_set():
+                        self._analyze_artifact(workspace, result, child, mode, execute, extraction)
+        self._emit(
+            "artifact_finished",
+            status="canceled" if self.cancel_event.is_set() else "completed",
+            artifact_id=artifact.id, logical_name=artifact.logical_name,
+        )
 
-    def _decide(self, artifact, observations):
+    def _emit(self, event: str, **values: Any) -> None:
+        if self.progress is None:
+            return
+        try:
+            self.progress({"event": event, **values})
+        except Exception:
+            # A presentation callback must never corrupt forensic analysis.
+            return
+
+    def _decide(self, workspace, artifact, observations):
         profile_result = self.profiles.evaluate(artifact, observations)
         rule_result = self.rules.evaluate(
-            artifact, observations, profiles=profile_result.active_profiles
+            artifact,
+            observations,
+            profiles=profile_result.active_profiles,
+            findings=workspace.database.findings(artifact.id),
+            tool_runs=workspace.database.tool_runs(artifact.id),
         )
         return profile_result, rule_result
+
+    def _inspect_supplied_sqlite_wal(
+        self, workspace, artifact, path: Path, observations: list[Observation]
+    ) -> list[Observation]:
+        """Read a selected DB and selected WAL together in an isolated snapshot.
+
+        Sidecars are matched only among already-ingested root evidence by an
+        exact logical filename.  Nothing is inferred or opened from the
+        source directory.  SQLite may create transient shared-memory state in
+        ``cache/``; the immutable evidence copies remain read-only.
+        """
+        if artifact.parent_id is not None or not any(
+            item.key == "sqlite.header_valid" and item.value is True
+            for item in observations
+        ):
+            return []
+        wanted_wal = f"{artifact.logical_name}-wal".casefold()
+        wanted_shm = f"{artifact.logical_name}-shm".casefold()
+        roots = [
+            item for item in workspace.database.artifacts()
+            if item.parent_id is None and item.id != artifact.id
+        ]
+        wal_candidates = [item for item in roots if item.logical_name.casefold() == wanted_wal]
+        if not wal_candidates:
+            return []
+
+        def source_parent(item) -> str:
+            return str(Path(item.source_path).parent).casefold() if item.source_path else ""
+
+        parent = source_parent(artifact)
+        wal = next((item for item in wal_candidates if source_parent(item) == parent), wal_candidates[0])
+        shm = next(
+            (
+                item for item in roots
+                if item.logical_name.casefold() == wanted_shm
+                and (not parent or source_parent(item) == parent)
+            ),
+            None,
+        )
+        wal_path = workspace.resolve_stored_path(wal.path)
+        try:
+            with wal_path.open("rb") as stream:
+                magic = stream.read(4)
+        except OSError as exc:
+            return [Observation(
+                artifact_id=artifact.id, key="browser.wal_errors", value=[str(exc)[:2_000]],
+                source="browser_sqlite_wal_reader", confidence=0.8,
+            )]
+        if magic not in {b"7\x7f\x06\x82", b"7\x7f\x06\x83"}:
+            return [Observation(
+                artifact_id=artifact.id,
+                key="browser.wal_errors",
+                value=["exact-name companion does not have a SQLite WAL signature"],
+                source="browser_sqlite_wal_reader",
+                confidence=0.9,
+            )]
+        snapshot_root = workspace.path("cache", "sqlite", artifact.id)
+        snapshot_root.mkdir(parents=True, exist_ok=True)
+        snapshot = snapshot_root / "database.sqlite"
+        snapshot_wal = snapshot_root / "database.sqlite-wal"
+        try:
+            shutil.copyfile(path, snapshot)
+            shutil.copyfile(wal_path, snapshot_wal)
+            browser = inspect_browser_database(
+                snapshot,
+                immutable=False,
+                wal_applied=True,
+                max_records=min(self.config.limits.max_strings, 2_000),
+            )
+        except OSError as exc:
+            return [Observation(
+                artifact_id=artifact.id, key="browser.wal_errors", value=[str(exc)[:2_000]],
+                source="browser_sqlite_wal_reader", confidence=0.8,
+            )]
+        companions = [{
+            "role": "wal", "artifact_id": wal.id, "logical_name": wal.logical_name,
+            "sha256": wal.sha256,
+        }]
+        if shm is not None:
+            companions.append({
+                "role": "shm", "artifact_id": shm.id, "logical_name": shm.logical_name,
+                "sha256": shm.sha256,
+            })
+        return [
+            Observation(
+                artifact_id=artifact.id, key="browser.wal_companions", value=companions,
+                source="browser_sqlite_wal_reader", confidence=0.99,
+            ),
+            Observation(
+                artifact_id=artifact.id, key="browser.wal_applied", value=browser.family is not None,
+                source="browser_sqlite_wal_reader", confidence=0.96,
+            ),
+            Observation(
+                artifact_id=artifact.id, key="browser.wal_family", value=browser.family,
+                source="browser_sqlite_wal_reader", confidence=0.96,
+            ),
+            Observation(
+                artifact_id=artifact.id, key="browser.wal_records", value=browser.records,
+                source="browser_sqlite_wal_reader", confidence=0.94,
+            ),
+            Observation(
+                artifact_id=artifact.id, key="browser.wal_records_truncated", value=browser.truncated,
+                source="browser_sqlite_wal_reader", confidence=0.94,
+            ),
+            Observation(
+                artifact_id=artifact.id, key="browser.wal_errors", value=browser.errors,
+                source="browser_sqlite_wal_reader", confidence=0.8,
+            ),
+        ]
 
     def _plan_tools(self, workspace, artifact, recommendations, mode):
         """Apply explicit CLI scope filters after evidence-backed planning.
@@ -322,6 +546,10 @@ class AnalysisEngine:
             return []
 
         def invoke(plan):
+            self._emit(
+                "tool_started", status="running", artifact_id=artifact.id,
+                tool=plan.tool,
+            )
             return runner.run(
                 plan.tool,
                 artifact,
@@ -330,7 +558,12 @@ class AnalysisEngine:
                 template_values=plan.parameters,
             )
 
-        workers = min(self.config.limits.jobs, len(plans))
+        worker_limit = self.config.limits.jobs
+        if artifact.artifact_type == "memory" or any(
+            item.artifact_type == "memory" for item in artifact.classifications
+        ):
+            worker_limit = min(worker_limit, self.config.limits.memory_jobs)
+        workers = min(worker_limit, len(plans))
         if workers <= 1:
             return [(plan, invoke(plan)) for plan in plans]
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="forensickit-tool") as pool:
@@ -355,6 +588,7 @@ class AnalysisEngine:
         AnalysisEngine._correlate_windows_process_evidence(workspace, result, artifacts)
         AnalysisEngine._correlate_windows_execution_artifacts(workspace, result, artifacts)
         AnalysisEngine._correlate_windows_registry_execution(workspace, result, artifacts)
+        AnalysisEngine._correlate_windows_cached_paths(workspace, result, artifacts)
         AnalysisEngine._correlate_usn_mft_records(workspace, result, artifacts)
         root_by_file_id = {
             artifact.logical_name.casefold(): artifact
@@ -997,6 +1231,149 @@ class AnalysisEngine:
             result.findings.extend(findings)
 
     @staticmethod
+    def _correlate_windows_cached_paths(workspace, result, artifacts) -> None:
+        """Join exact paths across independently supplied Windows artifacts.
+
+        The match key is only a normalized absolute Windows path.  Timestamps,
+        users, and record order remain context and are never used to claim
+        execution.  Raw source observations remain in the report and each link
+        carries the observation and byte/record locator needed to compare them.
+        """
+        artifact_by_id = {artifact.id: artifact for artifact in artifacts}
+        paths: dict[str, list[dict[str, object]]] = {}
+
+        def add(
+            observation: Observation,
+            kind: str,
+            path_value: object,
+            record: dict[str, object] | None = None,
+        ) -> None:
+            artifact = artifact_by_id.get(observation.artifact_id)
+            canonical = AnalysisEngine._windows_canonical_path(path_value)
+            if artifact is None or canonical is None:
+                return
+            record = record or {}
+            entry = {
+                "artifact_id": artifact.id,
+                "logical_name": artifact.logical_name,
+                "artifact_kind": kind,
+                "path": str(path_value)[:4_096],
+                "source_observation_id": observation.id,
+                "source": observation.source,
+                "record_locator": (
+                    record.get("entry_file_offset")
+                    or record.get("key_file_offset")
+                    or record.get("record_offset")
+                    or record.get("event_record_id")
+                    or record.get("row_id")
+                ),
+                "timestamp": (
+                    record.get("last_modified_time_utc")
+                    or record.get("key_last_write_time_utc")
+                    or record.get("timestamp")
+                    or record.get("visit_time_utc")
+                    or record.get("start_time_utc")
+                ),
+                "timestamp_basis": record.get("timestamp_basis"),
+                "user": record.get("user") or record.get("target_user"),
+                "record_kind": record.get("record_kind") or record.get("kind"),
+            }
+            group = paths.setdefault(canonical, [])
+            identity = (
+                entry["artifact_id"], entry["artifact_kind"],
+                entry["source_observation_id"], entry["record_locator"], entry["path"],
+            )
+            if not any(
+                (
+                    item["artifact_id"], item["artifact_kind"],
+                    item["source_observation_id"], item["record_locator"], item["path"],
+                ) == identity
+                for item in group
+            ):
+                group.append(entry)
+
+        for observation in workspace.database.observations():
+            if observation.artifact_id not in artifact_by_id:
+                continue
+            if observation.key == "lnk.target_path":
+                add(observation, "lnk", observation.value)
+                continue
+            if not isinstance(observation.value, list):
+                continue
+            if observation.key == "registry.amcache.records":
+                for record in observation.value[:4_000]:
+                    if isinstance(record, dict):
+                        add(observation, "amcache", record.get("path"), record)
+            elif observation.key == "registry.shimcache.records":
+                for record in observation.value[:4_000]:
+                    if isinstance(record, dict):
+                        add(observation, "shimcache", record.get("path"), record)
+            elif observation.key in {
+                "windows.event_hunt.normalized_events",
+                "windows.event_timeline.normalized_events",
+            }:
+                for record in observation.value[:5_000]:
+                    if isinstance(record, dict) and (
+                        record.get("category") == "process_creation"
+                        or str(record.get("event_id")) == "4688"
+                    ):
+                        add(observation, "evtx_process", record.get("process_path"), record)
+            elif observation.key in {"browser.records", "browser.wal_records"}:
+                for record in observation.value[:5_000]:
+                    if isinstance(record, dict) and record.get("path"):
+                        add(observation, "browser", record.get("path"), record)
+
+        matched = [
+            (path, entries)
+            for path, entries in paths.items()
+            if len({str(item["artifact_id"]) for item in entries}) >= 2
+            and len({str(item["artifact_kind"]) for item in entries}) >= 2
+        ][:500]
+        if not matched:
+            return
+        additions_by_artifact: dict[str, list[dict[str, object]]] = {}
+        findings: list[Finding] = []
+        for canonical, entries in matched:
+            link = {
+                "canonical_path": canonical,
+                "match_basis": "exact_normalized_absolute_windows_path",
+                "source_count": len(entries),
+                "artifact_count": len({str(item["artifact_id"]) for item in entries}),
+                "sources": entries[:32],
+                "interpretation": "cross-artifact path agreement; not proof of execution",
+            }
+            artifact_ids = sorted({str(item["artifact_id"]) for item in entries})
+            for artifact_id in artifact_ids:
+                additions_by_artifact.setdefault(artifact_id, []).append(link)
+            findings.append(Finding(
+                artifact_id=artifact_ids[0],
+                title=f"Exact path appears in {len(artifact_ids)} Windows evidence artifacts",
+                category="windows_artifact_path_correlation",
+                severity="info",
+                confidence=0.96,
+                explanation=(
+                    "The same normalized absolute Windows path occurs in at least two independently tracked artifact types. "
+                    "Each source observation and record/byte locator is retained for comparison; this agreement does not by itself prove execution or identity."
+                ),
+                source="windows_cached_path_correlator",
+                supporting_evidence=[canonical, *[str(item)[:2_000] for item in entries[:16]]],
+            ))
+        additions = [
+            Observation(
+                artifact_id=artifact_id,
+                key="correlation.windows_exact_path",
+                value=links[:500],
+                source="windows_cached_path_correlator",
+                confidence=0.96,
+            )
+            for artifact_id, links in additions_by_artifact.items()
+        ]
+        workspace.database.add_observations(additions)
+        result.observations.extend(additions)
+        workspace.database.add_findings(findings)
+        result.findings.extend(findings)
+
+    @staticmethod
     def _bounded_pid(value: object) -> int | None:
         if isinstance(value, bool) or value is None:
             return None
@@ -1176,31 +1553,118 @@ class AnalysisEngine:
             workspace.database.add_findings(findings)
             result.findings.extend(findings)
 
-    def _scan_tool_output_flags(self, workspace, artifact, run) -> list:
-        """Apply the same bounded transform-aware flag hunt to raw tool logs."""
-        hunter = FlagHunter(self.config.flag_patterns, self.config.limits.max_string_scan_bytes)
-        candidates = []
+    def _create_hunter(self) -> FlagHunter:
+        limits = self.config.limits
+        return FlagHunter(
+            self.config.flag_patterns,
+            limits.flag_max_scan_bytes,
+            flag_prefixes=self.config.flag_prefixes,
+            exact_strings=self.config.exact_strings,
+            regex_patterns=self.config.regex_patterns,
+            search_terms=self.config.search_terms,
+            chunk_size=limits.flag_scan_chunk_bytes,
+            max_match_length=limits.flag_max_match_length,
+            decode_depth=limits.flag_decode_depth,
+            max_decode_artifacts=limits.flag_max_decode_artifacts,
+            max_decoded_bytes=limits.flag_max_decoded_bytes,
+            scan_timeout=limits.flag_scan_timeout,
+            regex_timeout=limits.regex_match_timeout,
+        )
+
+    def _hunter(self) -> FlagHunter:
+        return self.flag_hunter
+
+    @staticmethod
+    def _record_search_result(workspace, result, matches: SearchScanResult) -> None:
+        if matches.flags:
+            workspace.database.add_flags(matches.flags)
+            result.flags.extend(matches.flags)
+        if matches.hits:
+            workspace.database.add_search_hits(matches.hits)
+            result.search_hits.extend(matches.hits)
+
+    def _scan_tool_output_matches(self, workspace, artifact, run) -> SearchScanResult:
+        """Search tool output while distinguishing stdout from program logs."""
+        hunter = self._hunter()
+        combined = SearchScanResult()
         for label, stored_path in (("stdout", run.stdout_path), ("stderr", run.stderr_path)):
             if not stored_path:
                 continue
             try:
                 path = workspace.resolve_stored_path(stored_path)
-                with path.open("rb") as stream:
-                    raw = stream.read(self.config.limits.max_string_scan_bytes + 1)
             except OSError:
                 continue
-            candidates.extend(hunter.scan_bytes(
-                raw[: self.config.limits.max_string_scan_bytes],
+            partial = hunter.scan_all(
+                path,
                 artifact,
                 source=f"tool_output_flag_hunter:{run.tool}:{run.id}",
                 location_prefix=f"tool run {run.id} {label}",
-                truncated=len(raw) > self.config.limits.max_string_scan_bytes,
-            ))
-        return candidates
+                source_kind=("derived_tool_output" if label == "stdout" else "program_log"),
+                discovered_path=stored_path,
+                include_filename=False,
+            )
+            combined.flags.extend(partial.flags)
+            combined.hits.extend(partial.hits)
+            combined.warnings.extend(partial.warnings)
+            combined.scanned_bytes += partial.scanned_bytes
+            combined.truncated = combined.truncated or partial.truncated
+        combined.flags = FlagHunter._group_flags(combined.flags)
+        combined.hits = FlagHunter._group_hits(combined.hits)
+        return combined
+
+    def _scan_tool_output_flags(self, workspace, artifact, run) -> list:
+        """Backward-compatible flag-only view used by the explicit run CLI."""
+        return self._scan_tool_output_matches(workspace, artifact, run).flags
+
+    def _scan_parsed_records(self, workspace, artifact) -> SearchScanResult:
+        """Search bounded parser/triage records without scanning planner echoes."""
+        hunter = self._hunter()
+        combined = SearchScanResult()
+        consumed = 0
+        excluded_sources = {
+            "tool_planner", "classification_engine", "profile_engine",
+            "rule_engine", "unified_search",
+        }
+        for observation in workspace.database.observations(artifact.id):
+            if (
+                observation.source in excluded_sources
+                or observation.key == "planner.tool_plan"
+                or not isinstance(observation.value, (str, list, dict))
+            ):
+                continue
+            try:
+                payload = (
+                    observation.value.encode("utf-8", errors="replace")
+                    if isinstance(observation.value, str)
+                    else json.dumps(observation.value, ensure_ascii=False).encode("utf-8")
+                )
+            except (TypeError, ValueError):
+                continue
+            remaining = min(4 * 1024 * 1024, self.config.limits.max_string_scan_bytes) - consumed
+            if remaining <= 0:
+                combined.truncated = True
+                combined.warnings.append("parsed-record search byte limit reached")
+                break
+            payload = payload[:remaining]
+            consumed += len(payload)
+            partial = hunter.scan_bytes_all(
+                payload, artifact,
+                source=f"parsed_record_search:{observation.source}",
+                location_prefix=f"observation {observation.id} ({observation.key})",
+                source_kind="parsed_record",
+                discovered_path=artifact.path,
+            )
+            combined.flags.extend(partial.flags)
+            combined.hits.extend(partial.hits)
+            combined.warnings.extend(partial.warnings)
+        combined.scanned_bytes = consumed
+        combined.flags = FlagHunter._group_flags(combined.flags)
+        combined.hits = FlagHunter._group_hits(combined.hits)
+        return combined
 
     def _scan_dns_txt_reassembly_flags(self, artifact, observations) -> list:
         """Hunt flags in bounded, provenance-bearing native DNS reconstructions."""
-        hunter = FlagHunter(self.config.flag_patterns, self.config.limits.max_string_scan_bytes)
+        hunter = self._hunter()
         candidates = []
         for observation in observations:
             if observation.key not in {"pcap.dns.txt_reassemblies", "pcap.dns.label_reassemblies"} or not isinstance(observation.value, list):
@@ -1221,11 +1685,13 @@ class AnalysisEngine:
                     source="dns_txt_fragment_flag_hunter", location_prefix=location,
                 ):
                     candidate.transform_chain = [kind, str(item["transform"]), *candidate.transform_chain]
+                    for occurrence in candidate.locations:
+                        occurrence["transform_chain"] = list(candidate.transform_chain)
                     candidates.append(candidate)
         return candidates
 
     def _scan_printable_pcap_payload_flags(self, artifact, observations) -> list:
-        hunter = FlagHunter(self.config.flag_patterns, self.config.limits.max_string_scan_bytes)
+        hunter = self._hunter()
         candidates = []
         seen_payloads: set[tuple[str, object, str]] = set()
         for observation in observations:
@@ -1245,7 +1711,7 @@ class AnalysisEngine:
 
     def _scan_jpeg_xmp_flags(self, artifact, observations) -> list:
         """Hunt bounded JPEG XMP text with APP1 segment provenance."""
-        hunter = FlagHunter(self.config.flag_patterns, self.config.limits.max_string_scan_bytes)
+        hunter = self._hunter()
         candidates = []
         for observation in observations:
             if observation.key != "jpeg.xmp_packets" or not isinstance(observation.value, list):
@@ -1270,7 +1736,7 @@ class AnalysisEngine:
             return []
         if message.get_content_type() != "multipart/alternative":
             return []
-        hunter = FlagHunter(self.config.flag_patterns, self.config.limits.max_string_scan_bytes)
+        hunter = self._hunter()
         candidates = []
         seen_values: set[str] = set()
         for index, part in enumerate(message.iter_parts()):
@@ -1303,6 +1769,14 @@ class AnalysisEngine:
                     "priority": plan.priority,
                     "available": plan.available,
                     "cost": plan.cost,
+                    "evidence_confidence": plan.evidence_confidence,
+                    "expected_value": plan.expected_value,
+                    "cpu_cost": plan.cpu_cost,
+                    "estimated_ram_bytes": plan.estimated_ram_bytes,
+                    "expected_outputs": plan.expected_outputs,
+                    "supported_platforms": plan.supported_platforms,
+                    "dependency_hints": plan.dependency_hints,
+                    "prerequisites": plan.prerequisites,
                     "command_mode": plan.command_mode,
                     "parameters": plan.parameters,
                     "timeout": plan.timeout,

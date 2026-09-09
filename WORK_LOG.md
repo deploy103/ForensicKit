@@ -1,5 +1,172 @@
 # ForensicKit Work Log
 
+## 2026-09-09 KST
+
+### UDF Allocation Extent Descriptor continuation chains
+
+- Short, long, and extended AD arrays now follow at most 32 Type-3 continuation references and at most 1,024 total descriptors through validated Type-1 partition maps, under an additional 256-AED/8-MiB budget shared by the sampled tree. Every AED retains its exact declared physical range and SHA-256, tag identifier/checksum/CRC/location, full `8 + lengthOfAllocationDescriptors` CRC coverage, previous-AED location, raw descriptor bytes/hash, and source-chain indices.
+- Continuations must be the final AD in each source array. The parser rejects malformed/truncated descriptors, bad previous pointers, repeated locations, data/AED or AED/AED physical overlap, incomplete termination, and extent-count exhaustion. Invalid chains remain reportable metadata and make the sampled UDF tree invalid, so none of their content can be materialized.
+- Directory traversal consumes the same validated flattened chain. Regular-file extraction adds every AED to protected UDF metadata ranges, reruns the complete UDF parser after full evidence hashing, requires exact stored/fresh tree equality, then rereads and revalidates the entire exact AED chain immediately before copying data.
+- Synthetic coverage includes chained root and nested directories; short/long/extended two-AED files containing recorded, recorded, and sparse ranges; Engine extraction/report provenance; exact AED slack mutation rejection; identifier/checksum/CRC/tag-location/previous-pointer/cycle/truncation failures; and the 32-AED bound. Focused UDF tests passed 10/10 and expanded triage/Engine/extraction regressions passed 218/218. The full direct suite reached 432 passes with only the independently present release-version consistency failure (`tests/test_release.py` expects 1.2.0 while the package still declares 1.1.0). `python -m compileall -q src tests scripts`, `git diff --check`, and focused trailing-whitespace checks passed.
+
+## 2026-09-07 21:42 KST
+
+### UDF extended allocation descriptors
+
+- ECMA-167 4/14.14.3 was checked directly: Extended AD `Recorded Length` reserves its upper two bits and describes physical bytes, while `Information Length` may differ because the extent may be transformed. Structural parsing now retains raw/masked recorded length, rejects reserved bits, and validates recorded/unrecorded extent relationships without incorrectly requiring information bytes to be no larger than recorded bytes.
+- Extended recorded extents are extractable only when `Recorded Length == Information Length`; allocated or unallocated sparse extents require zero recorded bytes and emit exactly `Information Length` logical zeros. Physical `Extent Length` remains the range used for partition/metadata/cross-file overlap checks, and `logicalBlocksRecorded` derives only from recorded bytes.
+- A structurally valid `Information Length > Recorded Length` extent remains explicit compression/transform evidence and is skipped rather than copying compressed bytes as file content. Whole-source hash, fresh-tree equality, raw FID/ICB/AD rereads, ordinary output bounds, and all prior alias/metadata collision defenses remain mandatory for safe extended-AD extraction.
+- Synthetic coverage adds an equal-length extended file, an extended recorded-plus-sparse file, and a compressed-length-divergent image that stays UDF-valid but omits only `EXTENDED.BIN` during extraction. Focused UDF tests passed 6/6, expanded focused regressions passed 219/219, and the full direct synthetic suite passed 366/366. `python -m compileall -q src tests scripts` and `git diff --check` passed.
+
+## 2026-09-07 21:29 KST
+
+### UDF sparse and embedded regular files
+
+- Complete short/long AD regular files may now mix recorded-allocated extents, unrecorded-allocated extents, and unrecorded-unallocated extents. Recorded ranges are copied exactly; both unrecorded forms emit bounded logical zeros in descriptor order, while allocated-but-unrecorded physical ranges still participate in metadata and cross-file collision checks.
+- `logicalBlocksRecorded` is required to count only recorded extents, and the summed logical extent coverage must match `informationLength` with less than one final block of allocation slack. An unused trailing descriptor, continuation extent, invalid unallocated location, or incomplete logical range fails closed.
+- Embedded-in-ICB regular files become eligible only when the exact allocation-descriptor bytes equal `informationLength`, `logicalBlocksRecorded` is zero, the full source/ICB/tree invariants still match, and the embedded SHA-256 is rechecked immediately before writing.
+- Synthetic Engine E2E now also recovers `SPARSE.BIN` as one recorded block followed by one logical zero block and `INLINE.TXT` from exact FE bytes. Expanded focused regressions passed 218/218, the UDF module passed 5/5, and the full direct synthetic suite passed 365/365. `python -m compileall -q src tests scripts` and `git diff --check` passed.
+
+## 2026-09-07 21:19 KST
+
+### Immutable UDF regular-file extraction
+
+- Pure UDF containers with a stored valid file-set observation now receive native extraction; ISO/UDF hybrids deliberately keep the existing ISO path. Before selecting any candidate, the extractor verifies the preserved evidence size and full SHA-256, reruns the complete bounded UDF parser, and requires the fresh FSD/directory tree to equal the stored observation exactly.
+- Only unique, active, non-metadata regular FIDs with safe validated component lineage, non-record-oriented FE/EFE metadata, and complete recorded-allocated short/long Type-1 extents are eligible. ICB aliases, cross-file extent overlap, transformed/multiversion/stream flags, sparse/embedded/extended layouts, and ranges intersecting any VRS/anchor/VDS/integrity/FSD/ICB/directory metadata allocation are suppressed.
+- Immediately before each copy, every possibly split FID source segment is reread and rehashed, the exact child ICB block hash is compared, and its EA-relative allocation-descriptor bytes must still match. Only `informationLength` bytes—not final allocation slack—are streamed from the exact ordered source ranges under ordinary artifact/depth/single/cumulative size budgets.
+- The extraction finding retains the original file-set observation ID/key, directory/FID indices, raw FID segments, ICB and AD hashes, and exact data ranges. Engine E2E now recovers both root `README.TXT` and `SUBDIR/NESTED.TXT` while preserving their UDF logical names; a separate test mutates only a data extent after triage and proves full-source hash rejection. Expanded focused regressions passed 218/218, the UDF module passed 5/5, and the full direct synthetic suite passed 365/365. `python -m compileall -q src tests scripts` and `git diff --check` passed.
+
+## 2026-09-07 21:04 KST
+
+### Bounded UDF directory-tree traversal
+
+- The root directory reader is now a shared Type-1 directory parser used breadth-first for at most 32 exact directory ICBs. It carries validated component-only CS0 lineage, local and global FID indices, parent directory indices, and each directory's expected parent ICB without fabricating paths from unsampled metadata.
+- Directory information reads share one 8-MiB and 4,096-FID budget across the complete sampled tree. Recorded short/long extents are range/alignment/block-count checked, and distinct directory ICBs cannot reuse overlapping physical directory allocations. Each nested directory independently requires its parent FID to be first, unique, non-deleted, directory-typed, and addressed to the exact containing ICB.
+- Directory ICBs are visited once. A self-reference is rejected during local child inventory, while ancestor cycles or multiple directory parents are rejected by the global ICB set; ambiguous multiple FID references never choose a traversal name. Deleted FIDs with cleared zero ICBs retain validated descriptor framing but are explicitly not followed.
+- Synthetic coverage now proves root → `SUBDIR` → `NESTED.TXT` metadata, exact nested physical/ICB provenance, zero-ICB deleted-FID isolation, bad nested parent rejection, root-cycle rejection, and a deliberately reduced global FID budget. Focused UDF tests passed 4/4, focused triage/Engine/UDF regressions passed 203/203, and the full direct synthetic suite passed 364/364. `python -m compileall -q src tests scripts` and `git diff --check` passed.
+
+## 2026-09-07 20:50 KST
+
+### UDF root-child ICB and allocation metadata
+
+- Every active, non-parent, non-deleted root FID with a one-block Type-1-resolved ICB address now causes one exact FE/EFE block reread. Repeated FID addresses are grouped as aliases rather than reread, while a child reference back to the root ICB is rejected as a cycle.
+- Child FE/EFE validation requires identifier/tag checksum/CRC/location, exact fixed-plus-EA-plus-AD CRC coverage, strategy type 4, one direct entry, known file type, nonzero link count, bounded permission/record fields, and EFE reserved/object-size relationships. Each FID directory bit must agree independently with the resolved ICB file type, and sampled aliases cannot exceed the declared link count.
+- Short, long, and extended child allocation descriptors are framed under the shared 1,024-record cap with partition-relative address resolution, physical overlap checks, information-length coverage, and `logicalBlocksRecorded` comparison. Unallocated extents remain logical metadata, allocation-extent continuation chains fail closed, and embedded-in-ICB payloads retain only exact length/SHA-256 without interpreting or materializing their content.
+- Synthetic coverage now includes regular FE and EFE children, all four allocation descriptor representations, a child-body CRC mutation, and a valid-tag FID/directory-file-type mismatch. Focused UDF tests passed 4/4, focused triage/Engine/UDF regressions passed 203/203, and the full direct synthetic suite passed 364/364. `python -m compileall -q src tests scripts` and `git diff --check` passed.
+
+## 2026-09-07 20:34 KST
+
+### UDF root directory allocation and FID inventory
+
+- Validated root FE/EFE short and long allocation-descriptor arrays are now framed separately and resolved only through existing Type-1 partition provenance. Recorded/allocated extents must remain evidence/partition bounded, non-overlapping, block-aligned except for a possible final extent, consistent with `informationLength`/`logicalBlocksRecorded`, and within an 8-MiB/1,024-AD cap.
+- Exact root-directory information bytes are assembled without reading allocation slack. Each File Identifier Descriptor is bounded to one logical block and 4,096 total entries, retains its possibly split physical source segments and SHA-256, and requires identifier `0x0101`, exact starting logical-block location, tag checksum/CRC, full aligned-record CRC coverage, version/flag framing, aligned implementation use, zero 4-byte padding, and a resolvable Type-1 ICB address.
+- OSTA CS0 compression IDs 8 and 16 are decoded strictly for non-parent file identifiers and kept component-safe. The root must begin with exactly one non-deleted directory-parent FID with an empty on-disc name and the same length/block/partition ICB address as the FSD root pointer. Active child ICBs remain address-only metadata and no directory or file payload is followed.
+- Synthetic coverage validates both short and long root AD forms, the root parent and `README.TXT` records, exact source offsets, report persistence, and rejection of body-CRC corruption, a validly checksummed wrong tag location, nonzero padding, unsafe CS0 names, and a mismatched root-parent ICB. Focused UDF tests passed 4/4, focused triage/Engine/UDF regressions passed 203/203, and the full direct synthetic suite passed 364/364. `python -m compileall -q src tests scripts` and `git diff --check` passed.
+
+## 2026-09-07 20:16 KST
+
+### UDF file-set and root ICB provenance
+
+- The active highest-sequence LVD now resolves its file-set `long_ad` only through a validated Type-1 partition map whose volume-sequence and latest matching partition descriptor agree. Partition-relative logical blocks, physical offsets, lengths, and evidence/partition bounds are retained explicitly; Type-2 translation is never guessed.
+- The exact File Set Descriptor block is reread and requires identifier `0x0100`, a valid tag checksum/CRC/location, full 496-byte CRC coverage, zero reserved tail, valid OSTA character sets/dstrings/domain identifier, and a one-block root-directory ICB address. Unsupported file-set chains and stream directories remain visible validation errors.
+- The resolved root ICB is independently read as a File Entry (`0x0105`) or Extended File Entry (`0x010a`). Variable CRC coverage must exactly include its fixed fields, extended attributes, and allocation descriptors; strategy type 4, one direct entry, directory file type, reserved fields, information size, block count, and raw allocation-descriptor hashes are preserved without traversing directory data.
+- Synthetic corruption coverage rejects an otherwise CRC-valid FSD mutation and a validly tagged regular-file root ICB. Focused UDF tests passed 4/4, focused triage/Engine/UDF regressions passed 203/203, and the full direct synthetic suite passed 364/364. `python -m compileall -q src tests scripts` and `git diff --check` passed.
+
+## 2026-09-07 20:00 KST
+
+### UDF recognition, anchor, and volume descriptors
+
+- Added `src/forensickit/udf.py` and `tests/test_udf.py`; changed `src/forensickit/triage.py`, `src/forensickit/identification.py`, `src/forensickit/profiles/archive.py`, `scripts/run_direct_tests.py`, and the capability/state documents.
+- Pure UDF images are recognized only from a fixed-sector bounded BEA01 → NSR02/NSR03 sequence, while missing/malformed TEA01 remains a detected structural anomaly rather than silently falling back to unknown data. ISO 9660/UDF hybrids retain ISO as the primary format and receive parallel UDF observations without overwriting container identity.
+- Anchor candidates are checked at logical sector 256 and the two trailing standard positions for 512/1,024/2,048/4,096-byte block candidates. Descriptor tag version/reserved/location/checksum/CRC, exact 496-byte anchor CRC coverage, zero reserved bytes, non-overlapping bounded main/reserve VDS extents, raw hashes, and every rejected candidate remain provenance; a valid sector-256 anchor is preferred deterministically.
+- Main and reserve VDS copies are read independently under 8-MiB/256-descriptor caps. PVD, partition, LVD, implementation-use, unallocated-space, and terminating tag framing preserve exact sectors/ranges/body hashes; fixed and variable descriptor CRC coverage is enforced so a valid short-prefix CRC cannot authenticate unverified tail bytes. Partition extents, OSTA CS0 dstrings, UDF entity IDs, logical block sizes, Type-1/Type-2 map framing, LVD file-set long address, and integrity-sequence extent are range/relationship checked.
+- Copy comparison excludes location-bearing tags but requires identical ordered descriptor-body hashes and equivalent PVD/partition/LVD semantics. Divergence or any invalid tag emits a dedicated medium-severity UDF finding; a fully consistent pair emits informational metadata only and does not yet traverse files.
+- Synthetic coverage proves valid NSR03/PVD/PD/LVD/TD main and reserve copies, exact tag checksum and CRC fields, rejection of a body CRC mutation, bad tag checksum, intentionally shortened CRC coverage, semantic reserve divergence, partial VRS recognition, Engine/report persistence, and ISO/UDF hybrid coexistence. Focused triage/Engine/UDF regressions passed: 203 passed, 0 failed. The full direct synthetic suite passed: 364 passed, 0 failed. `python -m compileall -q src tests scripts` and `git diff --check` passed.
+
+### Next
+
+- Resolve the validated LVD file-set `long_ad` through a Type-1 partition map, validate the FSD descriptor and root-directory ICB address with immutable range/tag provenance, and stop before directory traversal.
+
+## 2026-09-07 19:24 KST
+
+### CPIO link reconciliation and bounded link-target metadata
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/extraction.py`, `src/forensickit/profiles/archive.py`, `tests/test_triage.py`, and `tests/test_engine_pipeline.py`.
+- Regular-file records are grouped only within one concatenated archive by legacy device/inode or newc device-major/device-minor/inode. A group reconciles only when every sampled member has one consistent link count and inode metadata set, the observed count does not exceed the declaration, and exactly one member carries data. That member alone is canonical; empty aliases remain report metadata, partial but unambiguous groups stay explicitly partial, and inconsistent/multiple-payload groups make every member ambiguous and extraction-ineligible.
+- The extractor gates every grouped record by its group ID rather than trusting an individual link count. Before copying a canonical payload it recomputes group semantics, checks every role/canonical/eligibility field, and rereads every alias and canonical raw header. A changed member header or any mixed `{1, 2}` link-count group yields no child. Host hard links are never created.
+- CPIO symlink payloads of at most 4 KiB inside the global scan range now retain exact offset/length/raw bytes/SHA-256, strict UTF-8 target text, and relative-path safety. Absolute, drive-rooted, and parent-traversing targets receive a dedicated finding, while every symlink remains metadata-only and is never followed or materialized.
+- Replaced whole-remaining-range reads after every trailer with fixed 4-KiB zero scans followed by an exact six-byte header probe. A 128-segment regression bounds cumulative reads per segment and prevents quadratic behavior while preserving strict no-resynchronization semantics.
+- Synthetic triage covers complete/partial canonical groups, multiple payloads, mixed link counts, unsafe symlink targets, and the fixed per-segment padding-read bound. AUTO E2E proves one canonical child/flag with no alias child or host link, suppresses ambiguous and mixed-count groups, preserves safe symlink metadata in reports, and rejects an immutable alias-header mutation. Focused triage/Engine regressions passed: 199 passed, 0 failed. The full direct synthetic suite passed: 360 passed, 0 failed; after the final fixed-header-length guard, the Engine module passed again: 75 passed, 0 failed. `python -m compileall -q src tests scripts` and `git diff --check` passed.
+
+### Next
+
+- No unblocked post-v1.1 queue item remains; perform a fresh capability/limitation review before selecting the next bounded native feature.
+
+## 2026-09-07 18:59 KST
+
+### Concatenated CPIO archive traversal
+
+- Changed `src/forensickit/triage.py`, `tests/test_triage.py`, and `tests/test_engine_pipeline.py`.
+- A valid zero-length `TRAILER!!!` now closes one bounded archive segment. Parsing may continue only through zero bytes to an aligned recognized binary/odc/newc/CRC header within the global scan bound; any other nonzero byte is a terminal structural error, so the parser never scans forward to a later plausible magic after corruption.
+- Entries retain archive index/start and per-archive entry index. New observations retain every trailer and segment, per-segment format/byte order/count/range, exact inter-archive padding length, next archive offset, and total complete archive count. Format/byte-order consistency is enforced within each archive while independently valid concatenated archives may use different encodings. Trailer records count against the 4,096-record bound, preventing an empty-archive resource bypass.
+- Synthetic triage proves binary→newc continuation through exact zero padding and rejects a corrupt separator without discovering the later archive. AUTO E2E proves little- then big-endian binary archives produce two independently attributed recursive flag children and preserve both archive indexes in extraction/report evidence. Focused triage/Engine regressions passed: 195 passed, 0 failed. `python -m compileall -q src tests scripts` and `git diff --check` passed.
+
+### Next
+
+- Group regular CPIO records by archive/device/inode with declared link-count consistency, select only an unambiguous data-bearing canonical member, and retain aliases as metadata without creating host links.
+
+## 2026-09-07 18:51 KST
+
+### Binary CPIO parsing and extraction
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/extraction.py`, `src/forensickit/profiles/archive.py`, `tests/test_triage.py`, and `tests/test_engine_pipeline.py`.
+- Native identification now recognizes canonical big-endian `71 c7` and byte-swapped little-endian `c7 71` binary CPIO magic. The bounded walker decodes the 26-byte header as 13 endian-specific 16-bit words, preserves the high-word/low-word composition of 32-bit mtime and file size, detects mixed byte order, and retains raw header/magic, device/inode/mode/owner/link/rdevice, pathname, two-byte padding, and exact data-range provenance.
+- The existing CPIO extractor now accepts `bin` members only with a valid declared byte order, exact 26-byte/raw-header agreement, canonical decoded magic, matching metadata/name/size fields, a safe path, and an evidence-bounded range. Directories, symlinks, special files, and traversal paths remain metadata-only. Normal children still enter recursive identification and FlagHunter analysis.
+- Synthetic triage covers big- and little-endian archives plus a mixed-endian structural anomaly. AUTO E2E proves a little-endian regular file becomes the only child while directory/symlink/unsafe members remain unmaterialized, with endian/word provenance in the report. A direct extractor test mutates the observed raw header and confirms no child is registered. Focused triage/Engine regressions passed: 193 passed, 0 failed. `python -m compileall -q src tests scripts` and `git diff --check` passed.
+
+### Next
+
+- Continue after a valid `TRAILER!!!` only across bounded zero padding into another recognized CPIO header, retaining archive-member indexes and never resynchronizing after malformed bytes.
+
+## 2026-09-07 18:39 KST
+
+### ISO path-table extended-attribute reconciliation
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/profiles/archive.py`, `tests/test_triage.py`, and `tests/test_engine_pipeline.py`.
+- Every primary/Joliet path-table entry now retains its computed XAR offset/length/end, following directory-data offset, and evidence/declared-volume range verdict. Mandatory and optional table-copy comparison already includes the XAR block count; a consistent mandatory pair is now reconciled to the sampled active directory only when extent, identifier, XAR length, and data start all match exactly.
+- After bounded directory XAR parsing, reconciliation is enriched with the exact XAR validation verdict and raw hash. A nonzero path-table XAR declaration must point to the same valid range described by its unique directory record; path tables remain corroborating evidence and never override the active tree. The profile now names XAR/data-start disagreement as a path-table anomaly.
+- Synthetic primary-table coverage proves a shared, cache-read directory XAR reconciles across both endian copies and that two mutually consistent tables with an XAR length different from the active directory are still rejected as unreconciled. AUTO E2E proves the validated path-table/XAR hash survives into `report.json` while the nested file remains recursively extractable. Focused triage regression passed: 120 passed, 0 failed. Focused Engine regression passed: 70 passed, 0 failed. `python -m compileall -q src tests` and `git diff --check` passed.
+
+### Next
+
+- Implement portable bounded binary CPIO parsing with byte-order detection, strict framing/alignment, safe member typing, and recursive regular-file extraction.
+
+## 2026-09-07 18:29 KST
+
+### ISO 9660 multi-extent extended-attribute consistency
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/extraction.py`, `src/forensickit/profiles/archive.py`, `tests/test_triage.py`, and `tests/test_engine_pipeline.py`.
+- Every nonzero XAR length in an adjacent multi-extent chain is now parsed independently under the existing per-namespace count/byte bounds and copied into ordered segment provenance. ECMA-119 7.4.6/10.6 reconciliation requires record format and record attributes to agree across present file-section XARs, fixed-record length to agree for format 1, and an eligible XAR on every section whenever record metadata is assigned. Opaque system/application bytes may differ and keep independent range/hash provenance.
+- Multi-extent assembly now also enforces the directory-record consistency bits and identifier padding required across records. A complete byte-range chain remains structurally distinguishable from a chain made extraction-ineligible by XAR inconsistency. Primary/Joliet alias suppression is preserved, and Rock Ridge hard-link identity uses the complete ordered XAR sequence rather than only the leader's record.
+- The extractor rereads and structurally validates every section XAR, recalculates the cross-section values, checks them against triage, and only then concatenates data ranges. Synthetic triage covers two valid but byte-distinct XARs plus record-attribute/fixed-length disagreement. AUTO E2E proves two XAR-prefixed sections produce one recursively scanned child, while a direct second-section hash mutation produces no child and an extraction anomaly. The first focused pass exposed four ordering/provenance regressions (Joliet alias state, incomplete-chain error classification, and missing segment path/type provenance); all were corrected. Focused triage/Engine regressions passed: 188 passed, 0 failed. The full direct synthetic suite passed: 349 passed, 0 failed. `python -m compileall -q src tests scripts` and `git diff --check` passed.
+
+### Next
+
+- Reconcile path-table extended-attribute lengths with their sampled active directory records and validate that each referenced directory XAR/data start is represented consistently without treating path tables as authoritative.
+
+## 2026-09-07 14:58 KST
+
+### ISO 9660 extended-attribute records
+
+- Changed `src/forensickit/triage.py`, `src/forensickit/extraction.py`, `src/forensickit/profiles/archive.py`, `tests/test_triage.py`, and `tests/test_engine_pipeline.py`.
+- Nonzero directory-record extended-attribute block counts now drive bounded ECMA-119 XAR reads from the start of the declared extent, independently capped at 8 MiB and 4,096 records per primary/Joliet namespace. The parser retains the exact range/hash/preview, both-endian owner/group/record/application lengths, permissions, four normalized or explicitly unspecified timestamps, record format/attributes/length, system identifier/use, version, reserved bytes, application-use hash/preview, escape bytes, padding, cache/read metrics, and the exact following file-data offset.
+- Validation rejects bad extent/data relationships, malformed both-endian fields, owner/group zero mismatch, mandatory permission bits, invalid dates, reserved record formats/attributes, inconsistent record lengths, wrong version/reserved/padding bytes, variable fields outside assigned blocks, and disagreement with the directory record's record/protection flags. Invalid or over-budget XARs make affected regular files metadata-only. Single-extent valid records can gate ordinary or zisofs copying; multi-extent XAR consistency remains intentionally unsupported. PX hard-link reconciliation also requires identical XAR semantic hashes rather than treating a shared data range alone as identity.
+- Before copying, the extractor rereads the full XAR, independently recomputes its structural verdict and hash, and compares all extraction-critical derived values to triage provenance. Synthetic triage covers exact valid fields/ranges/hashes and a corrupt reserved byte; AUTO E2E proves the following data extent yields one recursively scanned flag child with XAR revalidation evidence. A direct extractor test mutates the stored triage hash and confirms copying is blocked with no child. Focused triage/Engine regressions passed: 185 passed, 0 failed. The full direct synthetic suite passed: 346 passed, 0 failed. `python -m compileall -q src tests scripts` and `git diff --check` passed.
+
+### Next
+
+- Validate extended-attribute consistency across every section of an ISO 9660 multi-extent file before permitting ordered assembly.
+
 ## 2026-09-07 14:19 KST
 
 ### Bounded zisofs block decompression
@@ -2912,3 +3079,80 @@
 - Changed `src/forensickit/triage.py`, `src/forensickit/engine.py`, and `tests/test_engine_pipeline.py`.
 - Manifest.db fixed-column read-only inventory now keeps up to 1,000 exact file-ID/domain/relative-path references (with an explicit truncation observation). Case correlation prefers this inventory over the 200-row UI summary, preserving deduplicated supplied payload roots rather than creating misleading duplicate children.
 - Verified compileall and an iOS backup E2E in which the only supplied payload matches the 201st Manifest `Files` row.
+
+### Offline analysis P0/P1 completion pass (2026-09-08)
+
+- Added chunked unified flag/exact/keyword/explicit-regex search across immutable evidence, recursive children, parsed records, tool output, UTF-8/ASCII/UTF-16LE/BE, and bounded repeated decoding. Equal candidates are grouped case-wide while every source location and non-original decoded offset is preserved.
+- Extended full-system Volatility planning with PsTree/CmdLine/network/handles/DLL, deep PsScan/FileScan/Malfind, selected-PID Memmap/DLL dumps, and the existing FileScan physical-object→DumpFiles→recursive search path. MDMP user minidumps are kept out of incompatible full-image plans.
+- Added bounded Automatic/Custom Destinations Jump List parsing, CFB/FAT/DIFAT/miniFAT validation, DestList provenance, embedded LNK extraction, and recursive flag analysis.
+- Added fixed read-only Chromium/Firefox/Safari SQLite normalization and exact supplied-WAL snapshot handling. Raw timestamp values/epochs, browser and Jump List rows now reach the common search and report timeline.
+- Added progress events, first/second SIGINT graceful cancellation behavior, `canceled` tool-run state, Linux per-process address-space/per-file output limits, and a separate memory-tool concurrency cap.
+- Validation: `compileall` and `git diff --check` passed; focused changed-flow regression passed 104/104; full direct synthetic regression passed 386/386. Doctor passed all required checks. Volatility, symbols, Textual, and many optional tools are absent on this development machine and were reported rather than hidden. Kernel network namespaces and `strace` are unavailable, so network isolation could not be enforced externally; a representative local CLI E2E passed and a source audit found only offline URL-decoding imports, not network clients.
+
+## 2026-09-09 — Windows semantic caches and active TUI continuation
+
+### Implemented
+
+- Added a bounded Registry cell reader that follows only fixed Amcache and AppCompatCache paths, validates allocated NK/list/VK/data cells, caps nodes/value bytes/records, and retains key/value/data/entry offsets.
+- Normalized modern Amcache application/file/program records plus older fixed `File` branches. Added 00ts/10ts Shimcache parsing with raw FILETIME/checksum/layout provenance and explicit unsupported-layout output.
+- Fed both record families through parsed-record FlagHunter search and the JSON/CSV timeline, and added an exact normalized full-path case correlator across Amcache, Shimcache, LNK, EVTX process, and browser records.
+- Added a UI-independent threaded `AnalysisSession` with bounded progress events, cooperative cancellation, terminal failure state, and whole-request retry into a new immutable case.
+- Replaced the read-only viewer flow with active Textual inputs and Quick/Automatic/Deep/Plan execution, progressive case refresh, cancel/retry, required result tabs, next-analysis plans, filters, display-timezone conversion, candidate copy, reproducible argv details, and explicit child-artifact saving.
+
+### Verification
+
+- New Registry fixtures cover modern Amcache, valid 10ts Shimcache, unsupported layouts, parsed-record flag discovery, report timeline provenance, and cross-hive exact-path correlation.
+- New session fixtures exercise a real engine/result, cooperative cancellation, first-attempt failure, and successful retry. Focused direct regression passed 10/10; the final full direct suite passed 393/393 after `git diff --check` and compileall succeeded.
+- Installed Textual 8.2.0 only into `/tmp/forensickit-textual.bLCYxG` and used its headless pilot to click Analyze, wait for the asynchronous real-engine result, populate the flag table, and reapply filters with `Asia/Seoul`. The repository retains no online/runtime dependency beyond the existing offline `tui` extra.
+
+### Remaining
+
+- Real staged Volatility plugin/image validation and a matching Ubuntu/Kali network-isolated bundle E2E remain environment-dependent gates.
+- Retry is currently whole-request/new-case retry; individual failed-tool restart and resumable parser checkpoints remain future work.
+
+### Offline bundle v2 audit
+
+- Added a standard-library component manifest builder and validator. It inventories source/wheel/deb/rule/catalog payloads and optionally requires a reviewed component description covering every regular file in a prepared tool/symbol tree.
+- Prepared trees reject symbolic links, special files, unsafe paths, and uncovered files before archiving. Component records retain version, license or Debian copyright reference, supported OS/architecture, byte size/count, and file/tree/archive SHA-256.
+- The builder now emits `forensickit-offline-v2`; the installer requires its JSON inventory, parses build metadata without shell `source`, and keeps local-only `pip --no-index`/APT `--no-download` behavior. Doctor deeply validates component payload paths, sizes, hashes, required kinds, and prepared metadata.
+- Focused manifest/doctor/release regression passed 20/20. A real temporary `--no-apt` build produced 20 component records and 23 checksum-covered files; `install_offline.sh --verify-only` and `doctor --bundle` completed. Doctor correctly reported `WARN`, not false readiness, because the project itself has no declared license and this workstation lacks staged optional tools/symbols.
+
+### Volatility 2.28.0 contract and provenance closeout
+
+- Audited an isolated Volatility 3 2.28.0 installation. The staged CLI exposes global `--offline`, JSON rendering, Windows Info/PsList/PsScan/PsTree/CmdLine/NetScan/Handles/FileScan/DllList/Memmap/Malfind/DumpFiles and Linux PsList/PsAux/Sockstat; the installed Memmap and DllList accept `--pid`/`--dump`, while DumpFiles accepts FileScan physical `_FILE_OBJECT` addresses through `--physaddr`.
+- Tool command construction now enforces offline quiet JSON rendering and a case-scoped output directory after local template expansion. The version probe uses offline `frameworkinfo.FrameworkInfo` because Volatility 3 has no `--version`; Doctor verifies all 16 exact plugins and critical extraction arguments.
+- Added Windows `windows.info.Info` to AUTO/DEEP analysis, normalized its structured Variable/Value rows into `memory.volatility.kernel_info`, and surfaced a cautious OS/kernel finding with preserved JSON provenance.
+- Split Amcache and Shimcache hive-relative cell/entry offsets from absolute hive-file offsets. Timeline `record_offset` now consistently uses the physical file byte position while `record_hive_offset` preserves the Registry-relative location.
+- Installed the offline bundle's Textual 8.2.8 wheel set using `pip --no-index` in an isolated target. Its headless pilot completed real Analyze→asynchronous FlagHunter result→`Asia/Seoul` filter refresh.
+
+### Verification
+
+- Focused Volatility/Registry/Doctor/profile regression passed 81/81; real Volatility Doctor reported framework 2.28.0, 16/16 plugins and all extraction arguments ready. The final direct synthetic suite passed 402/402 after compileall, shell syntax, and `git diff --check` validation.
+
+### Remaining
+
+- A supported full-system memory image with its exact offline symbol set and a matching Ubuntu/Kali kernel-level network-isolation run remain external pre-event gates. Individual failed-tool retry/parser checkpoint resume remains future work; current retry safely creates a new immutable case.
+
+## 2026-09-09 — v1.2.0 competition-readiness closeout
+
+### Implemented
+
+- Completed bounded UDF Allocation Extent Descriptor continuation parsing and immutable extraction revalidation for short, long, and extended Type-1 allocation arrays, including directory chains and strict tag/CRC/location/previous-pointer/range/cycle/overlap limits.
+- Added complete TUI artifact-tree, primary/alternate classification, and all-observation views with defensive orphan/cycle handling and F2–F5 keyboard navigation. Textual is now part of the standard install instead of an optional runtime gap.
+- Persisted one explicit hypothesis and verification record for every finding, including legacy case backfill and JSON schema v4, Markdown, and escaped HTML reporting.
+- Extended the planner, registry, and rule engine with evidence confidence, artifact size, expected value, CPU/RAM budget, platform, prior finding/tool/observation prerequisites, observations, confidence changes, and auditable parser/extractor actions.
+- Added `forensickit self-test` and JSON health output. The self-test executes preservation, appended ZIP extraction, recursive Base64 flag discovery, lineage, investigation records, SQLite, and JSON/Markdown/HTML reporting without external tools.
+- Hardened offline release/installation: clean Git provenance by default, commit/dirty manifest fields, build-product exclusions, exactly one version-matched project wheel, safe tar member validation, explicit dirty-development opt-in, force reinstall, staging self-test, atomic activation, and prior-prefix preservation on staging failure.
+- Added `scripts/release_gate.sh` to enforce clean source provenance, version consistency, full pytest, core self-test, bundle Doctor, and installer verification before a release is accepted.
+- Promoted the integrated feature set to v1.2.0 and added release notes.
+
+### Verification
+
+- The complete standard pytest suite passed **435/435** on Python 3.12 with Textual installed; the active headless TUI pilot completed real nonblocking analysis and populated artifact, observation, and flag views.
+- The independent pytest-free direct synthetic runner passed **435/435** across every `tests/test_*.py` module.
+- `python -m compileall -q src tests scripts`, `git diff --check`, and `bash -n install_forensics.sh scripts/*.sh` passed.
+- A dirty-development v2 bundle was built and checksum/component-validated; a fresh local prefix installed its complete offline wheel set and ran the CLI. Release packaging is performed again from the clean v1.2.0 commit so its manifest can truthfully record `SOURCE_DIRTY=0`.
+
+### External pre-event gates
+
+- A real supported full-system memory image with its exact staged symbols and the exact competition Ubuntu/Kali image/USB media are not present yet. Their real-fixture and network-disabled checks remain explicitly tracked and cannot be truthfully replaced by synthetic evidence.

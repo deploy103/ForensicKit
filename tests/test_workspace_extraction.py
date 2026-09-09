@@ -525,3 +525,42 @@ def test_doctor_warns_when_valid_bundle_targets_other_architecture(tmp_path: Pat
 
     assert bundle_check.status == "WARN"
     assert "impossible-arch" in bundle_check.detail
+
+
+def test_doctor_verifies_volatility_plugins_and_extraction_arguments(tmp_path: Path) -> None:
+    executable = tmp_path / "vol"
+    executable.write_text(
+        "#!/bin/sh\n"
+        "case \"$*\" in\n"
+        "  'windows.memmap.Memmap --help') printf '%s\\n' '--pid PID --dump' ;;\n"
+        "  'windows.dlllist.DllList --help') printf '%s\\n' '--pid PID --dump' ;;\n"
+        "  'windows.dumpfiles.DumpFiles --help') printf '%s\\n' '--physaddr PHYSADDR' ;;\n"
+        "  *) printf '%s\\n' '--offline --renderer banners.Banners windows.info.Info windows.pslist.PsList windows.psscan.PsScan windows.pstree.PsTree windows.cmdline.CmdLine windows.netscan.NetScan windows.handles.Handles windows.filescan.FileScan windows.dlllist.DllList windows.memmap.Memmap windows.malfind.Malfind windows.dumpfiles.DumpFiles linux.pslist.PsList linux.psaux.PsAux linux.sockstat.Sockstat' ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+
+    check = Doctor._volatility_cli_check(executable)
+
+    assert check.status == "OK"
+    assert "16 plugins" in check.detail
+
+
+def test_doctor_reports_missing_volatility_dumpfiles_argument(tmp_path: Path) -> None:
+    executable = tmp_path / "vol"
+    executable.write_text(
+        "#!/bin/sh\n"
+        "case \"$*\" in\n"
+        "  'windows.memmap.Memmap --help'|'windows.dlllist.DllList --help') printf '%s\\n' '--pid PID --dump' ;;\n"
+        "  'windows.dumpfiles.DumpFiles --help') printf '%s\\n' '--pid PID' ;;\n"
+        "  *) printf '%s\\n' '--offline --renderer banners.Banners windows.info.Info windows.pslist.PsList windows.psscan.PsScan windows.pstree.PsTree windows.cmdline.CmdLine windows.netscan.NetScan windows.handles.Handles windows.filescan.FileScan windows.dlllist.DllList windows.memmap.Memmap windows.malfind.Malfind windows.dumpfiles.DumpFiles linux.pslist.PsList linux.psaux.PsAux linux.sockstat.Sockstat' ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+
+    check = Doctor._volatility_cli_check(executable)
+
+    assert check.status == "BROKEN"
+    assert "windows.dumpfiles.DumpFiles --physaddr" in check.detail

@@ -11,8 +11,10 @@ suite when pytest is installed.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 import importlib
 import inspect
+from io import StringIO
 import sys
 import tempfile
 import traceback
@@ -37,6 +39,16 @@ TEST_MODULES = (
     "tests.test_workspace_extraction",
     "tests.test_tools",
     "tests.test_release",
+    "tests.test_udf",
+    "tests.test_unified_search",
+    "tests.test_windows_artifacts",
+    "tests.test_browser",
+    "tests.test_session",
+    "tests.test_bundle_manifest",
+    "tests.test_selftest",
+    "tests.test_tui",
+    "tests.test_release_gate",
+    "tests.test_investigation_chain",
 )
 
 
@@ -52,7 +64,45 @@ def _install_pytest_fixture_shim() -> None:
         return function
 
     shim.fixture = fixture  # type: ignore[attr-defined]
+
+    @contextmanager
+    def raises(exception_type, match=None):
+        try:
+            yield
+        except exception_type as exc:
+            if match is not None:
+                import re
+                if re.search(match, str(exc)) is None:
+                    raise AssertionError(
+                        f"exception text {str(exc)!r} does not match {match!r}"
+                    ) from exc
+        else:
+            raise AssertionError(f"did not raise {exception_type.__name__}")
+
+    shim.raises = raises  # type: ignore[attr-defined]
     sys.modules["pytest"] = shim
+
+
+class _CaptureFixture:
+    def __init__(self) -> None:
+        self.stdout = StringIO()
+        self.stderr = StringIO()
+
+    def readouterr(self):
+        captured = types.SimpleNamespace(
+            out=self.stdout.getvalue(), err=self.stderr.getvalue(),
+        )
+        for stream in (self.stdout, self.stderr):
+            stream.seek(0)
+            stream.truncate(0)
+        return captured
+
+
+@contextmanager
+def _captured_streams():
+    fixture = _CaptureFixture()
+    with redirect_stdout(fixture.stdout), redirect_stderr(fixture.stderr):
+        yield fixture
 
 
 def _fixture_values(module: types.ModuleType, function, tmp_path: Path) -> tuple[dict[str, object], list[object]]:
@@ -61,6 +111,11 @@ def _fixture_values(module: types.ModuleType, function, tmp_path: Path) -> tuple
     for parameter in inspect.signature(function).parameters:
         if parameter == "tmp_path":
             values[parameter] = tmp_path
+            continue
+        if parameter == "capsys":
+            generated = _captured_streams()
+            values[parameter] = generated.__enter__()
+            cleanup.append(generated)
             continue
         if parameter == "case_artifact" and hasattr(module, "case_artifact"):
             generated = module.case_artifact(tmp_path)
@@ -96,7 +151,10 @@ def run(modules: tuple[str, ...]) -> tuple[int, list[str]]:
                     passed += 1
                 finally:
                     for generated in reversed(cleanup):
-                        generated.close()
+                        if inspect.isgenerator(generated):
+                            generated.close()
+                        else:
+                            generated.__exit__(None, None, None)
     return passed, failures
 
 

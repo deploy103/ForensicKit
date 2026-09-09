@@ -1,10 +1,10 @@
 # ForensicKit Work Queue
 
-Last reviewed: 2026-09-07 14:19 KST
+Last reviewed: 2026-09-09 11:15 KST
 
 ## Post-v1.1 backlog
 
-- [ ] Parse and validate ISO 9660 extended-attribute-record areas for extents with nonzero extended-attribute block counts.
+- [x] Resolve bounded UDF Allocation Extent Descriptor continuation chains with exact Type-1 range/tag/CRC/previous-pointer/cycle provenance, then permit extraction only after full-chain immutable revalidation.
 
 ## v1.1.0 release gate
 
@@ -13,10 +13,28 @@ Last reviewed: 2026-09-07 14:19 KST
 
 ## Environment-dependent
 
-- None.
+- [ ] Validate Volatility plugins/arguments and PID/FileScan extraction against a real supported full-system image with the exact staged competition build, matching offline symbols, and the user-supplied competition fixture.
+- [ ] Validate the final USB bundle inside the exact competition Ubuntu/Kali image with network disabled once that image is available.
 
 ## Completed this session
 
+- [x] Bounded UDF Allocation Extent Descriptor continuation chains for directory and file short/long/extended AD arrays, with exact Type-1 range/tag/checksum/CRC/location/previous-pointer/hash provenance, cycle/overlap/count defenses, metadata-only malformed chains, and full-chain immutable extraction revalidation.
+- [x] ECMA-167 extended-AD length correction and safe Type-1 extraction only when recorded/information lengths prove untransformed data or exact sparse zeros; compressed-length divergence remains metadata-only.
+- [x] Immutable UDF extraction for complete short/long recorded and unrecorded sparse ranges plus embedded-in-ICB regular files, with bounded logical-zero writes and exact ICB provenance.
+- [x] Safe UDF regular-file materialization from complete recorded-allocated Type-1 short/long extents after whole-source hash plus fresh volume/tree equality and per-file FID/ICB/AD rereads, with alias/overlap/metadata collision suppression.
+- [x] Bounded 32-directory UDF Type-1 tree traversal with global 8-MiB/4,096-FID budgets, exact parent relationships and path components, shared/cyclic ICB and overlapping-directory-extent rejection, and metadata-only nested child ICB validation.
+- [x] Active UDF root-child FE/EFE rereads with exact variable CRC coverage, FID/file-type agreement, ICB alias grouping, and structural short/long/extended/embedded allocation-descriptor metadata without data reads.
+- [x] Bounded UDF root short/long allocation-descriptor resolution and FID inventory with exact physical segments, tag checksum/CRC/location, CS0 name, padding, ICB-range, and unique parent-record validation.
+- [x] Type-1 UDF LVD file-set address resolution plus exact FSD and root FE/EFE tag, CRC-coverage, identifier, range, and allocation-descriptor provenance validation.
+- [x] Bounded UDF VRS/anchor/main-reserve VDS validation with exact descriptor-tag checksum/CRC coverage, partition/LVD provenance, and ISO/UDF hybrid detection.
+- [x] Bounded CPIO symlink-target hash/text/safety metadata with no link following or materialization.
+- [x] Fixed-size per-segment CPIO zero-padding scans without quadratic remaining-range reads.
+- [x] CPIO hard-link inode reconciliation with one canonical payload, immutable all-member header revalidation, and no alias/host-link creation.
+- [x] Bounded concatenated CPIO traversal after validated trailers and zero-only inter-archive padding.
+- [x] Big-/little-endian binary CPIO parsing, exact header revalidation, and safe recursive regular-file extraction.
+- [x] Primary/Joliet path-table XAR range validation and exact active-directory XAR/data-start reconciliation.
+- [x] Per-section ISO multi-extent XAR validation, ECMA-119 record metadata consistency, and all-section immutable extraction revalidation.
+- [x] Bounded ISO 9660 extended-attribute-record validation and single-extent extraction gating with independent immutable-range revalidation.
 - [x] Exact bounded zisofs block decompression with immutable ZF/header/table revalidation, zero-fill handling, output limits, and recursive child provenance.
 - [x] Bounded RRIP `ZF` and zisofs header/block-pointer metadata validation without decompression or child materialization.
 - [x] Metadata-only El Torito hard-disk-emulation MBR and partition-range validation.
@@ -257,3 +275,17 @@ Last reviewed: 2026-09-07 14:19 KST
 - [x] TLS ALPN offer/selection mismatch profile finding with exact flow provenance.
 - [x] Bounded in-order TLS ServerHello continuation reassembly with incomplete/gap provenance.
 - [x] Full direct regression after PCAP HTTP flow-state bound (142 passed).
+- [x] Unified bounded flag/search pipeline with multi-location provenance and recursive decoded-content coverage.
+- [x] MDMP/full-system memory split, selected-PID dumps, and Volatility failure classification.
+- [x] Automatic/Custom Destinations Jump List parsing and LNK recursive extraction.
+- [x] Chromium/Firefox/Safari SQLite normalization with explicit supplied-WAL snapshot handling.
+- [x] Browser and Jump List records in the provenance-bearing report timeline.
+- [x] Fixed-path Amcache application/file and 00ts/10ts Shimcache parsing with raw offsets, common search, and timeline rows.
+- [x] Exact Windows cached-path correlation across independently supplied Amcache/Shimcache/LNK/EVTX/browser artifacts.
+- [x] Progressive CLI status, graceful process-group cancellation, memory-job cap, and Linux tool resource ceilings.
+- [x] Threaded analysis-session controller with bounded progress, cooperative cancel, and clean whole-request retry.
+- [x] In-TUI evidence/search input, active nonblocking analysis, cancel/retry, result tabs, filters, timezone display, candidate copy, and extracted-file save.
+- [x] Full direct synthetic regression after Windows semantic-cache and active-session/TUI work (393 passed).
+- [x] Offline bundle v2 component manifest for source/wheel/deb/rule/catalog/tool/symbol versions, licenses, supported environments, sizes, and hashes.
+- [x] Prepared-tool metadata coverage and symlink/special-file rejection; safe v2 installer and doctor validation without sourcing bundle-controlled shell.
+- [x] Actual temporary `--no-apt` v2 bundle build, local verify-only install check, and doctor component audit.

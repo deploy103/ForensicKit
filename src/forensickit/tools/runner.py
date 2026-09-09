@@ -3,8 +3,10 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Event
 from typing import Iterable, Mapping
 
 from ..models import Artifact, Finding, Observation, ToolRun, ToolRunStatus, utc_now
@@ -41,8 +43,11 @@ class ToolRunner:
         termination_grace: float = 0.5,
         max_generated_files: int = 1_000,
         max_timeout: float | None = None,
+        cancel_event: Event | None = None,
+        max_memory_bytes: int | None = None,
+        max_output_file_bytes: int | None = None,
     ) -> None:
-        if preview_bytes <= 0 or parser_bytes <= 0 or max_generated_files <= 0 or (max_timeout is not None and max_timeout <= 0):
+        if preview_bytes <= 0 or parser_bytes <= 0 or max_generated_files <= 0 or (max_timeout is not None and max_timeout <= 0) or (max_memory_bytes is not None and max_memory_bytes <= 0) or (max_output_file_bytes is not None and max_output_file_bytes <= 0):
             raise ValueError("output bounds must be positive")
         self.workspace = workspace
         self.registry = registry or ToolRegistry.default()
@@ -52,6 +57,9 @@ class ToolRunner:
         self.termination_grace = max(0.05, termination_grace)
         self.max_generated_files = max_generated_files
         self.max_timeout = max_timeout
+        self.cancel_event = cancel_event
+        self.max_memory_bytes = max_memory_bytes
+        self.max_output_file_bytes = max_output_file_bytes
 
     def run(
         self,
@@ -131,6 +139,12 @@ class ToolRunner:
             return self._finish_without_parser(run, generated_dir, available=True)
 
         self.workspace.database.add_tool_run(run)
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            run.status = ToolRunStatus.CANCELED
+            run.error = "tool canceled before launch"
+            run.ended_at = utc_now()
+            self.workspace.database.update_tool_run(run)
+            return self._finish_without_parser(run, generated_dir, available=True)
         run.started_at = utc_now()
         run.status = ToolRunStatus.RUNNING
         self.workspace.database.update_tool_run(run)
@@ -153,24 +167,44 @@ class ToolRunner:
                     close_fds=True,
                     **popen_options,
                 )
-                try:
-                    run.exit_code = process.wait(timeout=effective_timeout)
+                self._apply_process_limits(process)
+                deadline = time.monotonic() + effective_timeout
+                while True:
+                    if self.cancel_event is not None and self.cancel_event.is_set():
+                        self._terminate_process_group(process)
+                        run.exit_code = process.returncode
+                        run.status = ToolRunStatus.CANCELED
+                        run.error = "tool canceled by analyst"
+                        break
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        self._terminate_process_group(process)
+                        run.exit_code = process.returncode
+                        run.status = ToolRunStatus.TIMED_OUT
+                        run.error = f"tool exceeded {effective_timeout:g} second timeout"
+                        break
+                    try:
+                        run.exit_code = process.wait(timeout=min(0.25, remaining))
+                    except subprocess.TimeoutExpired:
+                        continue
                     run.status = (
                         ToolRunStatus.COMPLETED if run.exit_code == 0 else ToolRunStatus.FAILED
                     )
                     if run.exit_code != 0:
                         run.error = f"tool exited with status {run.exit_code}"
-                except subprocess.TimeoutExpired:
-                    self._terminate_process_group(process)
-                    run.exit_code = process.returncode
-                    run.status = ToolRunStatus.TIMED_OUT
-                    run.error = f"tool exceeded {effective_timeout:g} second timeout"
+                    break
         except OSError as exc:
             if process is not None and process.poll() is None:
                 self._terminate_process_group(process)
             run.exit_code = process.returncode if process is not None else None
             run.status = ToolRunStatus.FAILED
             run.error = f"tool launch failed: {exc}"
+        except KeyboardInterrupt:
+            if process is not None and process.poll() is None:
+                self._terminate_process_group(process)
+            run.exit_code = process.returncode if process is not None else None
+            run.status = ToolRunStatus.CANCELED
+            run.error = "tool canceled by analyst interrupt"
         finally:
             run.ended_at = utc_now()
 
@@ -510,6 +544,30 @@ class ToolRunner:
         except subprocess.TimeoutExpired:  # pragma: no cover - SIGKILL should be final.
             process.kill()
             process.wait()
+
+    def _apply_process_limits(self, process: subprocess.Popen[bytes]) -> None:
+        """Apply Linux resource ceilings immediately after a trusted tool starts."""
+        if os.name != "posix" or (
+            self.max_memory_bytes is None and self.max_output_file_bytes is None
+        ):
+            return
+        try:
+            import resource
+            if not hasattr(resource, "prlimit"):
+                return
+            if self.max_memory_bytes is not None:
+                resource.prlimit(
+                    process.pid, resource.RLIMIT_AS,
+                    (self.max_memory_bytes, self.max_memory_bytes),
+                )
+            if self.max_output_file_bytes is not None:
+                resource.prlimit(
+                    process.pid, resource.RLIMIT_FSIZE,
+                    (self.max_output_file_bytes, self.max_output_file_bytes),
+                )
+        except (OSError, ValueError) as exc:
+            self._terminate_process_group(process)
+            raise OSError(f"resource limit setup failed: {exc}") from exc
 
     @staticmethod
     def _read_bounded(path: Path, maximum: int) -> str:

@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "components": [
+    {
+      "kind": "tool",
+      "name": "volatility3",
+      "version": "REPLACE_WITH_TESTED_VERSION",
+      "license": "Volatility Software License 1.0",
+      "supported_os": ["linux"],
+      "architectures": ["any"],
+      "path": "volatility3",
+      "source": "REPLACE_WITH_PREPARATION_SOURCE"
+    },
+    {
+      "kind": "symbols",
+      "name": "volatility-symbols",
+      "version": "REPLACE_WITH_SNAPSHOT_DATE_OR_RELEASE",
+      "license": "REPLACE_WITH_APPLICABLE_SYMBOL_TERMS",
+      "supported_os": ["windows", "linux"],
+      "architectures": ["amd64"],
+      "path": "volatility-symbols",
+      "source": "REPLACE_WITH_PREPARATION_SOURCE"
+    }
+  ]
+}

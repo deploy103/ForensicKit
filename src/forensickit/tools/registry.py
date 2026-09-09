@@ -93,6 +93,9 @@ _COMMAND_TEMPLATES: dict[str, dict[str, tuple[str, ...]]] = {
     "volatility3_windows_pslist": {
         "default": ("{executable}", "-f", "{evidence}", "windows.pslist.PsList"),
     },
+    "volatility3_windows_info": {
+        "default": ("{executable}", "-f", "{evidence}", "windows.info.Info"),
+    },
     "volatility3_windows_psscan": {
         "default": ("{executable}", "-f", "{evidence}", "windows.psscan.PsScan"),
     },
@@ -113,6 +116,10 @@ _COMMAND_TEMPLATES: dict[str, dict[str, tuple[str, ...]]] = {
     },
     "volatility3_windows_dlllist": {
         "default": ("{executable}", "-f", "{evidence}", "windows.dlllist.DllList"),
+        "pid_dump": ("{executable}", "-f", "{evidence}", "windows.dlllist.DllList", "--pid", "{pid}", "--dump"),
+    },
+    "volatility3_windows_memmap": {
+        "pid_dump": ("{executable}", "-f", "{evidence}", "windows.memmap.Memmap", "--pid", "{pid}", "--dump"),
     },
     "volatility3_windows_malfind": {
         "default": ("{executable}", "-f", "{evidence}", "windows.malfind.Malfind"),
@@ -221,6 +228,7 @@ _BUILTIN_METADATA: dict[str, dict[str, Any]] = {
     "ewfinfo": {"executables": ["ewfinfo"], "profiles": ["disk"], "timeout": 60, "parser": "ewfinfo"},
     "volatility3": {"executables": ["vol", "vol.py", "vol-offline"], "profiles": ["memory"], "timeout": 600, "cost": "high", "parser": "volatility3"},
     "volatility3_windows_pslist": {"executables": ["vol", "vol.py", "vol-offline"], "profiles": ["memory"], "timeout": 600, "cost": "high", "parser": "volatility3"},
+    "volatility3_windows_info": {"executables": ["vol", "vol.py", "vol-offline"], "profiles": ["memory"], "timeout": 600, "cost": "high", "parser": "volatility3"},
     "volatility3_windows_psscan": {"executables": ["vol", "vol.py", "vol-offline"], "profiles": ["memory"], "timeout": 600, "cost": "high", "parser": "volatility3"},
     "volatility3_windows_pstree": {"executables": ["vol", "vol.py", "vol-offline"], "profiles": ["memory"], "timeout": 600, "cost": "high", "parser": "volatility3"},
     "volatility3_windows_cmdline": {"executables": ["vol", "vol.py", "vol-offline"], "profiles": ["memory"], "timeout": 600, "cost": "high", "parser": "volatility3"},
@@ -228,6 +236,7 @@ _BUILTIN_METADATA: dict[str, dict[str, Any]] = {
     "volatility3_windows_handles": {"executables": ["vol", "vol.py", "vol-offline"], "profiles": ["memory"], "timeout": 600, "cost": "high", "parser": "volatility3"},
     "volatility3_windows_filescan": {"executables": ["vol", "vol.py", "vol-offline"], "profiles": ["memory"], "timeout": 600, "cost": "high", "parser": "volatility3"},
     "volatility3_windows_dlllist": {"executables": ["vol", "vol.py", "vol-offline"], "profiles": ["memory"], "timeout": 600, "cost": "high", "parser": "volatility3"},
+    "volatility3_windows_memmap": {"executables": ["vol", "vol.py", "vol-offline"], "profiles": ["memory"], "timeout": 600, "cost": "high", "parser": "volatility3", "generates_files": True},
     "volatility3_windows_malfind": {"executables": ["vol", "vol.py", "vol-offline"], "profiles": ["memory"], "timeout": 600, "cost": "high", "parser": "volatility3"},
     "volatility3_windows_dumpfiles": {"executables": ["vol", "vol.py", "vol-offline"], "profiles": ["memory"], "timeout": 600, "cost": "high", "parser": "generic", "generates_files": True},
     "volatility3_linux_pslist": {"executables": ["vol", "vol.py", "vol-offline"], "profiles": ["memory"], "timeout": 600, "cost": "high", "parser": "volatility3"},
@@ -266,12 +275,17 @@ _VERSION_PROBES: dict[str, tuple[str, ...]] = {
     "foremost": ("-V",),
     "scalpel": ("-V",),
     "bulk_extractor": ("-V",),
+    # Volatility 3 deliberately has no --version flag.  FrameworkInfo prints
+    # the framework version on its first line and does not require evidence.
+    # Keep this probe offline as well: doctor must never make the first network
+    # request on a competition workstation.
+    "volatility3": ("--offline", "-q", "frameworkinfo.FrameworkInfo"),
 }
 
 
 _GENERATING_TOOLS = {
     "binwalk3", "sevenzip", "foremost", "scalpel", "bulk_extractor", "tshark", "outguess",
-    "hayabusa", "aleapp", "ileapp", "apktool", "jadx", "pdfdetach", "pdfimages", "volatility3_windows_dumpfiles",
+    "hayabusa", "aleapp", "ileapp", "apktool", "jadx", "pdfdetach", "pdfimages", "volatility3_windows_dumpfiles", "volatility3_windows_memmap",
 }
 
 
@@ -290,6 +304,16 @@ class ToolDefinition:
     command_templates: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     version_probe: tuple[str, ...] = ("--version",)
     generates_files: bool = False
+    supported_platforms: tuple[str, ...] = ("linux", "darwin", "windows")
+    expected_outputs: tuple[str, ...] = ("stdout", "parsed_observations")
+    dependency_hints: tuple[str, ...] = ()
+    prerequisites: tuple[str, ...] = ()
+    expected_value: int = 50
+    cpu_cost: int = 1
+    estimated_ram_bytes: int = 0
+    min_artifact_size: int = 0
+    max_artifact_size: int | None = None
+    minimum_confidence: float = 0.0
 
     @property
     def canonical_name(self) -> str:
@@ -398,18 +422,97 @@ class ToolRegistry:
         timeout = float(values.get("timeout", 60))
         if timeout <= 0:
             raise ValueError(f"tool {name!r} timeout must be positive")
+        cost = str(values.get("cost", "medium")).lower()
+        if cost not in {"low", "medium", "high"}:
+            raise ValueError(f"tool {name!r} cost must be low, medium, or high")
+        supported_platforms = _string_tuple(
+            values.get("supported_platforms", ("linux", "darwin", "windows")),
+            field_name="supported_platforms", tool_name=name,
+        )
+        if not supported_platforms:
+            raise ValueError(f"tool {name!r} supported_platforms must not be empty")
+        unknown_platforms = set(supported_platforms) - {"linux", "darwin", "windows"}
+        if unknown_platforms:
+            raise ValueError(
+                f"tool {name!r} has unsupported platforms: {sorted(unknown_platforms)}"
+            )
+        expected_outputs = _string_tuple(
+            values.get("expected_outputs", ("stdout", "stderr", "parsed_observations")),
+            field_name="expected_outputs", tool_name=name,
+        )
+        if not expected_outputs:
+            raise ValueError(f"tool {name!r} expected_outputs must not be empty")
+        dependency_hints = _string_tuple(
+            values.get(
+                "dependency_hints",
+                (f"provide one of {', '.join(map(str, executables))} in PATH via the offline bundle or local install",),
+            ),
+            field_name="dependency_hints", tool_name=name, lowercase=False,
+        )
+        prerequisites = _string_tuple(
+            values.get("prerequisites", ()), field_name="prerequisites", tool_name=name,
+        )
+        priority = str(values.get("priority", "P1"))
+        expected_value = _bounded_integer(
+            values.get("expected_value", {"P0": 75, "P1": 55, "P2": 35}.get(priority.upper(), 50)),
+            field_name="expected_value", tool_name=name,
+            minimum=0, maximum=100,
+        )
+        cpu_cost = _bounded_integer(
+            values.get("cpu_cost", {"low": 1, "medium": 1, "high": 2}[cost]),
+            field_name="cpu_cost", tool_name=name, minimum=1, maximum=256,
+        )
+        estimated_ram_bytes = _nonnegative_integer(
+            values.get(
+                "estimated_ram_bytes",
+                {"low": 128 * 1024 * 1024, "medium": 512 * 1024 * 1024, "high": 2 * 1024 * 1024 * 1024}[cost],
+            ),
+            field_name="estimated_ram_bytes", tool_name=name,
+        )
+        min_artifact_size = _nonnegative_integer(
+            values.get("min_artifact_size", 0), field_name="min_artifact_size", tool_name=name,
+        )
+        raw_max_artifact_size = values.get("max_artifact_size")
+        max_artifact_size = (
+            None if raw_max_artifact_size is None else _nonnegative_integer(
+                raw_max_artifact_size, field_name="max_artifact_size", tool_name=name,
+            )
+        )
+        if max_artifact_size is not None and max_artifact_size < min_artifact_size:
+            raise ValueError(f"tool {name!r} max_artifact_size is below min_artifact_size")
+        raw_minimum_confidence = values.get("minimum_confidence", 0.0)
+        if isinstance(raw_minimum_confidence, bool) or not isinstance(
+            raw_minimum_confidence, (int, float)
+        ):
+            raise ValueError(f"tool {name!r} minimum_confidence must be numeric")
+        minimum_confidence = float(raw_minimum_confidence)
+        if not 0.0 <= minimum_confidence <= 1.0:
+            raise ValueError(f"tool {name!r} minimum_confidence must be between 0 and 1")
+        generates_files = bool(values.get("generates_files", name in _GENERATING_TOOLS))
+        if generates_files and "generated_files" not in expected_outputs:
+            expected_outputs = (*expected_outputs, "generated_files")
         return ToolDefinition(
             name=name,
             executable_candidates=tuple(str(item) for item in executables),
             profiles=tuple(str(item) for item in values.get("profiles", ())),
             accepts=tuple(str(item) for item in values.get("accepts", ())),
-            priority=str(values.get("priority", "P1")),
-            cost=str(values.get("cost", "medium")),
+            priority=priority,
+            cost=cost,
             timeout=timeout,
             parser=str(values.get("parser", "generic")),
             command_templates=templates,
             version_probe=tuple(probe),
-            generates_files=bool(values.get("generates_files", name in _GENERATING_TOOLS)),
+            generates_files=generates_files,
+            supported_platforms=supported_platforms,
+            expected_outputs=expected_outputs,
+            dependency_hints=dependency_hints,
+            prerequisites=prerequisites,
+            expected_value=expected_value,
+            cpu_cost=cpu_cost,
+            estimated_ram_bytes=estimated_ram_bytes,
+            min_artifact_size=min_artifact_size,
+            max_artifact_size=max_artifact_size,
+            minimum_confidence=minimum_confidence,
         )
 
     def names(self) -> list[str]:
@@ -525,9 +628,71 @@ class ToolRegistry:
         except KeyError as exc:
             raise ValueError(f"unknown command placeholder for {definition.name}: {exc}") from exc
         argv.extend(str(arg) for arg in extra_args)
+        if definition.name.startswith("volatility3"):
+            argv = self._harden_volatility_command(argv, output_dir=output_dir)
         if any("\x00" in arg for arg in argv):
             raise ValueError("command arguments may not contain NUL bytes")
         return argv
 
+    @staticmethod
+    def _harden_volatility_command(argv: list[str], *, output_dir: str) -> list[str]:
+        """Force deterministic local-only Volatility global options.
+
+        Volatility global options must precede the plugin name.  Applying the
+        policy after template expansion also protects locally overridden tool
+        catalogs instead of relying on every template author to remember it.
+        Plugin-specific arguments remain in their original order.
+        """
+
+        if not argv:
+            return argv
+        plugin_index = next(
+            (
+                index for index, token in enumerate(argv[1:], start=1)
+                if token.startswith(("banners.", "windows.", "linux.", "frameworkinfo."))
+            ),
+            len(argv),
+        )
+        global_argv = argv[1:plugin_index]
+        additions: list[str] = []
+        if "--offline" not in global_argv:
+            additions.append("--offline")
+        if "-q" not in global_argv and "--quiet" not in global_argv:
+            additions.append("-q")
+        if "-r" not in global_argv and "--renderer" not in global_argv:
+            additions.extend(("-r", "json"))
+        if output_dir and "-o" not in global_argv and "--output-dir" not in global_argv:
+            additions.extend(("-o", output_dir))
+        return [argv[0], *additions, *argv[1:]]
+
 
 __all__ = ["ToolAvailability", "ToolDefinition", "ToolRegistry"]
+
+
+def _string_tuple(
+    value: Any, *, field_name: str, tool_name: str, lowercase: bool = True,
+) -> tuple[str, ...]:
+    if isinstance(value, str):
+        value = (value,)
+    if not isinstance(value, (list, tuple)) or not all(
+        isinstance(item, str) and item.strip() for item in value
+    ):
+        raise ValueError(f"tool {tool_name!r} {field_name} must be a string list")
+    normalized = (item.strip().lower() if lowercase else item.strip() for item in value)
+    return tuple(dict.fromkeys(normalized))
+
+
+def _bounded_integer(
+    value: Any, *, field_name: str, tool_name: str, minimum: int, maximum: int,
+) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+        raise ValueError(
+            f"tool {tool_name!r} {field_name} must be an integer between {minimum} and {maximum}"
+        )
+    return value
+
+
+def _nonnegative_integer(value: Any, *, field_name: str, tool_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"tool {tool_name!r} {field_name} must be a non-negative integer")
+    return value

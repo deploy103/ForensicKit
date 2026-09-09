@@ -135,6 +135,14 @@ tools:
     timeout: 600
     parser: volatility3
 
+  volatility3_windows_info:
+    priority: P0
+    executables: [vol, vol.py, vol-offline]
+    profiles: [memory]
+    cost: high
+    timeout: 600
+    parser: volatility3
+
   volatility3_windows_psscan:
     priority: P0
     executables: [vol, vol.py, vol-offline]
@@ -166,6 +174,15 @@ tools:
     cost: high
     timeout: 600
     parser: volatility3
+
+  volatility3_windows_memmap:
+    priority: P0
+    executables: [vol, vol.py, vol-offline]
+    profiles: [memory]
+    cost: high
+    timeout: 600
+    parser: volatility3
+    generates_files: true
 
   volatility3_windows_malfind:
     priority: P0

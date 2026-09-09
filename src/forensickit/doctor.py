@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import importlib.util
 import hashlib
+import json
+import os
 import platform
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 from .tools.registry import ToolRegistry
+from .bundle_manifest import validate_component_manifest
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,8 +59,8 @@ class Doctor:
         textual_available = importlib.util.find_spec("textual") is not None
         checks.append(
             DoctorCheck(
-                "Textual TUI", "OK" if textual_available else "MISSING", "RECOMMENDED",
-                "install the offline `forensickit[tui]` extra for `forensickit` / `forensickit tui`",
+                "Textual TUI", "OK" if textual_available else "MISSING", "REQUIRED",
+                "standard keyboard-first interface dependency",
             )
         )
         checks.append(self._workspace_check(workspace_base))
@@ -86,6 +90,7 @@ class Doctor:
                     executable or f"candidates: {', '.join(definition.executable_candidates)}",
                 )
             )
+        checks.extend(self._volatility_checks())
         checks.append(
             DoctorCheck(
                 "Offline runtime",
@@ -95,6 +100,149 @@ class Doctor:
             )
         )
         return DoctorResult(checks)
+
+    def _volatility_checks(self) -> list[DoctorCheck]:
+        checks: list[DoctorCheck] = []
+        try:
+            availability = self.registry.detect("volatility3", probe_version=True, timeout=3.0)
+        except KeyError:
+            availability = None
+        if availability is None or not availability.available:
+            checks.append(DoctorCheck(
+                "Volatility version", "MISSING", "RECOMMENDED",
+                "stage a tested Volatility 3 `vol` or `vol-offline` executable before competition",
+            ))
+        else:
+            detail = availability.version or availability.error or availability.executable or "version unknown"
+            checks.append(DoctorCheck(
+                "Volatility version", "OK" if availability.version else "WARN",
+                "RECOMMENDED", detail,
+            ))
+            checks.append(self._volatility_cli_check(Path(availability.executable)))
+
+        candidates: list[Path] = []
+        configured = os.environ.get("FORENSIC_VOL_SYMBOLS")
+        if configured:
+            candidates.append(Path(configured).expanduser())
+        candidates.extend((
+            Path("/opt/forensic-tools/volatility-symbols"),
+            Path.home() / ".cache" / "volatility3",
+        ))
+        package = importlib.util.find_spec("volatility3")
+        if package is not None and package.origin:
+            candidates.append(Path(package.origin).resolve().parent / "symbols")
+        inventories: list[str] = []
+        seen: set[Path] = set()
+        for candidate in candidates:
+            try:
+                resolved = candidate.resolve(strict=True)
+            except OSError:
+                continue
+            if resolved in seen or not resolved.is_dir():
+                continue
+            seen.add(resolved)
+            count = 0
+            try:
+                for item in resolved.rglob("*"):
+                    if item.is_file() and not item.is_symlink():
+                        count += 1
+                        if count >= 10_000:
+                            break
+            except OSError:
+                continue
+            inventories.append(f"{resolved} ({count}{'+' if count >= 10_000 else ''} files)")
+        checks.append(DoctorCheck(
+            "Volatility symbols/cache",
+            "OK" if inventories else "MISSING",
+            "RECOMMENDED",
+            "; ".join(inventories) if inventories else (
+                "no offline symbol/cache directory found; prepare FORENSIC_VOL_SYMBOLS or "
+                "/opt/forensic-tools/volatility-symbols while online"
+            ),
+        ))
+        return checks
+
+    @staticmethod
+    def _volatility_cli_check(executable: Path) -> DoctorCheck:
+        """Verify the exact plugins and extraction arguments ForensicKit uses."""
+
+        required_plugins = (
+            "banners.Banners",
+            "windows.info.Info",
+            "windows.pslist.PsList",
+            "windows.psscan.PsScan",
+            "windows.pstree.PsTree",
+            "windows.cmdline.CmdLine",
+            "windows.netscan.NetScan",
+            "windows.handles.Handles",
+            "windows.filescan.FileScan",
+            "windows.dlllist.DllList",
+            "windows.memmap.Memmap",
+            "windows.malfind.Malfind",
+            "windows.dumpfiles.DumpFiles",
+            "linux.pslist.PsList",
+            "linux.psaux.PsAux",
+            "linux.sockstat.Sockstat",
+        )
+        argument_checks = {
+            "windows.memmap.Memmap": ("--pid", "--dump"),
+            "windows.dlllist.DllList": ("--pid", "--dump"),
+            "windows.dumpfiles.DumpFiles": ("--physaddr",),
+        }
+
+        try:
+            global_help = subprocess.run(
+                [str(executable), "--help"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                shell=False,
+                timeout=5.0,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return DoctorCheck(
+                "Volatility plugins/arguments", "BROKEN", "RECOMMENDED",
+                f"unable to inspect CLI: {exc}",
+            )
+        help_text = global_help.stdout[:2 * 1024 * 1024].decode("utf-8", errors="replace")
+        missing: list[str] = []
+        if global_help.returncode != 0:
+            missing.append(f"global help exited {global_help.returncode}")
+        for option in ("--offline", "--renderer"):
+            if option not in help_text:
+                missing.append(option)
+        missing.extend(plugin for plugin in required_plugins if plugin not in help_text)
+
+        for plugin, options in argument_checks.items():
+            try:
+                plugin_help = subprocess.run(
+                    [str(executable), plugin, "--help"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    shell=False,
+                    timeout=5.0,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                missing.append(f"{plugin} help ({exc})")
+                continue
+            plugin_text = plugin_help.stdout[:256 * 1024].decode("utf-8", errors="replace")
+            if plugin_help.returncode != 0:
+                missing.append(f"{plugin} help exited {plugin_help.returncode}")
+                continue
+            missing.extend(f"{plugin} {option}" for option in options if option not in plugin_text)
+
+        if missing:
+            return DoctorCheck(
+                "Volatility plugins/arguments", "BROKEN", "RECOMMENDED",
+                "missing or unusable: " + ", ".join(missing),
+            )
+        return DoctorCheck(
+            "Volatility plugins/arguments", "OK", "RECOMMENDED",
+            f"{len(required_plugins)} plugins; Windows Info, Memmap/DllList PID dump and DumpFiles physical-address modes verified",
+        )
 
     @staticmethod
     def _workspace_check(workspace_base: Path) -> DoctorCheck:
@@ -133,6 +281,12 @@ class Doctor:
             )
         if not any(wheels.glob("*.whl")):
             return DoctorCheck("Offline bundle", "BROKEN", "RECOMMENDED", "bundle contains no Python wheels")
+        project_wheels = sorted(wheels.glob("forensickit-*.whl"))
+        if len(project_wheels) != 1:
+            return DoctorCheck(
+                "Offline bundle", "BROKEN", "RECOMMENDED",
+                f"bundle must contain exactly one ForensicKit wheel; found {len(project_wheels)}",
+            )
         try:
             metadata_values: dict[str, str] = {}
             for line in metadata.read_text(encoding="utf-8").splitlines():
@@ -160,6 +314,53 @@ class Doctor:
                 return DoctorCheck("Offline bundle", "BROKEN", "RECOMMENDED", "SHA256SUMS is empty")
         except OSError as exc:
             return DoctorCheck("Offline bundle", "BROKEN", "RECOMMENDED", str(exc))
+        bundle_format = metadata_values.get("BUNDLE_FORMAT", "")
+        component_detail = "legacy v1 manifest"
+        component_warnings: tuple[str, ...] = ()
+        if bundle_format == "forensickit-offline-v2":
+            source_commit = metadata_values.get("SOURCE_COMMIT", "")
+            source_dirty = metadata_values.get("SOURCE_DIRTY", "")
+            if not re.fullmatch(r"[0-9a-fA-F]{40,64}", source_commit):
+                return DoctorCheck(
+                    "Offline bundle", "BROKEN", "RECOMMENDED",
+                    "v2 bundle lacks a valid SOURCE_COMMIT",
+                )
+            if source_dirty not in {"0", "1"}:
+                return DoctorCheck(
+                    "Offline bundle", "BROKEN", "RECOMMENDED",
+                    "v2 bundle lacks a valid SOURCE_DIRTY marker",
+                )
+            component_path = root / "manifests" / "component-manifest.json"
+            if not component_path.is_file() or component_path.is_symlink():
+                return DoctorCheck(
+                    "Offline bundle", "BROKEN", "RECOMMENDED",
+                    "v2 bundle requires a regular manifests/component-manifest.json",
+                )
+            try:
+                component_payload = json.loads(component_path.read_text(encoding="utf-8"))
+                validation = validate_component_manifest(root, component_payload)
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                return DoctorCheck("Offline bundle", "BROKEN", "RECOMMENDED", f"invalid component manifest: {exc}")
+            if not validation.valid:
+                return DoctorCheck(
+                    "Offline bundle", "BROKEN", "RECOMMENDED",
+                    f"component manifest invalid: {validation.errors[0]}",
+                )
+            component_warnings = validation.warnings
+            if source_dirty == "1":
+                component_warnings = component_warnings + (
+                    "bundle was built from a dirty development worktree",
+                )
+            component_detail = (
+                f"{validation.component_count} components, "
+                f"{validation.prepared_component_count} prepared tool/symbol components, "
+                f"source={source_commit[:12]}{'-dirty' if source_dirty == '1' else ''}"
+            )
+        elif bundle_format not in {"", "forensickit-offline-v1"}:
+            return DoctorCheck(
+                "Offline bundle", "BROKEN", "RECOMMENDED",
+                f"unsupported or missing BUNDLE_FORMAT: {bundle_format or 'missing'}",
+            )
         target_id = metadata_values.get("DISTRO_ID", "unknown")
         target_version = metadata_values.get("DISTRO_VERSION", "unknown")
         target_arch = metadata_values.get("ARCHITECTURE", "unknown")
@@ -180,9 +381,14 @@ class Doctor:
         )
         detail = (
             f"verified {checked} staged files; target={target_id}/{target_version}/{target_arch}, "
-            f"local={local_id}/{local_version}/{local_arch}"
+            f"local={local_id}/{local_version}/{local_arch}; {component_detail}"
         )
-        return DoctorCheck("Offline bundle", "OK" if compatible else "WARN", "RECOMMENDED", detail)
+        if component_warnings:
+            detail += "; metadata warnings: " + "; ".join(component_warnings[:3])
+        return DoctorCheck(
+            "Offline bundle", "OK" if compatible and not component_warnings else "WARN",
+            "RECOMMENDED", detail,
+        )
 
 
 __all__ = ["Doctor", "DoctorCheck", "DoctorResult"]

@@ -53,6 +53,7 @@ def _cpio_newc_member(
     *,
     mode: int = 0o100644,
     inode: int = 1,
+    link_count: int = 1,
     magic: bytes = b"070701",
     checksum: int | None = None,
 ) -> bytes:
@@ -63,7 +64,7 @@ def _cpio_newc_member(
         else checksum
     )
     fields = (
-        inode, mode, 1000, 1000, 1, 1_700_000_000, len(data),
+        inode, mode, 1000, 1000, link_count, 1_700_000_000, len(data),
         0, 0, 0, 0, len(raw_name), stored_checksum,
     )
     header = magic + b"".join(f"{value:08x}".encode("ascii") for value in fields)
@@ -107,6 +108,35 @@ def _cpio_odc_member(
     return bytes(result)
 
 
+def _cpio_binary_member(
+    name: str,
+    data: bytes = b"",
+    *,
+    mode: int = 0o100644,
+    inode: int = 1,
+    link_count: int = 1,
+    device: int = 12,
+    rdevice: int = 0,
+    byte_order: str = "big",
+) -> bytes:
+    raw_name = name.encode("utf-8") + b"\x00"
+    mtime = 0x12345678
+    words = (
+        0o70707, device, inode, mode, 1000, 1000, link_count, rdevice,
+        mtime >> 16, mtime & 0xFFFF, len(raw_name),
+        len(data) >> 16, len(data) & 0xFFFF,
+    )
+    result = bytearray(
+        b"".join(value.to_bytes(2, byte_order) for value in words)
+    )
+    assert len(result) == 26
+    result.extend(raw_name)
+    result.extend(b"\x00" * ((-len(result)) % 2))
+    result.extend(data)
+    result.extend(b"\x00" * ((-len(result)) % 2))
+    return bytes(result)
+
+
 def _iso_both16(value: int) -> bytes:
     return value.to_bytes(2, "little") + value.to_bytes(2, "big")
 
@@ -117,9 +147,10 @@ def _iso_both32(value: int) -> bytes:
 
 def _iso_path_table_entry(
     identifier: bytes, extent_block: int, parent_number: int, *, byte_order: str,
+    extended_attribute_blocks: int = 0,
 ) -> bytes:
     result = bytearray()
-    result.extend((len(identifier), 0))
+    result.extend((len(identifier), extended_attribute_blocks))
     result.extend(extent_block.to_bytes(4, byte_order))
     result.extend(parent_number.to_bytes(2, byte_order))
     result.extend(identifier)
@@ -157,12 +188,45 @@ def _iso_directory_record(
     return bytes(record)
 
 
-def _iso9660_with_multi_extent_file(
-    *, final_identifier: bytes = b"SPLIT.BIN;1",
-) -> tuple[bytes, bytes]:
+def _iso_extended_attribute_record(
+    *, corrupt_reserved: bool = False, record_format: int = 0,
+    record_attributes: int = 0, record_length: int = 0,
+    application_use: bytes = b"FORENSIC-XAR",
+) -> bytes:
     block_size = 2_048
-    first_payload = b"A" * block_size
-    final_payload = b"CTF{iso9660_multi_extent_tail}"
+    escape_sequences = b"%G"
+    record = bytearray(block_size)
+    record[0:4] = _iso_both16(0)
+    record[4:8] = _iso_both16(0)
+    record[8:10] = (0xAAAA).to_bytes(2, "little")
+    record[10:27] = b"2026090714190000\x00"
+    record[27:44] = b"0" * 16 + b"\x00"
+    record[44:61] = b"0" * 16 + b"\x00"
+    record[61:78] = b"0" * 16 + b"\x00"
+    record[78] = record_format
+    record[79] = record_attributes
+    record[80:84] = _iso_both16(record_length)
+    record[84:116] = b"FORENSICKIT".ljust(32, b" ")
+    record[116:180] = b"SYSTEM-USE".ljust(64, b"\x00")
+    record[180] = 1
+    record[181] = len(escape_sequences)
+    if corrupt_reserved:
+        record[182] = 1
+    record[246:250] = _iso_both16(len(application_use))
+    record[250:250 + len(application_use)] = application_use
+    escape_offset = 250 + len(application_use)
+    record[escape_offset:escape_offset + len(escape_sequences)] = escape_sequences
+    return bytes(record)
+
+
+def _iso9660_with_extended_attribute(
+    *, corrupt_reserved: bool = False,
+) -> tuple[bytes, bytes, bytes]:
+    block_size = 2_048
+    payload = b"CTF{iso9660_extended_attribute_record}"
+    extended_attribute = _iso_extended_attribute_record(
+        corrupt_reserved=corrupt_reserved,
+    )
     image = bytearray(24 * block_size)
     pvd_offset = 16 * block_size
     pvd = memoryview(image)[pvd_offset:pvd_offset + block_size]
@@ -170,7 +234,7 @@ def _iso9660_with_multi_extent_file(
     pvd[1:6] = b"CD001"
     pvd[6] = 1
     pvd[8:40] = b"FORENSICKIT".ljust(32, b" ")
-    pvd[40:72] = b"MULTI_EXTENT".ljust(32, b" ")
+    pvd[40:72] = b"EXTENDED_ATTRIBUTE".ljust(32, b" ")
     pvd[80:88] = _iso_both32(24)
     pvd[120:124] = _iso_both16(1)
     pvd[124:128] = _iso_both16(1)
@@ -186,13 +250,82 @@ def _iso9660_with_multi_extent_file(
         root_record
         + _iso_directory_record(b"\x01", 20, block_size, flags=0x02)
         + _iso_directory_record(
-            b"SPLIT.BIN;1", 21, len(first_payload), flags=0x80,
+            b"XATTR.TXT;1", 21, len(payload), extended_attribute_blocks=1,
         )
-        + _iso_directory_record(final_identifier, 22, len(final_payload))
     )
     image[20 * block_size:20 * block_size + len(root)] = root
-    image[21 * block_size:21 * block_size + len(first_payload)] = first_payload
-    image[22 * block_size:22 * block_size + len(final_payload)] = final_payload
+    image[21 * block_size:22 * block_size] = extended_attribute
+    image[22 * block_size:22 * block_size + len(payload)] = payload
+    return bytes(image), payload, extended_attribute
+
+
+def _iso9660_with_multi_extent_file(
+    *, final_identifier: bytes = b"SPLIT.BIN;1",
+    extended_attributes: bool = False,
+    final_record_attributes: int = 0,
+    final_record_length: int = 16,
+) -> tuple[bytes, bytes]:
+    block_size = 2_048
+    first_payload = b"A" * block_size
+    final_payload = b"CTF{iso9660_multi_extent_tail}"
+    volume_blocks = 26 if extended_attributes else 24
+    image = bytearray(volume_blocks * block_size)
+    pvd_offset = 16 * block_size
+    pvd = memoryview(image)[pvd_offset:pvd_offset + block_size]
+    pvd[0] = 1
+    pvd[1:6] = b"CD001"
+    pvd[6] = 1
+    pvd[8:40] = b"FORENSICKIT".ljust(32, b" ")
+    pvd[40:72] = b"MULTI_EXTENT".ljust(32, b" ")
+    pvd[80:88] = _iso_both32(volume_blocks)
+    pvd[120:124] = _iso_both16(1)
+    pvd[124:128] = _iso_both16(1)
+    pvd[128:132] = _iso_both16(block_size)
+    pvd[132:140] = _iso_both32(0)
+    root_record = _iso_directory_record(b"\x00", 20, block_size, flags=0x02)
+    pvd[156:156 + len(root_record)] = root_record
+    terminator = 17 * block_size
+    image[terminator] = 255
+    image[terminator + 1:terminator + 6] = b"CD001"
+    image[terminator + 6] = 1
+    first_extent = 21
+    final_extent = 23 if extended_attributes else 22
+    section_flags = 0x08 if extended_attributes else 0
+    root = (
+        root_record
+        + _iso_directory_record(b"\x01", 20, block_size, flags=0x02)
+        + _iso_directory_record(
+            b"SPLIT.BIN;1", first_extent, len(first_payload),
+            flags=0x80 | section_flags,
+            extended_attribute_blocks=1 if extended_attributes else 0,
+        )
+        + _iso_directory_record(
+            final_identifier, final_extent, len(final_payload),
+            flags=section_flags,
+            extended_attribute_blocks=1 if extended_attributes else 0,
+        )
+    )
+    image[20 * block_size:20 * block_size + len(root)] = root
+    if extended_attributes:
+        image[21 * block_size:22 * block_size] = (
+            _iso_extended_attribute_record(
+                record_format=1, record_attributes=0, record_length=16,
+                application_use=b"FIRST-SECTION",
+            )
+        )
+        image[22 * block_size:23 * block_size] = first_payload
+        image[23 * block_size:24 * block_size] = (
+            _iso_extended_attribute_record(
+                record_format=1,
+                record_attributes=final_record_attributes,
+                record_length=final_record_length,
+                application_use=b"FINAL-SECTION",
+            )
+        )
+        image[24 * block_size:24 * block_size + len(final_payload)] = final_payload
+    else:
+        image[21 * block_size:21 * block_size + len(first_payload)] = first_payload
+        image[22 * block_size:22 * block_size + len(final_payload)] = final_payload
     return bytes(image), first_payload + final_payload
 
 
@@ -715,10 +848,12 @@ def _iso9660_with_el_torito(
 
 def _iso9660_with_subdirectory(
     *, shared_extent: bool = False, path_tables: bool = False,
-    divergent_path_table: bool = False,
+    divergent_path_table: bool = False, path_table_xar: bool = False,
+    path_table_xar_mismatch: bool = False,
 ) -> tuple[bytes, bytes]:
     block_size = 2_048
-    image = bytearray(25 * block_size)
+    volume_blocks = 26 if path_table_xar else 25
+    image = bytearray(volume_blocks * block_size)
     pvd_offset = 16 * block_size
     pvd = memoryview(image)[pvd_offset:pvd_offset + block_size]
     pvd[0] = 1
@@ -726,19 +861,28 @@ def _iso9660_with_subdirectory(
     pvd[6] = 1
     pvd[8:40] = b"FORENSICKIT".ljust(32, b" ")
     pvd[40:72] = b"NESTED_ISO".ljust(32, b" ")
-    pvd[80:88] = _iso_both32(25)
+    pvd[80:88] = _iso_both32(volume_blocks)
     pvd[120:124] = _iso_both16(1)
     pvd[124:128] = _iso_both16(1)
     pvd[128:132] = _iso_both16(block_size)
     if path_tables:
+        path_table_xar_blocks = int(
+            path_table_xar and not path_table_xar_mismatch
+        )
         little_path_table = (
             _iso_path_table_entry(b"\x00", 20, 1, byte_order="little")
-            + _iso_path_table_entry(b"SUBDIR", 22, 1, byte_order="little")
+            + _iso_path_table_entry(
+                b"SUBDIR", 22, 1, byte_order="little",
+                extended_attribute_blocks=path_table_xar_blocks,
+            )
         )
         big_subdir_extent = 23 if divergent_path_table else 22
         big_path_table = (
             _iso_path_table_entry(b"\x00", 20, 1, byte_order="big")
-            + _iso_path_table_entry(b"SUBDIR", big_subdir_extent, 1, byte_order="big")
+            + _iso_path_table_entry(
+                b"SUBDIR", big_subdir_extent, 1, byte_order="big",
+                extended_attribute_blocks=path_table_xar_blocks,
+            )
         )
         assert len(little_path_table) == len(big_path_table)
         pvd[132:140] = _iso_both32(len(little_path_table))
@@ -757,19 +901,34 @@ def _iso9660_with_subdirectory(
 
     root = bytearray(root_record)
     root.extend(_iso_directory_record(b"\x01", 20, block_size, flags=0x02))
-    root.extend(_iso_directory_record(b"SUBDIR", 22, block_size, flags=0x02))
+    root.extend(_iso_directory_record(
+        b"SUBDIR", 22, block_size, flags=0x02,
+        extended_attribute_blocks=1 if path_table_xar else 0,
+    ))
     if shared_extent:
         root.extend(_iso_directory_record(b"ALIAS", 22, block_size, flags=0x02))
     image[20 * block_size:20 * block_size + len(root)] = root
 
     payload = b"CTF{iso9660_nested_file}"
+    subdirectory_data_block = 23 if path_table_xar else 22
+    payload_block = 24 if path_table_xar else 23
     subdirectory = (
-        _iso_directory_record(b"\x00", 22, block_size, flags=0x02)
+        _iso_directory_record(
+            b"\x00", 22, block_size, flags=0x02,
+            extended_attribute_blocks=1 if path_table_xar else 0,
+        )
         + _iso_directory_record(b"\x01", 20, block_size, flags=0x02)
-        + _iso_directory_record(b"DEEP.TXT;1", 23, len(payload))
+        + _iso_directory_record(b"DEEP.TXT;1", payload_block, len(payload))
     )
-    image[22 * block_size:22 * block_size + len(subdirectory)] = subdirectory
-    image[23 * block_size:23 * block_size + len(payload)] = payload
+    if path_table_xar:
+        image[22 * block_size:23 * block_size] = _iso_extended_attribute_record()
+    image[
+        subdirectory_data_block * block_size:
+        subdirectory_data_block * block_size + len(subdirectory)
+    ] = subdirectory
+    image[
+        payload_block * block_size:payload_block * block_size + len(payload)
+    ] = payload
     return bytes(image), payload
 
 
@@ -1788,6 +1947,16 @@ def test_cpio_crc_entries_preserve_ranges_checksums_types_and_unsafe_paths(tmp_p
     assert entries[1]["checksum_valid"] is True
     assert entries[1]["checksum_verification"] == "complete"
     assert entries[1]["path_safe"] is True
+    assert entries[2]["symlink_target_offset"] == entries[2]["data_offset"]
+    assert entries[2]["symlink_target_length"] == len(b"../flag.txt")
+    assert entries[2]["symlink_target_raw_hex"] == b"../flag.txt".hex()
+    assert entries[2]["symlink_target_raw_sha256"] == hashlib.sha256(
+        b"../flag.txt"
+    ).hexdigest()
+    assert entries[2]["symlink_target"] == "../flag.txt"
+    assert entries[2]["symlink_target_safe"] is False
+    assert entries[2]["symlink_target_validation"] == "valid"
+    assert values["archive.cpio.symlinks"] == [entries[2]]
     assert entries[3]["path_safe"] is False
     assert values["archive.cpio.checksum_bytes_read"] == (
         len(payload) + len(b"../flag.txt") + len(b"unsafe")
@@ -1799,6 +1968,15 @@ def test_cpio_crc_entries_preserve_ranges_checksums_types_and_unsafe_paths(tmp_p
         if item.category == "archive_unsafe_member_path"
     )
     assert "../escape.txt" in unsafe_finding.supporting_evidence[0]
+    assert any(
+        item.category == "archive_symlink_metadata"
+        and "../flag.txt" in item.supporting_evidence[0]
+        for item in profile.findings
+    )
+    assert any(
+        item.category == "archive_unsafe_link_target"
+        for item in profile.findings
+    )
     assert not any(
         item.category == "archive_structure_anomaly"
         for item in profile.findings
@@ -1883,6 +2061,354 @@ def test_cpio_crc_entries_preserve_ranges_checksums_types_and_unsafe_paths(tmp_p
     assert odc_record["device_major"] is None
     assert odc_record["stored_checksum"] is None
     assert odc_record["checksum_verification"] == "not_applicable"
+
+
+def test_binary_cpio_detects_byte_order_and_preserves_word_provenance(
+    tmp_path: Path,
+) -> None:
+    for byte_order, magic_raw_hex in (("big", "71c7"), ("little", "c771")):
+        payload = b"binary-cpio"
+        archive = (
+            _cpio_binary_member(
+                "flag.bin", payload, inode=7, device=3,
+                byte_order=byte_order,
+            )
+            + _cpio_binary_member(
+                "TRAILER!!!", mode=0, inode=8, byte_order=byte_order,
+            )
+        )
+        evidence = tmp_path / f"binary-{byte_order}.cpio"
+        evidence.write_bytes(archive)
+        artifact = _artifact(evidence)
+        observations = GenericTriageEngine().analyze(artifact, evidence)
+        values = _values(observations)
+
+        assert IdentificationEngine().identify(
+            artifact, observations,
+        ).format == "cpio"
+        assert values["triage.detected_header_format"] == "cpio"
+        assert values["archive.cpio.formats"] == ["bin"]
+        assert values["archive.cpio.binary_byte_orders"] == [byte_order]
+        assert values["archive.cpio.format_consistent"] is True
+        assert values["archive.cpio.complete"] is True
+        assert values["archive.cpio.trailer_found"] is True
+        assert values["archive.cpio.structure_error"] is None
+        record = values["archive.cpio.entries"][0]
+        assert record["format"] == "bin"
+        assert record["magic"] == "71c7"
+        assert record["magic_raw_hex"] == magic_raw_hex
+        assert record["header_length"] == 26
+        assert len(record["header_raw_hex"]) == 52
+        assert record["numeric_encoding"] == "binary_16_bit_words"
+        assert record["binary_byte_order"] == byte_order
+        assert record["binary_long_word_order"] == "high_then_low"
+        assert record["legacy_device"] == 3
+        assert record["inode"] == 7
+        assert record["mode"] == "0o100644"
+        assert record["permissions"] == "0o0644"
+        assert record["mtime_unix"] == 0x12345678
+        assert record["name_offset"] == 26
+        assert record["name_size_including_nul"] == len(b"flag.bin\x00")
+        assert record["data_offset"] == 36
+        assert record["data_length"] == len(payload)
+        assert record["next_header_offset"] == 48
+        assert record["stored_checksum"] is None
+        assert record["checksum_verification"] == "not_applicable"
+
+    mixed = tmp_path / "binary-mixed-endian.cpio"
+    mixed.write_bytes(
+        _cpio_binary_member("one", b"1", byte_order="big")
+        + _cpio_binary_member("TRAILER!!!", mode=0, byte_order="little")
+    )
+    mixed_artifact = _artifact(mixed)
+    mixed_observations = GenericTriageEngine().analyze(mixed_artifact, mixed)
+    mixed_values = _values(mixed_observations)
+    assert mixed_values["archive.cpio.formats"] == ["bin"]
+    assert mixed_values["archive.cpio.binary_byte_orders"] == ["big", "little"]
+    assert mixed_values["archive.cpio.format_consistent"] is False
+    mixed_profile = ProfileEngine().evaluate(
+        mixed_artifact, mixed_observations,
+    )
+    assert any(
+        item.category == "archive_structure_anomaly"
+        and "format_consistent=False" in item.supporting_evidence
+        for item in mixed_profile.findings
+    )
+
+
+def test_concatenated_cpio_requires_valid_trailers_and_zero_padding(
+    tmp_path: Path,
+) -> None:
+    first_archive = (
+        _cpio_binary_member("first.bin", b"first", byte_order="big")
+        + _cpio_binary_member(
+            "TRAILER!!!", mode=0, inode=2, byte_order="big",
+        )
+    )
+    padding_length = 512 - (len(first_archive) % 512)
+    second_archive = _cpio_newc_archive(
+        _cpio_newc_member("second.txt", b"second", inode=3),
+    )
+    evidence = tmp_path / "concatenated.cpio"
+    evidence.write_bytes(
+        first_archive + b"\x00" * padding_length + second_archive
+    )
+    artifact = _artifact(evidence)
+    observations = GenericTriageEngine().analyze(artifact, evidence)
+    values = _values(observations)
+
+    assert values["archive.cpio.complete"] is True
+    assert values["archive.cpio.archive_count"] == 2
+    assert values["archive.cpio.formats"] == ["bin", "newc"]
+    assert values["archive.cpio.format_consistent"] is True
+    assert len(values["archive.cpio.trailers"]) == 2
+    entries = values["archive.cpio.entries"]
+    assert [item["name"] for item in entries] == ["first.bin", "second.txt"]
+    assert [item["archive_index"] for item in entries] == [0, 1]
+    assert [item["archive_entry_index"] for item in entries] == [0, 0]
+    segments = values["archive.cpio.archive_segments"]
+    assert segments[0]["archive_start_offset"] == 0
+    assert segments[0]["entry_count"] == 1
+    assert segments[0]["inter_archive_zero_padding_length"] == padding_length
+    assert segments[0]["next_archive_offset"] == 512
+    assert segments[1]["archive_start_offset"] == 512
+    assert segments[1]["format"] == "newc"
+    assert segments[1]["entry_count"] == 1
+    assert segments[1]["next_archive_offset"] is None
+
+    malformed = tmp_path / "concatenated-malformed.cpio"
+    malformed.write_bytes(
+        first_archive + b"\x00" * 8 + b"BAD!" + second_archive
+    )
+    malformed_artifact = _artifact(malformed)
+    malformed_observations = GenericTriageEngine().analyze(
+        malformed_artifact, malformed,
+    )
+    malformed_values = _values(malformed_observations)
+    assert malformed_values["archive.cpio.complete"] is False
+    assert malformed_values["archive.cpio.archive_count"] == 1
+    assert [
+        item["name"] for item in malformed_values["archive.cpio.entries"]
+    ] == ["first.bin"]
+    assert "do not begin an aligned recognized header" in malformed_values[
+        "archive.cpio.structure_error"
+    ]
+
+
+def test_concatenated_cpio_padding_scan_has_fixed_per_segment_read_bound(
+    tmp_path: Path,
+) -> None:
+    archive_count = 128
+    payload = b"".join(
+        _cpio_newc_archive(
+            _cpio_newc_member(f"member-{index}.txt", b"x", inode=index + 1),
+        )
+        for index in range(archive_count)
+    )
+    evidence = tmp_path / "many-concatenated.cpio"
+    evidence.write_bytes(payload)
+    artifact = _artifact(evidence)
+    values = _values(GenericTriageEngine().analyze(artifact, evidence))
+
+    assert values["archive.cpio.complete"] is True
+    assert values["archive.cpio.archive_count"] == archive_count
+    assert values["archive.cpio.entry_count"] == archive_count
+    assert values["archive.cpio.bytes_read"] <= (
+        len(payload) + (archive_count - 1) * (4_096 + 6)
+    )
+
+
+def test_cpio_hard_link_groups_choose_one_data_bearing_inode_member(
+    tmp_path: Path,
+) -> None:
+    evidence = tmp_path / "hard-links.cpio"
+    evidence.write_bytes(_cpio_newc_archive(
+        _cpio_newc_member(
+            "alias.txt", inode=41, link_count=3,
+        ),
+        _cpio_newc_member(
+            "canonical.txt", b"hard-link-content", inode=41, link_count=3,
+        ),
+    ))
+    artifact = _artifact(evidence)
+    observations = GenericTriageEngine().analyze(artifact, evidence)
+    values = _values(observations)
+
+    alias, canonical = values["archive.cpio.entries"]
+    assert alias["cpio_hard_link_role"] == "alias"
+    assert alias["cpio_hard_link_extraction_eligible"] is False
+    assert canonical["cpio_hard_link_role"] == "canonical"
+    assert canonical["cpio_hard_link_extraction_eligible"] is True
+    assert alias["cpio_hard_link_group_id"] == canonical[
+        "cpio_hard_link_group_id"
+    ]
+    group = values["archive.cpio.hard_link_groups"][0]
+    assert group["archive_index"] == 0
+    assert group["device_identity"] == ["major_minor", 0, 0]
+    assert group["inode"] == 41
+    assert group["declared_link_count"] == 3
+    assert group["observed_member_count"] == 2
+    assert group["complete"] is False
+    assert group["partial"] is True
+    assert group["canonical_name"] == "canonical.txt"
+    assert group["reconciled"] is True
+    assert group["host_hard_link_created"] is False
+    assert values["archive.cpio.hard_link_errors"] == []
+    profile = ProfileEngine().evaluate(artifact, observations)
+    assert any(
+        item.category == "archive_hard_link_metadata"
+        and "canonical.txt" in " ".join(item.supporting_evidence)
+        for item in profile.findings
+    )
+
+    ambiguous = tmp_path / "hard-links-ambiguous.cpio"
+    ambiguous.write_bytes(_cpio_newc_archive(
+        _cpio_newc_member(
+            "one.txt", b"one", inode=42, link_count=2,
+        ),
+        _cpio_newc_member(
+            "two.txt", b"two", inode=42, link_count=2,
+        ),
+    ))
+    ambiguous_artifact = _artifact(ambiguous)
+    ambiguous_observations = GenericTriageEngine().analyze(
+        ambiguous_artifact, ambiguous,
+    )
+    ambiguous_values = _values(ambiguous_observations)
+    ambiguous_group = ambiguous_values["archive.cpio.hard_link_groups"][0]
+    assert ambiguous_group["reconciled"] is False
+    assert "data_bearing_member_count" in ambiguous_group["failed_checks"]
+    assert all(
+        item["cpio_hard_link_role"] == "ambiguous"
+        and item["cpio_hard_link_extraction_eligible"] is False
+        for item in ambiguous_values["archive.cpio.entries"]
+    )
+    assert ambiguous_values["archive.cpio.hard_link_errors"][0][
+        "reason"
+    ] == "cpio_hard_link_inconsistency"
+    ambiguous_profile = ProfileEngine().evaluate(
+        ambiguous_artifact, ambiguous_observations,
+    )
+    assert any(
+        item.category == "cpio_hard_link_anomaly"
+        for item in ambiguous_profile.findings
+    )
+
+    mixed = tmp_path / "hard-links-mixed-counts.cpio"
+    mixed.write_bytes(_cpio_newc_archive(
+        _cpio_newc_member(
+            "alias.txt", inode=43, link_count=2,
+        ),
+        _cpio_newc_member(
+            "payload.txt", b"must-remain-metadata", inode=43, link_count=1,
+        ),
+    ))
+    mixed_artifact = _artifact(mixed)
+    mixed_values = _values(
+        GenericTriageEngine().analyze(mixed_artifact, mixed)
+    )
+    mixed_group = mixed_values["archive.cpio.hard_link_groups"][0]
+    assert mixed_group["reconciled"] is False
+    assert "declared_link_count_mismatch" in mixed_group["failed_checks"]
+    assert all(
+        item["cpio_hard_link_role"] == "ambiguous"
+        and item["cpio_hard_link_extraction_eligible"] is False
+        and item["cpio_hard_link_group_id"] == mixed_group["group_id"]
+        for item in mixed_values["archive.cpio.entries"]
+    )
+
+
+def test_iso9660_extended_attribute_records_gate_file_extents(
+    tmp_path: Path,
+) -> None:
+    image, payload, extended_attribute = _iso9660_with_extended_attribute()
+    evidence = tmp_path / "extended-attribute.iso"
+    evidence.write_bytes(image)
+    artifact = _artifact(evidence)
+    observations = GenericTriageEngine().analyze(artifact, evidence)
+    values = _values(observations)
+
+    regular = values["archive.iso9660.regular_files"][0]
+    assert regular["extended_attribute_blocks"] == 1
+    assert regular["extent_block"] == 21
+    assert regular["data_offset"] == 22 * 2_048
+    assert regular["data_length"] == len(payload)
+    assert regular["iso9660_extended_attribute_valid"] is True
+    assert regular["iso9660_extended_attribute_extraction_eligible"] is True
+    assert regular["extraction_eligible"] is True
+    records = values["archive.iso9660.extended_attributes"]
+    assert len(records) == 1
+    record = records[0]
+    assert record["namespace"] == "primary"
+    assert record["directory_record_offset"] == regular["record_offset"]
+    assert record["archive_path"] == "XATTR.TXT"
+    assert record["offset"] == 21 * 2_048
+    assert record["length"] == 2_048
+    assert record["end_offset"] == 22 * 2_048
+    assert record["data_offset"] == 22 * 2_048
+    assert record["data_starts_after_record"] is True
+    assert record["raw_sha256"] == hashlib.sha256(extended_attribute).hexdigest()
+    assert record["owner_id"] == 0
+    assert record["owner_id_both_endian_match"] is True
+    assert record["group_id"] == 0
+    assert record["group_id_both_endian_match"] is True
+    assert record["permissions"] == "0xaaaa"
+    assert record["mandatory_permission_bits_valid"] is True
+    assert record["timestamps"]["creation"]["utc"] == (
+        "2026-09-07T14:19:00+00:00"
+    )
+    assert record["timestamps"]["modification"]["unspecified"] is True
+    assert record["record_format"] == 0
+    assert record["record_length"] == 0
+    assert record["system_identifier"] == "FORENSICKIT"
+    assert record["system_use_length"] == 64
+    assert record["version"] == 1
+    assert record["reserved_all_zero"] is True
+    assert record["application_use_length"] == len(b"FORENSIC-XAR")
+    assert record["application_use_raw_sha256"] == hashlib.sha256(
+        b"FORENSIC-XAR"
+    ).hexdigest()
+    assert record["escape_sequences_raw_hex"] == b"%G".hex()
+    assert record["padding_all_zero"] is True
+    assert record["shared_range_cache_hit"] is False
+    assert record["range_read_bytes"] == 2_048
+    assert record["bytes_read_total_after_record"] == 2_048
+    assert record["failed_checks"] == []
+    assert record["valid"] is True
+    assert record["extraction_eligible"] is True
+    assert values["archive.iso9660.extended_attribute_errors"] == []
+    assert values["archive.iso9660.extended_attribute_bytes_read"] == 2_048
+    assert values[
+        "archive.iso9660.extended_attribute_byte_limit_per_namespace"
+    ] == 8 * 1_024 * 1_024
+    assert values[
+        "archive.iso9660.extended_attribute_record_limit_per_namespace"
+    ] == 1_064
+    profile = ProfileEngine().evaluate(artifact, observations)
+    assert any(
+        item.category == "archive_extended_attribute_metadata"
+        and item.severity == "info"
+        for item in profile.findings
+    )
+
+    bad_image, _, _ = _iso9660_with_extended_attribute(corrupt_reserved=True)
+    bad_path = tmp_path / "bad-extended-attribute.iso"
+    bad_path.write_bytes(bad_image)
+    bad_artifact = _artifact(bad_path)
+    bad_observations = GenericTriageEngine().analyze(bad_artifact, bad_path)
+    bad_values = _values(bad_observations)
+    bad_regular = bad_values["archive.iso9660.regular_files"][0]
+    bad_record = bad_values["archive.iso9660.extended_attributes"][0]
+    assert bad_record["valid"] is False
+    assert "reserved_bytes" in bad_record["failed_checks"]
+    assert bad_regular["extraction_eligible"] is False
+    assert bad_values["archive.iso9660.extended_attribute_errors"]
+    bad_profile = ProfileEngine().evaluate(bad_artifact, bad_observations)
+    assert any(
+        item.category == "iso9660_extended_attribute_anomaly"
+        and item.severity == "medium"
+        for item in bad_profile.findings
+    )
 
 
 def test_iso9660_primary_volume_and_root_records_preserve_both_endian_extents(tmp_path: Path) -> None:
@@ -2071,6 +2597,91 @@ def test_iso9660_multi_extent_chains_require_adjacent_matching_final_records(
     )
 
 
+def test_iso9660_multi_extent_xars_are_validated_per_section_and_reconciled(
+    tmp_path: Path,
+) -> None:
+    image, assembled = _iso9660_with_multi_extent_file(
+        extended_attributes=True,
+    )
+    evidence = tmp_path / "multi-extent-xar.iso"
+    evidence.write_bytes(image)
+    artifact = _artifact(evidence)
+
+    observations = GenericTriageEngine().analyze(artifact, evidence)
+    values = _values(observations)
+    head, tail = values["archive.iso9660.root_directory_entries"][2:4]
+    assert head["data_offset"] == 22 * 2_048
+    assert tail["data_offset"] == 24 * 2_048
+    assert head["assembled_data_length"] == len(assembled)
+    assert head["extraction_eligible"] is True
+    assert tail["extraction_eligible"] is False
+    xars = values["archive.iso9660.extended_attributes"]
+    assert len(xars) == 2
+    assert all(item["valid"] is True for item in xars)
+    assert [item["record_format"] for item in xars] == [1, 1]
+    assert [item["record_length"] for item in xars] == [16, 16]
+    assert xars[0]["raw_sha256"] != xars[1]["raw_sha256"]
+    consistency = values[
+        "archive.iso9660.multi_extent_extended_attribute_consistency"
+    ][0]
+    assert consistency["valid"] is True
+    assert consistency["extraction_eligible"] is True
+    assert consistency["present_segment_indices"] == [0, 1]
+    assert consistency["valid_segment_indices"] == [0, 1]
+    assert consistency["record_metadata_required_for_all_sections"] is True
+    assert consistency["record_format_values"] == [1]
+    assert consistency["record_attribute_values"] == [0]
+    assert consistency["fixed_record_length_values"] == [16]
+    assert consistency["failed_checks"] == []
+    assert head["multi_extent_chain"]["extended_attribute_consistency"] == consistency
+    assert [
+        segment["iso9660_extended_attribute"]["raw_sha256"]
+        for segment in head["multi_extent_segments"]
+    ] == [item["raw_sha256"] for item in xars]
+    assert values["archive.iso9660.extended_attribute_errors"] == []
+    assert values["archive.iso9660.multi_extent_errors"] == []
+
+    bad_image, _ = _iso9660_with_multi_extent_file(
+        extended_attributes=True,
+        final_record_attributes=1,
+        final_record_length=32,
+    )
+    bad_path = tmp_path / "multi-extent-xar-mismatch.iso"
+    bad_path.write_bytes(bad_image)
+    bad_artifact = _artifact(bad_path)
+    bad_observations = GenericTriageEngine().analyze(bad_artifact, bad_path)
+    bad_values = _values(bad_observations)
+    bad_head = bad_values["archive.iso9660.root_directory_entries"][2]
+    bad_consistency = bad_values[
+        "archive.iso9660.multi_extent_extended_attribute_consistency"
+    ][0]
+    assert all(
+        item["valid"] is True
+        for item in bad_values["archive.iso9660.extended_attributes"]
+    )
+    assert bad_consistency["valid"] is False
+    assert bad_consistency["extraction_eligible"] is False
+    assert "record_attributes_mismatch" in bad_consistency["failed_checks"]
+    assert "fixed_record_length_mismatch" in bad_consistency["failed_checks"]
+    assert bad_head["multi_extent_assembled"] is True
+    assert bad_head["multi_extent_chain"]["complete"] is True
+    assert bad_head["multi_extent_chain"]["extraction_eligible"] is False
+    assert bad_head["extraction_eligible"] is False
+    assert any(
+        item["reason"] == "multi_extent_extended_attribute_inconsistency"
+        for item in bad_values["archive.iso9660.multi_extent_errors"]
+    )
+    bad_profile = ProfileEngine().evaluate(bad_artifact, bad_observations)
+    assert any(
+        item.category == "iso9660_extended_attribute_anomaly"
+        for item in bad_profile.findings
+    )
+    assert any(
+        item.category == "iso9660_multi_extent_anomaly"
+        for item in bad_profile.findings
+    )
+
+
 def test_iso9660_multi_extent_segment_limit_suppresses_overflow_tail() -> None:
     block_size = 2_048
     records: list[dict[str, object]] = []
@@ -2244,6 +2855,86 @@ def test_iso9660_path_table_endian_copies_reconcile_active_directories(
     assert any(
         item.category == "iso9660_path_table_anomaly"
         for item in divergent_profile.findings
+    )
+
+
+def test_iso9660_path_table_xar_lengths_reconcile_to_directory_records(
+    tmp_path: Path,
+) -> None:
+    block_size = 2_048
+    image, _ = _iso9660_with_subdirectory(
+        path_tables=True, path_table_xar=True,
+    )
+    evidence = tmp_path / "path-table-xar.iso"
+    evidence.write_bytes(image)
+    artifact = _artifact(evidence)
+    observations = GenericTriageEngine().analyze(artifact, evidence)
+    values = _values(observations)
+
+    little, big = values["archive.iso9660.path_tables"]
+    for table in (little, big):
+        subdir = table["entries"][1]
+        assert subdir["extended_attribute_blocks"] == 1
+        assert subdir["extended_attribute_offset"] == 22 * block_size
+        assert subdir["extended_attribute_length"] == block_size
+        assert subdir["extended_attribute_end_offset"] == 23 * block_size
+        assert subdir["extended_attribute_range_valid"] is True
+        assert subdir["data_offset"] == 23 * block_size
+    reconciliation = values["archive.iso9660.path_table_reconciliation"]
+    subdir_reconciliation = reconciliation[1]
+    assert subdir_reconciliation["path_table_extended_attribute_blocks"] == 1
+    assert subdir_reconciliation[
+        "directory_record_extended_attribute_blocks"
+    ] == 1
+    assert subdir_reconciliation["extended_attribute_length_match"] is True
+    assert subdir_reconciliation["data_offset_match"] is True
+    assert subdir_reconciliation[
+        "directory_extended_attribute_validation_required"
+    ] is True
+    assert subdir_reconciliation["directory_extended_attribute_valid"] is True
+    assert subdir_reconciliation["directory_extended_attribute_offset"] == (
+        22 * block_size
+    )
+    assert subdir_reconciliation["directory_extended_attribute_length"] == (
+        block_size
+    )
+    assert isinstance(
+        subdir_reconciliation["directory_extended_attribute_raw_sha256"], str,
+    )
+    assert subdir_reconciliation["reconciled"] is True
+    comparison = values["archive.iso9660.path_table_comparison"]
+    assert comparison["consistent"] is True
+    assert comparison["all_entries_reconciled"] is True
+    assert comparison["extended_attribute_entries_reconciled"] == 1
+
+    mismatch_image, _ = _iso9660_with_subdirectory(
+        path_tables=True, path_table_xar=True, path_table_xar_mismatch=True,
+    )
+    mismatch_path = tmp_path / "path-table-xar-mismatch.iso"
+    mismatch_path.write_bytes(mismatch_image)
+    mismatch_artifact = _artifact(mismatch_path)
+    mismatch_observations = GenericTriageEngine().analyze(
+        mismatch_artifact, mismatch_path,
+    )
+    mismatch_values = _values(mismatch_observations)
+    mismatch_comparison = mismatch_values["archive.iso9660.path_table_comparison"]
+    mismatch_reconciliation = mismatch_values[
+        "archive.iso9660.path_table_reconciliation"
+    ][1]
+    assert mismatch_comparison["consistent"] is True
+    assert mismatch_comparison["all_entries_reconciled"] is False
+    assert mismatch_reconciliation["extended_attribute_length_match"] is False
+    assert mismatch_reconciliation["data_offset_match"] is False
+    assert mismatch_reconciliation["reconciled"] is False
+    mismatch_profile = ProfileEngine().evaluate(
+        mismatch_artifact, mismatch_observations,
+    )
+    assert any(
+        item.category == "iso9660_path_table_anomaly"
+        and "extended_attribute_length_match" in " ".join(
+            item.supporting_evidence
+        )
+        for item in mismatch_profile.findings
     )
 
 

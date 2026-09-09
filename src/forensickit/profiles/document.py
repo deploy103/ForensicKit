@@ -196,4 +196,46 @@ class SqliteProfile(BaseProfile):
                     severity="low",
                 )
             )
+        browser_records = next(
+            (value for value in context.values("browser.wal_records") if isinstance(value, list) and value),
+            next((value for value in context.values("browser.records") if isinstance(value, list)), []),
+        )
+        browser_family = next(
+            (value for value in context.values("browser.wal_family") if isinstance(value, str)),
+            next((value for value in context.values("browser.family") if isinstance(value, str)), None),
+        )
+        if browser_family and browser_records:
+            kinds: dict[str, int] = {}
+            for record in browser_records:
+                if isinstance(record, dict):
+                    kind = str(record.get("kind") or "unknown")
+                    kinds[kind] = kinds.get(kind, 0) + 1
+            result.findings.append(self.finding(
+                context,
+                title=f"{browser_family.title()} browser activity records normalized",
+                category="browser_activity_inventory",
+                confidence=0.92,
+                explanation=(
+                    "Fixed, read-only queries matched a known browser schema and normalized bounded visit, download, search, or form-history rows. "
+                    "Raw timestamps and their epoch/unit are retained beside UTC conversions; a history record is evidence of stored application state, not proof of a particular user's action."
+                ),
+                evidence=[f"record_counts={kinds}", *[str(item)[:2_000] for item in browser_records[:50]]],
+                severity="info",
+            ))
+        if context.truthy("browser.wal_applied"):
+            companions = next(
+                (value for value in context.values("browser.wal_companions") if isinstance(value, list)), []
+            )
+            result.findings.append(self.finding(
+                context,
+                title="Supplied browser SQLite WAL included in read-only snapshot",
+                category="browser_sqlite_wal",
+                confidence=0.97,
+                explanation=(
+                    "An exactly named, independently ingested WAL companion with a valid SQLite WAL signature was copied beside the database in case cache and read in query-only mode. "
+                    "The original database, WAL, and optional SHM evidence were not modified."
+                ),
+                evidence=[str(item)[:2_000] for item in companions],
+                severity="info",
+            ))
         return result

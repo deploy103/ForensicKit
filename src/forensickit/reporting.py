@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import html
 import json
 from dataclasses import asdict
 from datetime import UTC, datetime
@@ -27,7 +28,7 @@ def _json_value(value: Any) -> Any:
 class ReportGenerator:
     _TIMELINE_FIELDS = (
         "artifact_id", "artifact_name", "timestamp", "timestamp_utc", "event_id",
-        "category", "event_record_id", "record_offset", "record_size", "chunk_index",
+        "category", "event_record_id", "record_offset", "record_hive_offset", "record_size", "chunk_index",
         "provider", "channel", "computer", "user", "target_user", "process_id",
         "parent_process_id", "process_path", "command_line", "source_ip", "destination_ip",
         "service_name", "task_name", "cluster_start_utc", "cluster_end_utc", "cluster_score",
@@ -39,6 +40,10 @@ class ReportGenerator:
         "mft_artifact_id", "mft_artifact_name", "mft_observation_id",
         "sample_file_names", "sample_deleted", "sample_physical_segments",
         "remaining_extents", "number_of_extents", "extent_size", "extents",
+        "record_kind", "browser_family", "table", "row_id", "url", "title",
+        "path", "search_term", "timestamp_raw", "timestamp_basis", "application_id",
+        "registry_key_path", "registry_value_name", "registry_cache_format",
+        "registry_record_name", "registry_program_id", "registry_file_id",
     )
 
     def generate(self, workspace: CaseWorkspace) -> tuple[Path, Path]:
@@ -47,19 +52,25 @@ class ReportGenerator:
         artifacts = database.artifacts()
         observations = database.observations()
         findings = database.findings()
+        hypotheses = database.hypotheses()
+        verifications = database.verifications()
         runs = database.tool_runs()
         flags = database.flags()
+        search_hits = database.search_hits()
         errors = database.errors()
         graph = ArtifactGraph(artifacts)
         report = _json_value(
             {
-                "schema_version": 2,
+                "schema_version": 4,
                 "case": asdict(case),
                 "artifacts": [asdict(item) for item in artifacts],
                 "observations": [asdict(item) for item in observations],
+                "hypotheses": [asdict(item) for item in hypotheses],
+                "verifications": [asdict(item) for item in verifications],
                 "findings": [asdict(item) for item in findings],
                 "tool_runs": [asdict(item) for item in runs],
                 "flag_candidates": [asdict(item) for item in flags],
+                "search_hits": [asdict(item) for item in search_hits],
                 "errors": [asdict(item) for item in errors],
                 "artifact_graph": graph.as_mapping(),
             }
@@ -68,8 +79,11 @@ class ReportGenerator:
         json_path = workspace.path("reports", "report.json")
         markdown_path = workspace.path("reports", "report.md")
         timeline_path = workspace.path("reports", "timeline.csv")
+        search_path = workspace.path("reports", "search_results.csv")
+        html_path = workspace.path("reports", "report.html")
         json_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         markdown_path.write_text(self._markdown(report), encoding="utf-8")
+        html_path.write_text(self._html(report), encoding="utf-8")
         with timeline_path.open("w", encoding="utf-8", newline="") as stream:
             writer = csv.DictWriter(stream, fieldnames=self._TIMELINE_FIELDS, extrasaction="ignore")
             writer.writeheader()
@@ -77,7 +91,44 @@ class ReportGenerator:
                 writer.writerow({
                     key: self._csv_safe(row.get(key, "")) for key in self._TIMELINE_FIELDS
                 })
+        self._write_search_csv(search_path, report)
         return json_path, markdown_path
+
+    @classmethod
+    def _write_search_csv(cls, path: Path, report: dict[str, Any]) -> None:
+        fields = (
+            "result_type", "match_type", "query", "value", "status",
+            "artifact_id", "origin_path", "discovered_path", "source_kind",
+            "source", "location", "offset", "encoding", "transform_chain", "context",
+        )
+        with path.open("w", encoding="utf-8", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=fields)
+            writer.writeheader()
+            for result_type, records in (
+                ("flag_candidate", report.get("flag_candidates", [])),
+                ("search_hit", report.get("search_hits", [])),
+            ):
+                for record in records:
+                    locations = record.get("locations") or [record]
+                    for location in locations:
+                        row = {
+                            "result_type": result_type,
+                            "match_type": record.get("match_type", "flag"),
+                            "query": record.get("query", ""),
+                            "value": record.get("value", ""),
+                            "status": record.get("status", ""),
+                            "artifact_id": location.get("artifact_id", record.get("artifact_id", "")),
+                            "origin_path": location.get("origin_path", record.get("origin_path", "")),
+                            "discovered_path": location.get("discovered_path", record.get("discovered_path", "")),
+                            "source_kind": location.get("source_kind", record.get("source_kind", "")),
+                            "source": location.get("source", record.get("source", "")),
+                            "location": location.get("location", record.get("location", "")),
+                            "offset": location.get("offset", record.get("offset", "")),
+                            "encoding": location.get("encoding", record.get("encoding", "")),
+                            "transform_chain": " -> ".join(location.get("transform_chain", record.get("transform_chain", []))),
+                            "context": location.get("context", record.get("context", "")),
+                        }
+                        writer.writerow({key: cls._csv_safe(value) for key, value in row.items()})
 
     @staticmethod
     def _event_identity(artifact_id: object, event: dict[str, Any]) -> tuple[object, ...]:
@@ -281,6 +332,119 @@ class ReportGenerator:
                     ):
                         if value and value not in lists[key]:
                             lists[key].append(value)
+        browser_families: dict[object, str] = {}
+        application_ids: dict[object, str] = {}
+        for observation in report.get("observations", []):
+            if not isinstance(observation, dict):
+                continue
+            if observation.get("key") in {"browser.family", "browser.wal_family"} and isinstance(observation.get("value"), str):
+                browser_families[observation.get("artifact_id")] = str(observation["value"])
+            elif observation.get("key") == "jumplist.application_id" and isinstance(observation.get("value"), str):
+                application_ids[observation.get("artifact_id")] = str(observation["value"])
+        for observation in report.get("observations", []):
+            if not isinstance(observation, dict) or observation.get("key") not in {
+                "browser.records", "browser.wal_records", "jumplist.destinations",
+                "registry.amcache.records", "registry.shimcache.records",
+            }:
+                continue
+            records = observation.get("value")
+            if not isinstance(records, list):
+                continue
+            artifact_id = observation.get("artifact_id")
+            source = str(observation.get("source") or "")
+            for index, record in enumerate(records[:5_000]):
+                if not isinstance(record, dict):
+                    continue
+                observation_key = observation.get("key")
+                if observation_key == "jumplist.destinations":
+                    identity = (artifact_id, "jumplist", record.get("entry_id"), record.get("stream_offset"))
+                    timestamp = record.get("last_access_time_utc")
+                    row = rows_by_identity.setdefault(identity, {
+                        "artifact_id": artifact_id, "artifact_name": artifacts.get(artifact_id, ""),
+                        "event_id": "JUMPLIST_DESTLIST", "category": "windows_jumplist",
+                        "record_kind": "destination", "row_id": record.get("entry_id"),
+                        "record_offset": record.get("stream_offset"), "record_size": record.get("record_length"),
+                        "path": record.get("path"), "computer": record.get("hostname"),
+                        "timestamp": timestamp, "timestamp_utc": timestamp,
+                        "timestamp_raw": record.get("last_access_time_raw_filetime"),
+                        "timestamp_basis": "100ns intervals since 1601-01-01 UTC",
+                        "application_id": application_ids.get(artifact_id, ""),
+                    })
+                elif observation_key in {"browser.records", "browser.wal_records"}:
+                    kind = str(record.get("kind") or "browser_record")
+                    identity = (
+                        artifact_id, "browser", kind, record.get("table"),
+                        record.get("row_id", index),
+                    )
+                    timestamp_key = (
+                        "visit_time" if "visit_time_utc" in record else
+                        "visit_date" if "visit_date_utc" in record else
+                        "start_time" if "start_time_utc" in record else
+                        "last_used" if "last_used_utc" in record else None
+                    )
+                    timestamp = record.get(f"{timestamp_key}_utc") if timestamp_key else None
+                    row = rows_by_identity.setdefault(identity, {
+                        "artifact_id": artifact_id, "artifact_name": artifacts.get(artifact_id, ""),
+                        "event_id": f"BROWSER_{kind.upper()}", "category": "browser_activity",
+                        "record_kind": kind, "browser_family": browser_families.get(artifact_id, ""),
+                        "table": record.get("table"), "row_id": record.get("row_id"),
+                        "url": record.get("url"), "title": record.get("title"),
+                        "path": record.get("path"), "search_term": record.get("term") or record.get("value"),
+                        "timestamp": timestamp, "timestamp_utc": timestamp,
+                        "timestamp_raw": record.get(f"{timestamp_key}_raw") if timestamp_key else None,
+                        "timestamp_basis": record.get(f"{timestamp_key}_basis") if timestamp_key else None,
+                    })
+                elif observation_key == "registry.amcache.records":
+                    identity = (
+                        artifact_id, "amcache", record.get("key_file_offset"),
+                        record.get("key_path"),
+                    )
+                    timestamp = record.get("key_last_write_time_utc")
+                    row = rows_by_identity.setdefault(identity, {
+                        "artifact_id": artifact_id, "artifact_name": artifacts.get(artifact_id, ""),
+                        "event_id": f"AMCACHE_{str(record.get('record_kind') or 'RECORD').upper()}",
+                        "category": "windows_amcache", "record_kind": record.get("record_kind"),
+                        "record_offset": record.get("key_file_offset"),
+                        "record_hive_offset": record.get("key_hive_offset"),
+                        "path": record.get("path"), "title": record.get("name"),
+                        "timestamp": timestamp, "timestamp_utc": cls._utc_timestamp(timestamp),
+                        "timestamp_raw": record.get("key_last_write_time_raw_filetime"),
+                        "timestamp_basis": record.get("timestamp_basis"),
+                        "registry_key_path": record.get("key_path"),
+                        "registry_record_name": record.get("key_name"),
+                        "registry_program_id": record.get("program_id"),
+                        "registry_file_id": record.get("file_id"),
+                    })
+                else:
+                    identity = (
+                        artifact_id, "shimcache", record.get("value_hive_offset"),
+                        record.get("entry_offset_in_value"),
+                    )
+                    timestamp = record.get("last_modified_time_utc")
+                    row = rows_by_identity.setdefault(identity, {
+                        "artifact_id": artifact_id, "artifact_name": artifacts.get(artifact_id, ""),
+                        "event_id": "SHIMCACHE_ENTRY", "category": "windows_shimcache",
+                        "record_kind": record.get("record_kind"),
+                        "record_offset": record.get("entry_file_offset"),
+                        "record_hive_offset": record.get("entry_hive_offset"),
+                        "record_size": record.get("entry_size"), "path": record.get("path"),
+                        "timestamp": timestamp, "timestamp_utc": cls._utc_timestamp(timestamp),
+                        "timestamp_raw": record.get("last_modified_time_raw_filetime"),
+                        "timestamp_basis": record.get("timestamp_basis"),
+                        "registry_key_path": record.get("key_path"),
+                        "registry_value_name": record.get("value_name"),
+                        "registry_cache_format": record.get("cache_format"),
+                    })
+                lists = source_lists.setdefault(identity, {
+                    "sources": [], "source_observation_ids": [],
+                    "tool_run_ids": [], "raw_stdout_paths": [],
+                })
+                for key, value in (
+                    ("sources", source),
+                    ("source_observation_ids", str(observation.get("id") or "")),
+                ):
+                    if value and value not in lists[key]:
+                        lists[key].append(value)
         rows: list[dict[str, Any]] = []
         for identity, row in rows_by_identity.items():
             for key, values in source_lists[identity].items():
@@ -322,9 +486,42 @@ class ReportGenerator:
         if flags:
             for flag in flags:
                 chain = " → ".join(flag["transform_chain"])
-                lines.append(f"- **`{flag['value']}`** — {chain}; {flag.get('location') or 'location unknown'}")
+                value = str(flag["value"]).replace("`", "\\`")
+                locations = flag.get("locations") or [flag]
+                lines.append(
+                    f"- **`{value}`** — status `candidate`, {chain}; "
+                    f"{len(locations)} preserved location(s). This is not an automatic answer verdict."
+                )
+                for location in locations[:50]:
+                    lines.append(
+                        "  - "
+                        f"`{location.get('source_kind', 'unknown')}` · "
+                        f"origin `{location.get('origin_path') or 'unknown'}` · "
+                        f"found in `{location.get('discovered_path') or 'unknown'}` · "
+                        f"{location.get('location') or 'location unknown'} · "
+                        f"encoding `{location.get('encoding') or 'unknown'}` · "
+                        f"chain `{' → '.join(location.get('transform_chain') or [])}` · "
+                        f"context `{str(location.get('context') or '').replace('`', '\\`')}`"
+                    )
         else:
             lines.append("No flag candidates detected.")
+        lines.extend(["", "## Search hits", ""])
+        if report.get("search_hits"):
+            for hit in report["search_hits"]:
+                locations = hit.get("locations") or [hit]
+                lines.append(
+                    f"- `{hit.get('match_type')}` query `{str(hit.get('query') or '').replace('`', '\\`')}` "
+                    f"matched `{str(hit.get('value') or '').replace('`', '\\`')}` at {len(locations)} location(s)."
+                )
+                for location in locations[:50]:
+                    lines.append(
+                        f"  - `{location.get('source_kind', 'unknown')}` · "
+                        f"`{location.get('discovered_path') or 'unknown'}` · "
+                        f"{location.get('location') or 'location unknown'} · "
+                        f"context `{str(location.get('context') or '').replace('`', '\\`')}`"
+                    )
+        else:
+            lines.append("No exact-string, keyword, or explicit-regex hits requested/detected.")
         lines.extend(["", "## Analysis errors", ""])
         if report["errors"]:
             for error in report["errors"]:
@@ -369,6 +566,49 @@ class ReportGenerator:
                 )
         else:
             lines.extend(["No findings recorded.", ""])
+        lines.extend(["## Investigation chain", ""])
+        hypotheses_by_finding = {
+            item.get("finding_id"): item for item in report.get("hypotheses", [])
+        }
+        verifications_by_finding = {
+            item.get("finding_id"): item for item in report.get("verifications", [])
+        }
+        if report.get("findings"):
+            for finding in report["findings"]:
+                finding_id = finding.get("id")
+                hypothesis = hypotheses_by_finding.get(finding_id)
+                verification = verifications_by_finding.get(finding_id)
+                if not hypothesis or not verification:
+                    lines.extend([
+                        f"### {finding.get('title')}", "",
+                        f"- Finding ID: `{finding_id}`",
+                        "- Chain status: `incomplete` (legacy or damaged case data)", "",
+                    ])
+                    continue
+                lines.extend([
+                    f"### {hypothesis.get('statement')}", "",
+                    f"- Finding ID: `{finding_id}`",
+                    f"- Artifact ID: `{hypothesis.get('artifact_id')}`",
+                    f"- Hypothesis source/confidence: `{hypothesis.get('source')}` / "
+                    f"`{float(hypothesis.get('confidence', 0.0)):.2f}`",
+                    f"- Verification: `{verification.get('status')}`",
+                    f"- Verification method: `{verification.get('method')}`",
+                    f"- Verification source: `{verification.get('source')}`",
+                    "",
+                    str(hypothesis.get("rationale") or "No rationale recorded."),
+                    "",
+                    f"Verification conclusion: {verification.get('conclusion')}",
+                    "",
+                    "Recorded evidence:",
+                ])
+                evidence = verification.get("evidence") or []
+                if evidence:
+                    lines.extend(f"- {item}" for item in evidence)
+                else:
+                    lines.append("- No supporting evidence recorded; this remains explicitly unverified.")
+                lines.append("")
+        else:
+            lines.extend(["No hypothesis or verification records available.", ""])
         lines.extend(["## Artifacts", ""])
         for artifact in report["artifacts"]:
             parent = artifact["parent_id"] or "root evidence"
@@ -461,3 +701,102 @@ class ReportGenerator:
         else:
             lines.append("No tool plans recorded.")
         return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def _html(report: dict[str, Any]) -> str:
+        """Render a dependency-free report with every evidence value escaped."""
+        esc = lambda value: html.escape(str(value if value is not None else ""), quote=True)
+        flag_rows: list[str] = []
+        for flag in report.get("flag_candidates", []):
+            locations = flag.get("locations") or [flag]
+            detail = "".join(
+                "<li>"
+                f"source={esc(item.get('source_kind'))}; "
+                f"origin={esc(item.get('origin_path'))}; "
+                f"found in={esc(item.get('discovered_path'))}; "
+                f"location={esc(item.get('location'))}; "
+                f"encoding={esc(item.get('encoding'))}; "
+                f"chain={esc(' → '.join(item.get('transform_chain') or []))}; "
+                f"context=<code>{esc(item.get('context'))}</code>"
+                "</li>"
+                for item in locations[:50]
+            )
+            flag_rows.append(
+                "<tr>"
+                f"<td><code>{esc(flag.get('value'))}</code></td>"
+                "<td>candidate (not automatically confirmed)</td>"
+                f"<td><ul>{detail}</ul></td>"
+                "</tr>"
+            )
+        hit_rows: list[str] = []
+        for hit in report.get("search_hits", []):
+            locations = hit.get("locations") or [hit]
+            detail = "".join(
+                "<li>"
+                f"{esc(item.get('source_kind'))}; {esc(item.get('discovered_path'))}; "
+                f"{esc(item.get('location'))}; context=<code>{esc(item.get('context'))}</code>"
+                "</li>"
+                for item in locations[:50]
+            )
+            hit_rows.append(
+                "<tr>"
+                f"<td>{esc(hit.get('match_type'))}</td>"
+                f"<td><code>{esc(hit.get('query'))}</code></td>"
+                f"<td><code>{esc(hit.get('value'))}</code></td>"
+                f"<td><ul>{detail}</ul></td>"
+                "</tr>"
+            )
+        findings_by_id = {
+            item.get("id"): item for item in report.get("findings", [])
+        }
+        verifications_by_finding = {
+            item.get("finding_id"): item
+            for item in report.get("verifications", [])
+        }
+        chain_rows: list[str] = []
+        for hypothesis in report.get("hypotheses", []):
+            finding_id = hypothesis.get("finding_id")
+            finding = findings_by_id.get(finding_id, {})
+            verification = verifications_by_finding.get(finding_id, {})
+            evidence = verification.get("evidence") or []
+            evidence_items = "".join(
+                f"<li><code>{esc(item)}</code></li>" for item in evidence
+            ) or "<li>No supporting evidence recorded; analyst verification is required.</li>"
+            chain_rows.append(
+                "<tr>"
+                f"<td><code>{esc(finding_id)}</code><br>{esc(finding.get('title'))}</td>"
+                f"<td>{esc(hypothesis.get('statement'))}<br>"
+                f"<small>{esc(hypothesis.get('rationale'))}</small><br>"
+                f"source=<code>{esc(hypothesis.get('source'))}</code></td>"
+                f"<td><strong>{esc(verification.get('status') or 'missing')}</strong><br>"
+                f"method=<code>{esc(verification.get('method'))}</code><br>"
+                f"source=<code>{esc(verification.get('source'))}</code><br>"
+                f"{esc(verification.get('conclusion'))}</td>"
+                f"<td><ul>{evidence_items}</ul></td>"
+                "</tr>"
+            )
+        artifact_rows = "".join(
+            "<tr>"
+            f"<td>{esc(item.get('logical_name'))}</td>"
+            f"<td>{esc(item.get('artifact_type'))}</td>"
+            f"<td><code>{esc(item.get('sha256'))}</code></td>"
+            f"<td>{esc(item.get('source_path'))}</td>"
+            "</tr>"
+            for item in report.get("artifacts", [])
+        )
+        return """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>ForensicKit report</title>
+<style>body{font:14px system-ui,sans-serif;margin:2rem;line-height:1.4}table{border-collapse:collapse;width:100%;margin-bottom:2rem}th,td{border:1px solid #bbb;padding:.45rem;vertical-align:top;text-align:left}code{white-space:pre-wrap;overflow-wrap:anywhere}ul{margin:.2rem;padding-left:1.2rem}.notice{padding:.7rem;background:#fff4cc}</style></head><body>""" + (
+            f"<h1>ForensicKit report: {esc(report.get('case', {}).get('name'))}</h1>"
+            "<p class=\"notice\">Flag strings are candidates for analyst validation, not automatically confirmed answers. "
+            "Program logs and evidence-derived output are labelled separately.</p>"
+            "<h2>Flag candidates</h2><table><thead><tr><th>Value</th><th>Status</th><th>Locations and provenance</th></tr></thead><tbody>"
+            + ("".join(flag_rows) or "<tr><td colspan=\"3\">None detected</td></tr>")
+            + "</tbody></table><h2>Search hits</h2><table><thead><tr><th>Type</th><th>Query</th><th>Value</th><th>Locations</th></tr></thead><tbody>"
+            + ("".join(hit_rows) or "<tr><td colspan=\"4\">None detected</td></tr>")
+            + "</tbody></table><h2>Investigation chain</h2><table><thead><tr><th>Finding</th><th>Hypothesis</th><th>Verification</th><th>Evidence</th></tr></thead><tbody>"
+            + ("".join(chain_rows) or "<tr><td colspan=\"4\">No hypothesis or verification records</td></tr>")
+            + "</tbody></table><h2>Artifacts</h2><table><thead><tr><th>Name</th><th>Type</th><th>SHA-256</th><th>Original path</th></tr></thead><tbody>"
+            + artifact_rows
+            + "</tbody></table></body></html>\n"
+        )
