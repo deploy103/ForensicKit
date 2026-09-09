@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -14,6 +15,12 @@ _OPERATORS = frozenset(
     {"equals", "not_equals", "greater_than", "less_than", "contains", "exists"}
 )
 _LOGICAL = frozenset({"all", "any"})
+_CONFIDENCE_TARGET_PREFIX = "classification:"
+_MAX_ACTIONS_PER_KIND = 32
+_MAX_ACTION_PARAMETERS = 16
+_MAX_ACTION_IDENTIFIER_LENGTH = 128
+_MAX_ACTION_PARAMETER_VALUE_LENGTH = 1_024
+_MAX_ACTION_PRIORITY = 1_000
 _OBSERVATION_ALIASES: dict[str, tuple[str, ...]] = {
     # ``artifact.format`` is the declarative rule vocabulary; the bounded
     # in-process triage engine records how it derived that value explicitly.
@@ -55,6 +62,14 @@ class RuleConfidenceChange:
     delta: float
     reason: str
     rule_id: str
+    status: str
+    previous_confidences: tuple[float, ...] = ()
+    updated_confidences: tuple[float, ...] = ()
+    detail: str = ""
+
+    @property
+    def applied(self) -> bool:
+        return self.status == "applied"
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,9 +203,24 @@ class RuleEngine:
             names = ", ".join(sorted(kwargs))
             raise TypeError(f"unexpected keyword argument(s): {names}")
         observation_index: dict[str, list[Any]] = {}
+        applied_confidence_changes: set[tuple[str, str, float]] = set()
         for observation in observations:
             if observation.artifact_id == artifact.id:
                 observation_index.setdefault(observation.key, []).append(observation.value)
+                if (
+                    observation.key == "rule.confidence_change"
+                    and isinstance(observation.value, Mapping)
+                    and observation.value.get("status") == "applied"
+                    and isinstance(observation.value.get("rule_id"), str)
+                    and isinstance(observation.value.get("target"), str)
+                    and isinstance(observation.value.get("delta"), (int, float))
+                    and not isinstance(observation.value.get("delta"), bool)
+                ):
+                    applied_confidence_changes.add((
+                        observation.value["rule_id"],
+                        observation.value["target"],
+                        float(observation.value["delta"]),
+                    ))
         active_profiles = _infer_profiles(artifact, observation_index) if profiles is None else {
             str(profile).lower() for profile in profiles
         }
@@ -228,22 +258,35 @@ class RuleEngine:
                     confidence=spec.confidence,
                 ))
             for target, delta, change_reason in rule.confidence_changes:
-                change = RuleConfidenceChange(
-                    target=target, delta=delta, reason=change_reason, rule_id=rule.id,
+                change = _apply_confidence_change(
+                    artifact,
+                    target=target,
+                    delta=delta,
+                    reason=change_reason,
+                    rule_id=rule.id,
+                    already_applied=(rule.id, target, delta) in applied_confidence_changes,
                 )
                 result.confidence_changes.append(change)
-                result.observations.append(Observation(
-                    artifact_id=artifact.id,
-                    key="rule.confidence_change",
-                    value={
-                        "target": target,
-                        "delta": delta,
-                        "reason": change_reason,
-                        "rule_id": rule.id,
-                    },
-                    source=f"rule:{rule.id}",
-                    confidence=1.0,
-                ))
+                # The original applied record already provides the durable
+                # audit trail when a bounded post-tool generation re-evaluates
+                # the same rule. Avoid manufacturing duplicate observations.
+                if change.status != "already_applied":
+                    result.observations.append(Observation(
+                        artifact_id=artifact.id,
+                        key="rule.confidence_change",
+                        value={
+                            "target": target,
+                            "delta": delta,
+                            "reason": change_reason,
+                            "rule_id": rule.id,
+                            "status": change.status,
+                            "previous_confidences": list(change.previous_confidences),
+                            "updated_confidences": list(change.updated_confidences),
+                            "detail": change.detail,
+                        },
+                        source=f"rule:{rule.id}",
+                        confidence=1.0,
+                    ))
             result.actions.extend(rule.actions)
             for action in rule.actions:
                 result.observations.append(Observation(
@@ -255,6 +298,8 @@ class RuleEngine:
                         "modes": sorted(mode.value for mode in action.modes),
                         "command_mode": action.command_mode,
                         "parameters": dict(action.parameters),
+                        "priority": action.priority,
+                        "disposition": "tool_recommendation",
                     },
                     source=f"rule:{rule.id}",
                     confidence=1.0,
@@ -345,6 +390,16 @@ def _parse_rule(
     if not isinstance(emit, Mapping):
         errors.append(RuleValidationError(f"{location}.emit", "emit must be a mapping", rule_id_for_error))
     else:
+        unknown_emit_keys = set(emit) - {
+            "findings", "recommend", "observations", "confidence_changes",
+            "parser_actions", "extractor_actions",
+        }
+        if unknown_emit_keys:
+            errors.append(RuleValidationError(
+                f"{location}.emit",
+                f"unsupported emit keys: {sorted(str(key) for key in unknown_emit_keys)}",
+                rule_id_for_error,
+            ))
         raw_findings = emit.get("findings", [])
         if not isinstance(raw_findings, list):
             errors.append(
@@ -417,19 +472,35 @@ def _parse_rule(
                 rule_id_for_error,
             ))
         else:
+            seen_change_targets: set[str] = set()
             for index, raw_change in enumerate(raw_changes):
                 change, change_errors = _parse_confidence_change(
                     raw_change, f"{location}.emit.confidence_changes[{index}]", rule_id_for_error
                 )
                 errors.extend(change_errors)
                 if change is not None:
-                    confidence_changes.append(change)
+                    if change[0] in seen_change_targets:
+                        errors.append(RuleValidationError(
+                            f"{location}.emit.confidence_changes[{index}].target",
+                            f"duplicate confidence target: {change[0]}",
+                            rule_id_for_error,
+                        ))
+                    else:
+                        seen_change_targets.add(change[0])
+                        confidence_changes.append(change)
 
         for key, kind in (("parser_actions", "parser"), ("extractor_actions", "extractor")):
             raw_actions = emit.get(key, [])
             if not isinstance(raw_actions, list):
                 errors.append(RuleValidationError(
                     f"{location}.emit.{key}", f"{key} must be a list", rule_id_for_error
+                ))
+                continue
+            if len(raw_actions) > _MAX_ACTIONS_PER_KIND:
+                errors.append(RuleValidationError(
+                    f"{location}.emit.{key}",
+                    f"{key} may contain at most {_MAX_ACTIONS_PER_KIND} actions",
+                    rule_id_for_error,
                 ))
                 continue
             for index, raw_action in enumerate(raw_actions):
@@ -544,15 +615,28 @@ def _parse_confidence_change(
     target = raw.get("target")
     delta = raw.get("delta")
     reason = raw.get("reason")
-    if not isinstance(target, str) or not target.strip():
+    normalized_target = target.strip().lower() if isinstance(target, str) else ""
+    classification_type = normalized_target.removeprefix(_CONFIDENCE_TARGET_PREFIX)
+    if not normalized_target:
         errors.append(RuleValidationError(f"{location}.target", "target must be a non-empty string", rule_id))
+    elif (
+        not normalized_target.startswith(_CONFIDENCE_TARGET_PREFIX)
+        or not classification_type
+        or len(classification_type) > _MAX_ACTION_IDENTIFIER_LENGTH
+        or not classification_type.replace("_", "").replace("-", "").replace(".", "").isalnum()
+    ):
+        errors.append(RuleValidationError(
+            f"{location}.target",
+            "supported target syntax is classification:<artifact_type>",
+            rule_id,
+        ))
     if isinstance(delta, bool) or not isinstance(delta, (int, float)) or not -1 <= delta <= 1:
         errors.append(RuleValidationError(f"{location}.delta", "delta must be between -1 and 1", rule_id))
     if not isinstance(reason, str) or not reason.strip():
         errors.append(RuleValidationError(f"{location}.reason", "reason must be a non-empty string", rule_id))
     if errors:
         return None, errors
-    return (target.strip(), float(delta), reason.strip()), []
+    return (normalized_target, float(delta), reason.strip()), []
 
 
 def _parse_action(
@@ -569,10 +653,31 @@ def _parse_action(
     command_mode = raw.get("command_mode", "extract" if kind == "extractor" else "default")
     parameters = raw.get("parameters", {})
     priority = raw.get("priority", 75 if kind == "extractor" else 80)
-    if not isinstance(target, str) or not target.strip():
-        errors.append(RuleValidationError(f"{location}.{kind}", "target must be a non-empty string", rule_id))
-    if tool is not None and (not isinstance(tool, str) or not tool.strip()):
-        errors.append(RuleValidationError(f"{location}.tool", "tool must be a non-empty string", rule_id))
+    if (
+        not isinstance(target, str) or not target.strip()
+        or len(target.strip()) > _MAX_ACTION_IDENTIFIER_LENGTH
+        or not target.strip().replace("_", "").replace("-", "").replace(".", "").isalnum()
+    ):
+        errors.append(RuleValidationError(
+            f"{location}.{kind}",
+            f"target must be a simple identifier of at most {_MAX_ACTION_IDENTIFIER_LENGTH} characters",
+            rule_id,
+        ))
+    if not isinstance(tool, str) or not tool.strip():
+        errors.append(RuleValidationError(
+            f"{location}.tool",
+            "tool is required; in-process parser/extractor actions are not supported",
+            rule_id,
+        ))
+    elif (
+        len(tool.strip()) > _MAX_ACTION_IDENTIFIER_LENGTH
+        or not tool.strip().replace("_", "").replace("-", "").replace(".", "").isalnum()
+    ):
+        errors.append(RuleValidationError(
+            f"{location}.tool",
+            f"tool must be a simple identifier of at most {_MAX_ACTION_IDENTIFIER_LENGTH} characters",
+            rule_id,
+        ))
     normalized_modes: set[AnalysisMode] = set()
     if modes is None or not modes:
         errors.append(RuleValidationError(f"{location}.modes", "modes must be a string list", rule_id))
@@ -593,22 +698,43 @@ def _parse_action(
                 normalized_modes.add(normalized)
     if (
         not isinstance(command_mode, str) or not command_mode.strip()
+        or len(command_mode.strip()) > _MAX_ACTION_IDENTIFIER_LENGTH
         or not command_mode.replace("_", "").replace("-", "").isalnum()
     ):
         errors.append(RuleValidationError(
-            f"{location}.command_mode", "command_mode must be a simple identifier", rule_id
+            f"{location}.command_mode",
+            f"command_mode must be a simple identifier of at most {_MAX_ACTION_IDENTIFIER_LENGTH} characters",
+            rule_id,
         ))
-    if not isinstance(parameters, Mapping) or any(
-        not isinstance(key, str) or not key.replace("_", "").isalnum()
-        or not isinstance(value, (str, int, float)) or isinstance(value, bool)
-        or "\x00" in str(value)
-        for key, value in (parameters.items() if isinstance(parameters, Mapping) else ())
+    parameter_items = parameters.items() if isinstance(parameters, Mapping) else ()
+    if (
+        not isinstance(parameters, Mapping)
+        or len(parameters) > _MAX_ACTION_PARAMETERS
+        or any(
+            not isinstance(key, str) or not key or len(key) > _MAX_ACTION_IDENTIFIER_LENGTH
+            or not key.replace("_", "").isalnum()
+            or not isinstance(value, (str, int, float)) or isinstance(value, bool)
+            or (isinstance(value, float) and not math.isfinite(value))
+            or "\x00" in str(value)
+            or len(str(value)) > _MAX_ACTION_PARAMETER_VALUE_LENGTH
+            for key, value in parameter_items
+        )
     ):
         errors.append(RuleValidationError(
-            f"{location}.parameters", "parameters must map identifier keys to scalar values", rule_id
+            f"{location}.parameters",
+            f"parameters must contain at most {_MAX_ACTION_PARAMETERS} identifier/scalar pairs "
+            f"with values no longer than {_MAX_ACTION_PARAMETER_VALUE_LENGTH} characters",
+            rule_id,
         ))
-    if isinstance(priority, bool) or not isinstance(priority, int):
-        errors.append(RuleValidationError(f"{location}.priority", "priority must be an integer", rule_id))
+    if (
+        isinstance(priority, bool) or not isinstance(priority, int)
+        or not -_MAX_ACTION_PRIORITY <= priority <= _MAX_ACTION_PRIORITY
+    ):
+        errors.append(RuleValidationError(
+            f"{location}.priority",
+            f"priority must be an integer between {-_MAX_ACTION_PRIORITY} and {_MAX_ACTION_PRIORITY}",
+            rule_id,
+        ))
     if errors:
         return None, errors
     return RuleActionSpec(
@@ -620,6 +746,58 @@ def _parse_action(
         parameters={str(key): str(value) for key, value in parameters.items()},
         priority=priority,
     ), []
+
+
+def _apply_confidence_change(
+    artifact: Artifact,
+    *,
+    target: str,
+    delta: float,
+    reason: str,
+    rule_id: str,
+    already_applied: bool,
+) -> RuleConfidenceChange:
+    """Apply one validated classification delta with a complete audit result."""
+
+    classification_type = target.removeprefix(_CONFIDENCE_TARGET_PREFIX)
+    matching = [
+        item for item in artifact.classifications
+        if item.artifact_type.casefold() == classification_type.casefold()
+    ]
+    previous = tuple(item.confidence for item in matching)
+    if already_applied:
+        return RuleConfidenceChange(
+            target=target,
+            delta=delta,
+            reason=reason,
+            rule_id=rule_id,
+            status="already_applied",
+            previous_confidences=previous,
+            updated_confidences=previous,
+            detail="an applied audit record for this rule/target/delta already exists",
+        )
+    if not matching:
+        return RuleConfidenceChange(
+            target=target,
+            delta=delta,
+            reason=reason,
+            rule_id=rule_id,
+            status="rejected",
+            detail=f"artifact has no classification matching {classification_type!r}",
+        )
+    updated = tuple(max(0.0, min(1.0, value + delta)) for value in previous)
+    for classification, confidence in zip(matching, updated):
+        classification.confidence = confidence
+    return RuleConfidenceChange(
+        target=target,
+        delta=delta,
+        reason=reason,
+        rule_id=rule_id,
+        status="applied",
+        previous_confidences=previous,
+        updated_confidences=updated,
+        detail=f"updated {len(matching)} matching artifact classification(s), clamped to [0, 1]",
+    )
 
 
 def _validate_condition(

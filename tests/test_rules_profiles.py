@@ -2,12 +2,17 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from forensickit.engine import AnalysisEngine
+from forensickit.evidence import EvidenceManager
 from forensickit.models import (
     AnalysisMode, Artifact, Classification, Finding, Observation, ToolRun, ToolRunStatus,
 )
+from forensickit.planner import ToolPlanner
 from forensickit.profiles import ProfileEngine, ToolRecommendation, merge_recommendations
 from forensickit.rules import RuleEngine
+from forensickit.tools.registry import ToolDefinition, ToolRegistry
 from forensickit.triage import GenericTriageEngine
+from forensickit.workspace import CaseWorkspace
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -136,7 +141,7 @@ def test_rule_conditions_use_prior_findings_and_tool_results_and_emit_actions() 
         "emit": {
             "observations": [{"key": "archive.verified", "value": True, "confidence": 0.95}],
             "confidence_changes": [{
-                "target": "hypothesis:embedded_archive", "delta": 0.15,
+                "target": "classification:archive", "delta": 0.15,
                 "reason": "independent parser confirmation",
             }],
             "parser_actions": [{"parser": "sevenzip", "tool": "sevenzip", "priority": 93}],
@@ -146,7 +151,10 @@ def test_rule_conditions_use_prior_findings_and_tool_results_and_emit_actions() 
             }],
         },
     }]})
-    target = artifact("archive")
+    target = artifact(
+        "archive",
+        classifications=[Classification("archive", 0.9, "validated archive structure")],
+    )
     prior_finding = Finding(
         artifact_id=target.id, title="Embedded archive", category="embedded_archive",
         severity="medium", confidence=0.9, explanation="signature", source="test",
@@ -163,11 +171,160 @@ def test_rule_conditions_use_prior_findings_and_tool_results_and_emit_actions() 
     assert result.observations[0].key == "archive.verified"
     assert result.observations[0].source == "rule:verify_then_extract"
     assert result.confidence_changes[0].delta == 0.15
+    assert result.confidence_changes[0].status == "applied"
+    assert result.confidence_changes[0].previous_confidences == (0.9,)
+    assert result.confidence_changes[0].updated_confidences == (1.0,)
+    assert target.classifications[0].confidence == 1.0
     assert {action.kind for action in result.actions} == {"parser", "extractor"}
+    action_audits = [item for item in result.observations if item.key.endswith("_action")]
+    assert all(item.value["disposition"] == "tool_recommendation" for item in action_audits)
     recommendations = {(item.tool, item.command_mode): item for item in result.recommendations}
     assert recommendations[("sevenzip", "default")].allows(AnalysisMode.AUTO)
     assert recommendations[("sevenzip", "extract")].allowed_modes == {AnalysisMode.DEEP}
     assert "prior tool result matched" in recommendations[("sevenzip", "extract")].reason
+
+
+def test_rule_confidence_change_is_bounded_auditable_and_idempotent() -> None:
+    engine = RuleEngine.from_data({"rules": [{
+        "id": "raise_archive_confidence",
+        "when": {"artifact_type": "archive"},
+        "emit": {"confidence_changes": [{
+            "target": "classification:archive",
+            "delta": 0.7,
+            "reason": "independent structure validation",
+        }]},
+    }]})
+    target = artifact(
+        "archive",
+        classifications=[Classification("archive", 0.45, "weak archive signature")],
+    )
+
+    first = engine.evaluate(target)
+    audit = next(item for item in first.observations if item.key == "rule.confidence_change")
+    second = engine.evaluate(target, first.observations)
+
+    assert target.classifications[0].confidence == 1.0
+    assert first.confidence_changes[0].status == "applied"
+    assert first.confidence_changes[0].previous_confidences == (0.45,)
+    assert first.confidence_changes[0].updated_confidences == (1.0,)
+    assert audit.value["status"] == "applied"
+    assert audit.value["detail"].endswith("clamped to [0, 1]")
+    assert second.confidence_changes[0].status == "already_applied"
+    assert not any(item.key == "rule.confidence_change" for item in second.observations)
+
+
+def test_engine_persists_rule_confidence_change_before_planner_scoring(tmp_path: Path) -> None:
+    source = tmp_path / "weak.zip"
+    source.write_bytes(b"PK\x03\x04payload")
+    executable = tmp_path / "verifier"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(0o755)
+    registry = ToolRegistry([ToolDefinition(
+        "verifier",
+        (str(executable),),
+        profiles=("archive",),
+        minimum_confidence=0.6,
+        command_templates={"default": ("{executable}", "{evidence}")},
+    )])
+    analysis = AnalysisEngine()
+    analysis.profiles = ProfileEngine([])
+    analysis.rules = RuleEngine.from_data({"rules": [{
+        "id": "confirm_archive",
+        "when": {"artifact_type": "archive"},
+        "emit": {"confidence_changes": [{
+            "target": "classification:archive",
+            "delta": 0.25,
+            "reason": "validated directory structure",
+        }]},
+    }]})
+
+    with CaseWorkspace.create(tmp_path / "cases", "confidence-integration") as workspace:
+        target = EvidenceManager(workspace).ingest(source)
+        target.artifact_type = "archive"
+        target.classifications = [Classification("archive", 0.4, "weak signature")]
+        workspace.database.update_artifact_identification(target)
+
+        _, rule_result = analysis._decide(workspace, target, [])
+        plans = ToolPlanner(workspace, registry).plan(
+            target,
+            [ToolRecommendation(
+                "verifier", frozenset({AnalysisMode.AUTO}), "verify archive", 80,
+            )],
+            AnalysisMode.AUTO,
+        )
+        persisted = workspace.database.artifact_by_hash(target.case_id, target.sha256)
+
+    assert rule_result.confidence_changes[0].applied is True
+    assert persisted is not None
+    assert persisted.classifications[0].confidence == 0.65
+    assert plans[0].evidence_confidence == 0.65
+    assert plans[0].available is True
+
+
+def test_rule_confidence_change_without_matching_classification_is_recorded_as_rejected() -> None:
+    engine = RuleEngine.from_data({"rules": [{
+        "id": "missing_target",
+        "when": {"artifact_type": "archive"},
+        "emit": {"confidence_changes": [{
+            "target": "classification:archive",
+            "delta": 0.1,
+            "reason": "parser evidence",
+        }]},
+    }]})
+
+    result = engine.evaluate(artifact("archive"))
+
+    assert result.confidence_changes[0].status == "rejected"
+    audit = next(item for item in result.observations if item.key == "rule.confidence_change")
+    assert audit.value["status"] == "rejected"
+    assert "no classification matching" in audit.value["detail"]
+
+
+def test_rule_rejects_unsupported_confidence_targets_and_toolless_actions() -> None:
+    engine = RuleEngine.from_data({"rules": [
+        {
+            "id": "unsupported_confidence",
+            "when": {"artifact_type": "archive"},
+            "emit": {"confidence_changes": [{
+                "target": "hypothesis:embedded_archive",
+                "delta": 0.1,
+                "reason": "not persistently actionable",
+            }]},
+        },
+        {
+            "id": "tool_less_actions",
+            "when": {"artifact_type": "archive"},
+            "emit": {
+                "parser_actions": [{"parser": "sevenzip"}],
+                "extractor_actions": [{"extractor": "sevenzip"}],
+            },
+        },
+        {
+            "id": "valid",
+            "when": {"artifact_type": "archive"},
+            "emit": {"recommend": {"auto": ["sevenzip"]}},
+        },
+    ]})
+
+    assert [rule.id for rule in engine.rules] == ["valid"]
+    messages = [str(error) for error in engine.validation_errors]
+    assert any("classification:<artifact_type>" in message for message in messages)
+    assert sum("tool is required" in message for message in messages) == 2
+
+
+def test_rule_rejects_unbounded_action_parameters() -> None:
+    engine = RuleEngine.from_data({"rules": [{
+        "id": "too_many_parameters",
+        "when": {"artifact_type": "archive"},
+        "emit": {"parser_actions": [{
+            "parser": "sevenzip",
+            "tool": "sevenzip",
+            "parameters": {f"value_{index}": index for index in range(17)},
+        }]},
+    }]})
+
+    assert not engine.rules
+    assert any("at most 16" in str(error) for error in engine.validation_errors)
 
 
 def test_rule_prior_state_exists_false_is_explainable() -> None:

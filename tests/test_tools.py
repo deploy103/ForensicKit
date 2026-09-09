@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from threading import Event, Timer
 import time
 
 import pytest
 
+from forensickit.config import AnalysisLimits, ForensicKitConfig
 from forensickit.evidence import EvidenceManager
 from forensickit.models import ToolRunStatus
 from forensickit.tools import ToolDefinition, ToolRegistry, ToolRunner, parse_output
@@ -17,6 +19,7 @@ def _fake_executable(path: Path) -> Path:
     path.write_text(
         """#!/usr/bin/env python3
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -24,6 +27,42 @@ import time
 
 if '--version' in sys.argv:
     print('fake-forensic 1.2.3')
+    raise SystemExit(0)
+if '--many-files' in sys.argv:
+    output_dir = pathlib.Path(sys.argv[2])
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for index in range(3):
+        (output_dir / f'many-{index}.bin').write_bytes(b'M')
+    raise SystemExit(0)
+if '--aggregate-files' in sys.argv:
+    output_dir = pathlib.Path(sys.argv[2])
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / 'aggregate-a.bin').write_bytes(b'A' * 40)
+    (output_dir / 'aggregate-b.bin').write_bytes(b'B' * 40)
+    raise SystemExit(0)
+if '--symlink-output' in sys.argv:
+    output_dir = pathlib.Path(sys.argv[2])
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / 'link').symlink_to(pathlib.Path(sys.argv[1]))
+    raise SystemExit(0)
+if '--fifo-output' in sys.argv:
+    output_dir = pathlib.Path(sys.argv[2])
+    output_dir.mkdir(parents=True, exist_ok=True)
+    os.mkfifo(output_dir / 'pipe')
+    raise SystemExit(0)
+if '--partial-output' in sys.argv:
+    output_dir = pathlib.Path(sys.argv[2])
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / 'partial.bin').write_bytes(b'partial')
+    raise SystemExit(9)
+if '--growing-output' in sys.argv:
+    output_dir = pathlib.Path(sys.argv[2])
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with (output_dir / 'growing.bin').open('wb') as output:
+        for _ in range(256):
+            output.write(b'G' * 4096)
+            output.flush()
+            time.sleep(0.05)
     raise SystemExit(0)
 if '--sleep' in sys.argv:
     print('started', flush=True)
@@ -165,6 +204,19 @@ def test_runner_preserves_exact_argv_logs_and_generated_files(
     assert result.run.generated_files
     generated = workspace.resolve_stored_path(result.run.generated_files[0])
     assert generated.read_text(encoding="utf-8") == "generated"
+    assert result.generated_output_audit == {
+        "accepted": True,
+        "scan_complete": True,
+        "regular_file_count": 1,
+        "regular_file_bytes": len(b"generated"),
+        "directory_count": 0,
+        "entries_scanned": 1,
+        "max_generated_files": 1_000,
+        "max_generated_bytes": 2 * 1024 * 1024 * 1024,
+        "max_output_file_bytes": None,
+        "failed_checks": [],
+        "rejected_entries": [],
+    }
 
     persisted = workspace.database.tool_runs(artifact.id)
     assert len(persisted) == 1
@@ -240,6 +292,195 @@ def test_runner_caps_generated_file_size_on_linux(tmp_path: Path, case_artifact)
     generated = workspace.resolve_stored_path(result.generated_directory or "") / "too-large.bin"
     assert result.status is ToolRunStatus.FAILED
     assert not generated.exists() or generated.stat().st_size <= 64 * 1024
+
+
+def test_runner_rejects_preexisting_output_directory_without_launch(
+    tmp_path: Path,
+    case_artifact,
+) -> None:
+    workspace, artifact = case_artifact
+    executable = _fake_executable(tmp_path / "preexisting-fake")
+    output = workspace.path("extracted", "already-present")
+    output.mkdir()
+    (output / "old.bin").write_bytes(b"old output")
+
+    result = ToolRunner(workspace, _registry(executable)).run(
+        "fake", artifact, output_directory=output,
+    )
+
+    assert result.status is ToolRunStatus.FAILED
+    assert result.run.command_argv == []
+    assert result.run.generated_files == []
+    assert "must start with a new empty directory" in str(result.run.error)
+    assert result.generated_output_audit["accepted"] is False
+    assert result.generated_output_audit["failed_checks"] == [
+        "preexisting_output"
+    ]
+    stdout = workspace.resolve_stored_path(result.run.stdout_path or "")
+    assert stdout.read_bytes() == b""
+    assert (output / "old.bin").read_bytes() == b"old output"
+
+
+def test_runner_rejects_generated_file_count_and_aggregate_bytes(
+    tmp_path: Path,
+    case_artifact,
+) -> None:
+    workspace, artifact = case_artifact
+    executable = _fake_executable(tmp_path / "aggregate-fake")
+    registry = _registry(executable)
+
+    too_many = ToolRunner(
+        workspace,
+        registry,
+        max_generated_files=2,
+        max_generated_bytes=1_024,
+    ).run("fake", artifact, extra_args=("--many-files",))
+    assert too_many.status is ToolRunStatus.FAILED
+    assert too_many.run.exit_code == 0
+    assert too_many.run.generated_files == []
+    assert "generated_file_count_limit" in str(too_many.run.error)
+    assert too_many.generated_output_audit["accepted"] is False
+    assert too_many.generated_output_audit["scan_complete"] is False
+    assert too_many.generated_output_audit["regular_file_count"] == 3
+    assert too_many.generated_output_audit["regular_file_bytes"] == 3
+
+    too_large = ToolRunner(
+        workspace,
+        registry,
+        max_generated_files=10,
+        max_generated_bytes=64,
+    ).run("fake", artifact, extra_args=("--aggregate-files",))
+    assert too_large.status is ToolRunStatus.FAILED
+    assert too_large.run.exit_code == 0
+    assert too_large.run.generated_files == []
+    assert "generated_byte_limit" in str(too_large.run.error)
+    assert too_large.generated_output_audit["regular_file_count"] == 2
+    assert too_large.generated_output_audit["regular_file_bytes"] == 80
+    audit_observation = next(
+        item for item in too_large.observations
+        if item.key == "tool.fake.generated_output_audit"
+    )
+    assert audit_observation.value == too_large.generated_output_audit
+
+    audit_only_root = workspace.path("extracted", "audit-only")
+    audit_only_root.mkdir()
+    (audit_only_root / "oversized.bin").write_bytes(b"Z" * 65)
+    audit_runner = ToolRunner(
+        workspace,
+        registry,
+        max_generated_files=1,
+        max_generated_bytes=1_024,
+        max_output_file_bytes=64,
+    )
+    oversized_audit = audit_runner._generated_output_audit(audit_only_root)
+    assert oversized_audit.accepted is False
+    assert oversized_audit.failed_checks == ["generated_file_size_limit"]
+    assert oversized_audit.regular_file_count == 1
+    assert oversized_audit.regular_file_bytes == 65
+
+    entry_root = workspace.path("extracted", "entry-limit")
+    entry_root.mkdir()
+    for index in range(258):
+        (entry_root / f"directory-{index}").mkdir()
+    entry_audit = audit_runner._generated_output_audit(entry_root)
+    assert entry_audit.accepted is False
+    assert entry_audit.scan_complete is False
+    assert entry_audit.entries_scanned == 258
+    assert entry_audit.failed_checks == ["output_entry_limit"]
+
+
+def test_runner_rejects_links_special_files_and_incomplete_run_outputs(
+    tmp_path: Path,
+    case_artifact,
+) -> None:
+    workspace, artifact = case_artifact
+    executable = _fake_executable(tmp_path / "unsafe-output-fake")
+    registry = _registry(executable)
+
+    linked = ToolRunner(workspace, registry).run(
+        "fake", artifact, extra_args=("--symlink-output",),
+    )
+    assert linked.status is ToolRunStatus.FAILED
+    assert linked.run.generated_files == []
+    assert linked.generated_output_audit["failed_checks"] == [
+        "symbolic_link_output"
+    ]
+
+    if os.name == "posix":
+        special = ToolRunner(workspace, registry).run(
+            "fake", artifact, extra_args=("--fifo-output",),
+        )
+        assert special.status is ToolRunStatus.FAILED
+        assert special.run.generated_files == []
+        assert special.generated_output_audit["failed_checks"] == [
+            "special_file_output"
+        ]
+
+    partial = ToolRunner(workspace, registry).run(
+        "fake", artifact, extra_args=("--partial-output",),
+    )
+    assert partial.status is ToolRunStatus.FAILED
+    assert partial.run.exit_code == 9
+    assert partial.run.generated_files == []
+    assert "tool exited with status 9" in str(partial.run.error)
+    assert "partial_output_from_incomplete_run" in str(partial.run.error)
+    assert partial.generated_output_audit["regular_file_count"] == 1
+    assert partial.generated_output_audit["regular_file_bytes"] == 7
+
+
+def test_runner_terminates_live_aggregate_growth_before_unbounded_output(
+    tmp_path: Path,
+    case_artifact,
+) -> None:
+    workspace, artifact = case_artifact
+    executable = _fake_executable(tmp_path / "growing-output-fake")
+    started = time.monotonic()
+
+    result = ToolRunner(
+        workspace,
+        _registry(executable),
+        max_generated_bytes=16 * 1_024,
+        max_output_file_bytes=2 * 1024 * 1024,
+    ).run(
+        "fake",
+        artifact,
+        timeout=10,
+        extra_args=("--growing-output",),
+    )
+
+    generated = workspace.resolve_stored_path(
+        result.generated_directory or ""
+    ) / "growing.bin"
+    assert time.monotonic() - started < 3
+    assert result.status is ToolRunStatus.FAILED
+    assert result.run.generated_files == []
+    assert "generated_byte_limit" in str(result.run.error)
+    assert result.generated_output_audit["regular_file_bytes"] > 16 * 1_024
+    assert generated.stat().st_size < 256 * 1_024
+
+
+def test_generated_output_limits_are_positive_and_serialized() -> None:
+    limits = AnalysisLimits(
+        tool_max_generated_files=7,
+        tool_max_generated_bytes=8_192,
+    )
+    assert limits.tool_max_generated_files == 7
+    assert limits.tool_max_generated_bytes == 8_192
+    serialized = ForensicKitConfig(limits=limits).as_dict()["limits"]
+    assert serialized["tool_max_generated_files"] == 7
+    assert serialized["tool_max_generated_bytes"] == 8_192
+    try:
+        AnalysisLimits(tool_max_generated_files=0)
+    except ValueError as exc:
+        assert str(exc) == "tool_max_generated_files must be positive"
+    else:
+        raise AssertionError("zero generated-file limit was accepted")
+    try:
+        AnalysisLimits(tool_max_generated_bytes=0)
+    except ValueError as exc:
+        assert str(exc) == "tool_max_generated_bytes must be positive"
+    else:
+        raise AssertionError("zero generated-byte limit was accepted")
 
 
 def test_missing_tool_is_skipped_and_persisted(case_artifact) -> None:

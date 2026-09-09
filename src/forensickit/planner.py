@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 import sys
-from typing import Iterable
+from typing import Any, Iterable, Mapping
 
 from .models import AnalysisMode, Artifact, ToolPlanItem, ToolRunStatus
 from .profiles.base import ToolRecommendation
@@ -38,13 +38,9 @@ class ToolPlanner:
                 merged[key].append(recommendation)
 
         previous_runs = self.workspace.database.tool_runs(artifact.id)
-        previous = {
-            run.tool
-            for run in previous_runs
-            if run.status is ToolRunStatus.COMPLETED and run.exit_code == 0
-        }
         previous_findings = self.workspace.database.findings(artifact.id)
         previous_observations = self.workspace.database.observations(artifact.id)
+        previous = _successful_plan_identities(previous_runs, previous_observations)
         limits = self.workspace.case.configuration.get("limits", {})
         if not isinstance(limits, dict):
             limits = {}
@@ -60,8 +56,6 @@ class ToolPlanner:
         plans: list[ToolPlanItem] = []
         for (tool_name, requested_mode, parameter_items), tool_recommendations in merged.items():
             parameters = dict(parameter_items)
-            if tool_name in previous and not parameters:
-                continue
             reasons = list(dict.fromkeys(item.reason for item in tool_recommendations))
             priority = max(item.priority for item in tool_recommendations)
             try:
@@ -146,15 +140,24 @@ class ToolPlanner:
                 policy_reasons.append("unmet prerequisites: " + ", ".join(unmet))
 
             executable = self.registry.resolve_executable(definition)
-            if requested_mode != "default" and requested_mode in definition.command_templates:
+            command_mode_available = True
+            if requested_mode != "default":
                 run_mode = requested_mode
+                if requested_mode not in definition.command_templates:
+                    command_mode_available = False
+                    policy_reasons.append(
+                        f"requested command mode {requested_mode!r} is not defined for this tool"
+                    )
             elif mode is AnalysisMode.DEEP and "deep" in definition.command_templates:
                 run_mode = "deep"
             else:
                 run_mode = "default"
+            plan_identity = (definition.name, run_mode, parameter_items)
+            if plan_identity in previous:
+                continue
             output_directory = self.workspace.path("artifacts", artifact.id, tool_name)
             command: list[str] = []
-            if executable:
+            if executable and command_mode_available:
                 try:
                     command = self.registry.build_command(
                         definition,
@@ -204,10 +207,78 @@ class ToolPlanner:
                     prerequisites=list(definition.prerequisites),
                 )
             )
-        return sorted(plans, key=lambda item: (-item.priority, item.tool))
+        return sorted(_deduplicate_plans(plans), key=lambda item: (
+            -item.priority, item.tool, item.command_mode, tuple(sorted(item.parameters.items()))
+        ))
 
 
 __all__ = ["ToolPlanner"]
+
+
+def _successful_plan_identities(
+    runs: Iterable[Any], observations: Iterable[Any],
+) -> set[tuple[str, str, tuple[tuple[str, str], ...]]]:
+    """Return only successful executions with an auditable planner identity.
+
+    A :class:`ToolRun` deliberately stores the exact argv for reproducibility,
+    but argv alone cannot recover a logical command mode: two catalog modes may
+    intentionally share a template and generated output paths are run-scoped.
+    The engine therefore records the plan identity beside each finished run.
+    Old runs without that record are conservatively eligible to run again
+    instead of suppressing a distinct verifier/extractor by tool name alone.
+    """
+
+    successful_run_ids = {
+        run.id
+        for run in runs
+        if run.status is ToolRunStatus.COMPLETED and run.exit_code == 0
+    }
+    identities: set[tuple[str, str, tuple[tuple[str, str], ...]]] = set()
+    for observation in observations:
+        if (
+            observation.key != "planner.tool_execution"
+            or observation.source != "tool_planner"
+            or not isinstance(observation.value, Mapping)
+            or observation.value.get("run_id") not in successful_run_ids
+        ):
+            continue
+        tool = observation.value.get("tool")
+        command_mode = observation.value.get("command_mode")
+        parameters = observation.value.get("parameters")
+        if (
+            not isinstance(tool, str) or not tool.strip()
+            or not isinstance(command_mode, str) or not command_mode.strip()
+            or not isinstance(parameters, Mapping)
+            or any(not isinstance(key, str) for key in parameters)
+        ):
+            continue
+        identities.add((
+            tool.strip().lower(),
+            command_mode.strip().lower(),
+            tuple(sorted((key, str(value)) for key, value in parameters.items())),
+        ))
+    return identities
+
+
+def _deduplicate_plans(plans: Iterable[ToolPlanItem]) -> list[ToolPlanItem]:
+    """Coalesce plans that resolve to the same logical execution identity."""
+
+    deduplicated: dict[
+        tuple[str, str, tuple[tuple[str, str], ...]], ToolPlanItem
+    ] = {}
+    for plan in plans:
+        key = (
+            plan.tool,
+            plan.command_mode,
+            tuple(sorted(plan.parameters.items())),
+        )
+        current = deduplicated.get(key)
+        if current is None:
+            deduplicated[key] = plan
+            continue
+        current.reasons = list(dict.fromkeys([*current.reasons, *plan.reasons]))
+        current.priority = max(current.priority, plan.priority)
+    return list(deduplicated.values())
 
 
 def _accepts_artifact(accepted: tuple[str, ...], artifact: Artifact) -> bool:
