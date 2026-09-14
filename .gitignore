@@ -18,3 +18,18 @@ cases/
 .DS_Store
 .idea/
 .vscode/
+
+# Local agent instructions, prompts, and work notes
+.agent/
+AGENTS.md
+PROMPORT.md
+PROMPT.md
+FINAL_PROMPT.txt
+FORENSIC_DEVELOPMENT_DIRECTIVE.md
+WORK_LOG.md
+WORK_QUEUE.md
+요구사항.md
+작업내용.md
+
+# Local challenge inputs and forensic analysis output
+Problem/
