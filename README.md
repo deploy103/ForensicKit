@@ -508,4 +508,4 @@ scripts/release_gate.sh --bundle /media/usb/forensickit-bundle
 - 구성 요소 manifest의 라이선스 필드는 출처와 적용 조건을 기록할 뿐 법률 검토가 아닙니다. 도구·규칙·심볼의 배포 권한을 대회 규정과 각 라이선스에 따라 별도로 확인하십시오.
 - 실제 민감 증거가 아니라 승인된 CTF/로컬 포렌식 범위에서 사용하십시오. 실증 테스트에는 합성 또는 공개 샘플을 사용하고 사건 폴더 전체를 민감 데이터로 취급하십시오.
 
-더 세밀한 형식별 경계는 [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md), 보안 원칙은 [SECURITY.md](SECURITY.md), 조사 모델과 구현 지침은 [AGENTS.md](AGENTS.md)를 참고하십시오.
+더 세밀한 형식별 경계는 [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md), 보안 원칙은 [SECURITY.md](SECURITY.md)를 참고하십시오.
